@@ -1,11 +1,14 @@
 /**
  * pi-workflow: Workflow engine for Pi coding agent
  *
- * Workflow Spec v1 definition parser, loader, and immutable snapshot facilities.
+ * Workflow Spec v1 definition parser, loader, immutable snapshot facilities,
+ * durable run registry, and iteration execution context with model-callable tools.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { WorkflowDispatcher } from "./dispatcher.ts";
 import { WorkflowRunRegistry } from "./registry.ts";
+import { createWorkflowTools } from "./tools.ts";
 import type { WorkflowSessionTarget } from "./types.ts";
 
 // Re-export constants
@@ -38,6 +41,15 @@ export * from "./session-entries.ts";
 // Re-export registry
 export * from "./registry.ts";
 
+// Re-export prompt construction
+export * from "./prompt.ts";
+
+// Re-export dispatcher
+export * from "./dispatcher.ts";
+
+// Re-export tools
+export * from "./tools.ts";
+
 /**
  * Factory to create a WorkflowRunRegistry.
  */
@@ -48,13 +60,32 @@ export function createWorkflowRunRegistry(
 }
 
 /**
+ * Factory to create a WorkflowDispatcher.
+ */
+export function createWorkflowDispatcher(
+  registry: WorkflowRunRegistry
+): WorkflowDispatcher {
+  return new WorkflowDispatcher(registry);
+}
+
+/**
  * Pi extension entrypoint.
- * Automatically synchronizes workflow runs with the active session branch across reloads and tree navigation.
+ * Automatically synchronizes workflow runs with the active session branch across reloads and tree navigation,
+ * registers model-facing workflow tools, and enforces safe iteration clearing across lifecycle events.
  */
 export default function workflowExtension(pi: ExtensionAPI): void {
   const registry = new WorkflowRunRegistry();
+  const dispatcher = new WorkflowDispatcher(registry);
+  const tools = createWorkflowTools({ dispatcher, registry });
+
+  if (typeof pi.registerTool === "function") {
+    for (const tool of tools) {
+      pi.registerTool(tool);
+    }
+  }
 
   pi.on("session_start", async (_event, ctx) => {
+    dispatcher.clearActiveIteration("session_start");
     registry.bindSession({
       appendEntry: (customType: string, data?: unknown) => pi.appendEntry(customType, data),
       getBranch: (fromId?: string) => ctx.sessionManager.getBranch(fromId),
@@ -62,7 +93,16 @@ export default function workflowExtension(pi: ExtensionAPI): void {
     registry.refresh();
   });
 
-  pi.on("session_tree", async (_event, _ctx) => {
+  pi.on("session_tree", async () => {
+    dispatcher.clearActiveIteration("session_tree");
     registry.refresh();
+  });
+
+  pi.on("agent_settled", async () => {
+    dispatcher.clearActiveIteration("agent_settled");
+  });
+
+  pi.on("session_shutdown", async () => {
+    dispatcher.clearActiveIteration("session_shutdown");
   });
 }
