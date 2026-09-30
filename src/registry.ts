@@ -4,6 +4,7 @@
  */
 
 import { WORKFLOW_RUN_ENTRY_TYPE } from "./constants.ts";
+import { validateRunId } from "./data-bounds.ts";
 import {
   applyBlockRun,
   applyCancelRun,
@@ -35,6 +36,7 @@ import {
   WorkflowInvalidTransitionError,
   WorkflowPersistenceError,
   type WorkflowRun,
+  WorkflowRunError,
   type WorkflowRunDiagnostic,
   type WorkflowRunLifecycle,
   WorkflowRunNotFoundError,
@@ -103,6 +105,37 @@ export class WorkflowRunRegistry {
     const workflowName = snapshot.name;
     const maxRuns = snapshot.concurrency?.maxRuns ?? 1;
 
+    // Check custom runId collision BEFORE concurrency checks
+    if (options.runId) {
+      const validRunId = validateRunId(options.runId);
+      if (this.runs.has(validRunId)) {
+        const existing = this.runs.get(validRunId)!;
+        if (existing.workflow !== workflowName) {
+          throw new WorkflowRunError(
+            `Run ID "${validRunId}" already exists for workflow "${existing.workflow}" (cannot be reused for workflow "${workflowName}")`,
+            validRunId
+          );
+        }
+
+        if (!isTerminalLifecycle(existing.lifecycle)) {
+          if (options.existingPolicy === "returnExisting") {
+            return existing;
+          }
+          throw new WorkflowConcurrencyError(
+            workflowName,
+            [existing.id],
+            maxRuns,
+            `Run with ID "${validRunId}" is already active in workflow "${workflowName}"`
+          );
+        }
+
+        throw new WorkflowRunError(
+          `Run ID "${validRunId}" already exists as a terminal run in workflow "${workflowName}".`,
+          validRunId
+        );
+      }
+    }
+
     // Find nonterminal runs of this workflow
     const nonterminalRuns = this.getNonterminalRuns(workflowName);
 
@@ -115,23 +148,6 @@ export class WorkflowRunRegistry {
         nonterminalRuns.map((r) => r.id),
         maxRuns
       );
-    }
-
-    // Check if custom runId already exists in this registry
-    if (options.runId && this.runs.has(options.runId)) {
-      const existing = this.runs.get(options.runId)!;
-      if (!isTerminalLifecycle(existing.lifecycle)) {
-        if (options.existingPolicy === "returnExisting") {
-          return existing;
-        }
-        throw new WorkflowConcurrencyError(
-          workflowName,
-          [existing.id],
-          maxRuns,
-          `Run with ID "${options.runId}" is already active in workflow "${workflowName}"`
-        );
-      }
-      throw new Error(`Run ID "${options.runId}" already exists as a terminal run.`);
     }
 
     const run = createWorkflowRun({
@@ -549,9 +565,26 @@ export class WorkflowRunRegistry {
     if (!this.sessionTarget) return;
 
     if (typeof this.sessionTarget.appendCustomEntry === "function") {
-      this.sessionTarget.appendCustomEntry(WORKFLOW_RUN_ENTRY_TYPE, data);
+      try {
+        this.sessionTarget.appendCustomEntry(WORKFLOW_RUN_ENTRY_TYPE, data);
+      } catch (err: unknown) {
+        if (err instanceof WorkflowPersistenceError) throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new WorkflowPersistenceError(`Failed to persist session entry: ${msg}`, { runId: data.runId });
+      }
     } else if (typeof this.sessionTarget.appendEntry === "function") {
-      this.sessionTarget.appendEntry(WORKFLOW_RUN_ENTRY_TYPE, data);
+      try {
+        this.sessionTarget.appendEntry(WORKFLOW_RUN_ENTRY_TYPE, data);
+      } catch (err: unknown) {
+        if (err instanceof WorkflowPersistenceError) throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new WorkflowPersistenceError(`Failed to persist session entry: ${msg}`, { runId: data.runId });
+      }
+    } else {
+      throw new WorkflowPersistenceError(
+        `Bound sessionTarget does not implement appendCustomEntry or appendEntry`,
+        { runId: data.runId }
+      );
     }
   }
 }

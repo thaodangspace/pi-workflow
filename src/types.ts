@@ -510,4 +510,3 @@ export class WorkflowPersistenceError extends WorkflowRunError {
     this.entryId = options?.entryId;
   }
 }
-

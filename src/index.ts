@@ -66,5 +66,3 @@ export default function workflowExtension(pi: ExtensionAPI): void {
     registry.refresh();
   });
 }
-
-

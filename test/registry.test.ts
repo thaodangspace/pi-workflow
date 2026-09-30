@@ -222,6 +222,111 @@ Steps to execute.
     );
   });
 
+  it("fails closed with WorkflowPersistenceError and prevents in-memory mutations when sessionTarget lacks append methods", () => {
+    // Bound session target without appendCustomEntry or appendEntry
+    const brokenTarget: any = {
+      getBranch: () => [],
+    };
+
+    const registry = new WorkflowRunRegistry(brokenTarget);
+    const def = createDef();
+
+    // 1. createRun fails and does not add run to memory
+    assert.throws(
+      () => registry.createRun(def, { runId: "persist-fail-run" }),
+      (err) => err instanceof WorkflowPersistenceError && err.message.includes("does not implement appendCustomEntry")
+    );
+    assert.equal(registry.hasRun("persist-fail-run"), false);
+    assert.equal(registry.listRuns().length, 0);
+
+    // 2. Bound target whose append method throws prevents in-memory mutation on update
+    const normalSession = new FakeSessionManager();
+    const reg2 = new WorkflowRunRegistry(normalSession);
+    const run = reg2.createRun(def, { runId: "live-run", initialStep: "ORIGINAL" });
+
+    // Now bind a target that throws on append
+    const throwingTarget: any = {
+      getBranch: () => normalSession.getBranch(),
+      appendCustomEntry: () => {
+        throw new Error("Disk write error");
+      },
+    };
+    reg2.bindSession(throwingTarget);
+
+    assert.throws(
+      () => reg2.transitionStep(run.id, { toStep: "MUTATED" }),
+      (err) => err instanceof WorkflowPersistenceError && err.message.includes("Disk write error")
+    );
+
+    // In-memory step must still be ORIGINAL, not MUTATED!
+    assert.equal(reg2.requireRun(run.id).step, "ORIGINAL");
+  });
+
+  it("checks custom runId collision before concurrency and never returns other-workflow run", () => {
+    const registry = new WorkflowRunRegistry();
+    const defA = parseWorkflowContent(
+      `---
+name: workflow-alpha
+description: Workflow Alpha.
+mode: self-paced
+concurrency:
+  maxRuns: 1
+---
+# Alpha
+`,
+      { path: "/test/alpha.md", scope: "project" }
+    );
+
+    const defB = parseWorkflowContent(
+      `---
+name: workflow-beta
+description: Workflow Beta.
+mode: self-paced
+concurrency:
+  maxRuns: 1
+---
+# Beta
+`,
+      { path: "/test/beta.md", scope: "project" }
+    );
+
+    // Create run in Alpha
+    const runAlpha = registry.createRun(defA, { runId: "shared-id" });
+    assert.equal(runAlpha.workflow, "workflow-alpha");
+
+    // Attempt to create run in Beta with the SAME runId, requesting returnExisting
+    // Must throw WorkflowRunError and NEVER return runAlpha!
+    assert.throws(
+      () => registry.createRun(defB, { runId: "shared-id", existingPolicy: "returnExisting" }),
+      (err) => {
+        assert(err instanceof Error);
+        assert.equal(err.name, "WorkflowRunError");
+        assert(err.message.includes('already exists for workflow "workflow-alpha"'));
+        return true;
+      }
+    );
+
+    // Ensure Beta still has no runs
+    assert.equal(registry.listRuns({ workflow: "workflow-beta" }).length, 0);
+
+    // Also verify when Beta's concurrency is already full, collision is still checked before concurrency
+    // Create a normal run in Beta
+    const runBeta = registry.createRun(defB, { runId: "beta-active" });
+    assert.equal(runBeta.workflow, "workflow-beta");
+
+    // Now Beta has 1/1 runs active. Attempting to create Beta run with runId="shared-id" (Alpha's ID)
+    // with returnExisting must throw the ID collision error, NOT return Beta's existing run!
+    assert.throws(
+      () => registry.createRun(defB, { runId: "shared-id", existingPolicy: "returnExisting" }),
+      (err) => {
+        assert(err instanceof Error);
+        assert.equal(err.name, "WorkflowRunError");
+        assert(err.message.includes('already exists for workflow "workflow-alpha"'));
+        return true;
+      }
+    );
+  });
+
   it("reconstructs accurately after simulated session file reload (JSONL)", () => {
     const session1 = new FakeSessionManager();
     const registry1 = new WorkflowRunRegistry(session1);
