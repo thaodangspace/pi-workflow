@@ -50,6 +50,8 @@ export function createWorkflowSnapshot(
     schemaVersion: WORKFLOW_SCHEMA_VERSION,
     name: definition.name,
     description: definition.description,
+    ...(definition.type ? { type: definition.type } : {}),
+    ...(definition.objective !== undefined ? { objective: definition.objective } : {}),
     mode: definition.mode,
     ...(definition.schedule ? { schedule: JSON.parse(JSON.stringify(definition.schedule)) } : {}),
     concurrency: { ...definition.concurrency },
@@ -82,6 +84,8 @@ export function createWorkflowSnapshot(
     source: clonedDef.source,
     name: clonedDef.name,
     description: clonedDef.description,
+    ...(clonedDef.type ? { type: clonedDef.type } : {}),
+    ...(clonedDef.objective !== undefined ? { objective: clonedDef.objective } : {}),
     mode: clonedDef.mode,
     schedule: clonedDef.schedule,
     concurrency: clonedDef.concurrency,
@@ -98,16 +102,84 @@ export function createWorkflowSnapshot(
 }
 
 /**
- * Check if an unknown value is a valid WorkflowSnapshotV1
+ * Validates the durable kind/objective invariant shared by a snapshot's
+ * top-level fields and its nested immutable `definition`.
+ *
+ * Invariants:
+ * - `type`, when present, must be a member of the closed union
+ *   (`"workflow" | "goal"`); an absent type defaults to an ordinary workflow.
+ * - The top-level and nested `definition` kinds must agree.
+ * - A `goal` must carry a non-empty objective in BOTH places and the two must
+ *   be identical; the objective is durable goal identity, so a mismatch is
+ *   corruption rather than a recoverable inconsistency.
+ * - An ordinary/legacy workflow must carry NO objective in either place.
+ * - Pre-feature ordinary snapshots (both fields absent) remain valid.
+ */
+function isValidSnapshotKindInvariant(
+  topType: unknown,
+  topObjective: unknown,
+  nestedType: unknown,
+  nestedObjective: unknown
+): boolean {
+  const validKind = (v: unknown): v is "workflow" | "goal" | undefined =>
+    v === undefined || v === "workflow" || v === "goal";
+  if (!validKind(topType) || !validKind(nestedType)) {
+    return false;
+  }
+
+  const topKind = topType === "goal" ? "goal" : "workflow";
+  const nestedKind = nestedType === "goal" ? "goal" : "workflow";
+  if (topKind !== nestedKind) {
+    return false;
+  }
+
+  const topObjIsString = topObjective === undefined || typeof topObjective === "string";
+  const nestedObjIsString = nestedObjective === undefined || typeof nestedObjective === "string";
+  if (!topObjIsString || !nestedObjIsString) {
+    return false;
+  }
+
+  if (topKind === "goal") {
+    if (typeof topObjective !== "string" || topObjective.trim().length === 0) return false;
+    if (typeof nestedObjective !== "string" || nestedObjective.trim().length === 0) return false;
+    return topObjective === nestedObjective;
+  }
+
+  // Ordinary/legacy: objective is meaningless and must be absent everywhere.
+  return topObjective === undefined && nestedObjective === undefined;
+}
+
+/**
+ * Check if an unknown value is a valid WorkflowSnapshotV1.
+ *
+ * Beyond the presence of required envelope fields, this enforces the durable
+ * kind/objective invariant across both the top-level snapshot fields and the
+ * nested immutable `definition` (see {@link isValidSnapshotKindInvariant}), so a
+ * replayed create payload can never silently lose or corrupt goal identity.
  */
 export function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshotV1 {
   if (typeof value !== "object" || value === null) return false;
   const s = value as Partial<WorkflowSnapshotV1>;
-  return (
-    s.schemaVersion === WORKFLOW_SCHEMA_VERSION &&
-    typeof s.snapshotId === "string" &&
-    typeof s.name === "string" &&
-    typeof s.body === "string" &&
-    typeof s.source === "object"
+  if (
+    s.schemaVersion !== WORKFLOW_SCHEMA_VERSION ||
+    typeof s.snapshotId !== "string" ||
+    typeof s.name !== "string" ||
+    typeof s.body !== "string" ||
+    typeof s.source !== "object"
+  ) {
+    return false;
+  }
+
+  const rawDefinition = (s as { definition?: unknown }).definition;
+  const nestedDefinition =
+    rawDefinition !== null && typeof rawDefinition === "object" && !Array.isArray(rawDefinition)
+      ? (rawDefinition as Record<string, unknown>)
+      : undefined;
+
+  return isValidSnapshotKindInvariant(
+    s.type,
+    s.objective,
+    nestedDefinition?.type,
+    nestedDefinition?.objective
   );
 }

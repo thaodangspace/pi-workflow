@@ -6,6 +6,10 @@ Workflow engine for Pi coding agent.
 
 The engine does not parse workflow states or state transitions out of prose; workflow definitions declare the governing policies, budgets, capabilities, and guidance for runs.
 
+The ad-hoc `/goal` command is a thin facade over this same engine: a goal is an
+ordinary durable workflow run, not a separate subsystem. See
+[Goal Facade (`/goal`)](#goal-facade-goal).
+
 ---
 
 ## Workflow Spec v1
@@ -122,6 +126,8 @@ A workflow definition is reusable; a **workflow run** is a concrete, durable exe
 interface WorkflowRun {
   readonly id: string;                     // Stable unique run identifier (e.g. wfrun-deploy-...)
   readonly workflow: string;               // Workflow definition name
+  readonly type?: "workflow" | "goal";     // Durable kind discriminator (absent => ordinary workflow)
+  readonly objective?: string;             // Goal objective (goal-kind runs only)
   readonly definitionVersion: number | string;
   readonly definitionSource: string;       // Origin file path / scope
   readonly snapshot: WorkflowSnapshotV1;   // Deep-frozen immutable definition snapshot
@@ -705,6 +711,114 @@ installed, authenticated, or compatible.
 See [Capability Providers](docs/capability-providers.md) for the model, the
 minimal third-party provider example, and session-scope/lifecycle guarantees.
 
+---
+
+## Goal Facade (`/goal`)
+
+`/goal` is a **thin user-facing facade over the workflow engine**, not a second
+orchestration subsystem. A goal is an ordinary, durable, self-paced workflow run
+whose objective is supplied interactively. It uses the same run registry,
+immutable snapshots, generic lifecycle controls, generic completion/evidence
+gate, model tools, and the same single `pi-loop` scheduler adapter as any named
+workflow. `/goal` adds **no** second scheduler, timer, continuation engine, or
+`agent_settled` auto-continue loop.
+
+### Usage
+
+```text
+/goal <objective>        Create an ad-hoc goal workflow run
+/goal -- <objective>     Create a goal whose objective starts with a reserved word
+/goal status             Show the active goal (or the most recent terminal goal)
+/goal pause              Pause the active goal and suspend wakeups
+/goal resume             Resume the paused/blocked active goal
+/goal stop               Stop (cancel) the active goal and cancel its scheduler task
+/goal help               Show usage
+```
+
+`status|pause|resume|stop|help` are reserved control subcommands. An objective
+that begins with one of those words is ambiguous and is **rejected** with
+guidance; use `/goal -- <objective>` to force it to be treated literally.
+
+### Compilation to a workflow
+
+`/goal fix all failing tests and verify the suite passes` builds the reserved
+built-in definition `__pi_goal` (`type: "goal"`, in memory only) with:
+
+| Property | Value |
+|---|---|
+| `mode` | `self-paced` |
+| `requires` | `["loop"]` |
+| `concurrency.maxRuns` | `1` (one command-owned goal) |
+| `budget.maxTurns` | `50` |
+| `budget.maxDuration` | `7d` |
+| `budget.maxAttempts` | `10` |
+| `budget.onExhaustion` | `block` |
+| `wakeups.default` / `min` / `max` | `10m` / `1m` / `1h` |
+| `completion.requireSummary` | `true` |
+| `completion.requireEvidence` | `true` |
+| `completion.verify` | `false` (disabled) by default |
+
+Unsupported `maxCost`/`maxTokens` budgets are never generated and remain
+rejected by the shared start validation.
+
+The objective is embedded as **task data** in the definition body (the generic
+workflow policy mechanism) and is preserved verbatim in the immutable snapshot's
+`objective` field. It is never spliced into privileged engine directives.
+
+### Goal iteration policy
+
+The built-in policy instructs the agent to make progress each iteration, persist
+concise progress in durable run data with the generic tools, request a bounded
+next wakeup with `workflow_continue` when work remains, `workflow_block` with a
+human-required reason when authorization/input is required, reconcile uncertain
+external effects before repeating them, and submit `workflow_complete` only with
+a summary and concrete evidence.
+
+### Completion & verification
+
+Completion uses the generic evidence gate: a summary and at least one evidence
+item are required, and plain assistant text (for example “done”) never completes
+a goal. The **generic verifier is disabled by default**. A goal completed with
+the verifier disabled is recorded as an **unverified completion** and is shown
+as such in `/workflow status` (`Verification: not configured (unverified
+completion)`); it must never be presented as independently verified. When the
+gate is enabled (`createGoalDefinition(objective, { verify: true })` or the goal
+controller's `goalOptions`), completion is routed through the existing
+`workflow_verify` accept/reject/rework path and its configured attempt limit.
+
+### One-goal policy and terminal history
+
+Exactly one command-owned goal may be **nonterminal** at a time. Starting a
+second goal while one is active fails closed without creating a run. Terminal
+goals remain visible by run ID through `/workflow status <id>`, and `/goal status`
+explicitly reports the most recent terminal goal (with its run ID and lifecycle)
+rather than pretending no goal ever existed. If more than one nonterminal goal
+is somehow present (for example from manual state), `/goal` fails closed listing
+the run IDs instead of controlling an arbitrary run.
+
+### Recovery and reconstruction
+
+Because a goal is a normal durable run, replay and recovery are the ordinary
+generic ones: the goal is reconstructed from the session branch via
+`WorkflowRunRegistry.reconstructFromSession`, and `session_start` /
+`session_tree` reconciliation recreates at most one linked `pi-loop` task from
+the durable snapshot. The goal's `type` and `objective` are persisted in the
+create entry and survive reload/branch switches; a changed objective is never
+recompiled. The built-in definition has a synthetic source identity
+(`<builtin>/pi-goal.md`, deterministic SHA-256) and no on-disk file, so definition
+compatibility checks are bypassed safely for goal-kind runs; the reserved name
+begins with an underscore and can never be produced by the loader.
+
+### Limitations
+
+- One command-owned goal per session (multiple named goal runs are a possible
+  future extension, still represented as ordinary runs).
+- The verifier is opt-in; an unverified completion is never labelled verified.
+- The bounded self-paced fallback is not proof of progress. Hard budgets,
+  blockers, and pause/stop always take precedence over wakeups, and a paused,
+  blocked (human-required), or terminal goal never spontaneously runs.
+- A goal can always be inspected and controlled through the generic
+  `/workflow status|pause|resume|stop <run-id>` commands.
 
 ---
 

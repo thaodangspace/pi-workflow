@@ -30,6 +30,7 @@ import {
   parseWorkflowCommandArgs,
   WorkflowCommandController,
 } from "../src/commands.ts";
+import { createGoalCommandController } from "../src/index.ts";
 import { WorkflowDispatcher } from "../src/dispatcher.ts";
 import workflowExtension from "../src/index.ts";
 import { WorkflowRunRegistry } from "../src/registry.ts";
@@ -1074,16 +1075,14 @@ describe("Workflow Lifecycle Commands & Run Controls (Issue #5)", () => {
   // 13. Pi Extension Command Registration
   // =========================================================================
   describe("Pi Extension Command Registration", () => {
-    it("registers /workflow command with description, completions, and handler", () => {
-      let registeredName = "";
-      let registeredOptions: any = null;
+    it("registers /workflow and /goal commands with description, completions, and handler", () => {
+      const registered = new Map<string, any>();
 
       const mockPi: any = {
         events: null,
         registerTool: () => {},
         registerCommand: (name: string, options: any) => {
-          registeredName = name;
-          registeredOptions = options;
+          registered.set(name, options);
         },
         on: () => () => {},
         appendEntry: () => {},
@@ -1091,11 +1090,49 @@ describe("Workflow Lifecycle Commands & Run Controls (Issue #5)", () => {
 
       workflowExtension(mockPi);
 
-      assert.equal(registeredName, "workflow");
-      assert.ok(registeredOptions);
-      assert.match(registeredOptions.description, /Manage workflow definitions and runs/);
-      assert.equal(typeof registeredOptions.handler, "function");
-      assert.equal(typeof registeredOptions.getArgumentCompletions, "function");
+      const workflowOptions = registered.get("workflow");
+      assert.ok(workflowOptions, "expected /workflow to be registered");
+      assert.match(workflowOptions.description, /Manage workflow definitions and runs/);
+      assert.equal(typeof workflowOptions.handler, "function");
+      assert.equal(typeof workflowOptions.getArgumentCompletions, "function");
+
+      const goalOptions = registered.get("goal");
+      assert.ok(goalOptions, "expected /goal to be registered");
+      assert.match(goalOptions.description, /goal/i);
+      assert.equal(typeof goalOptions.handler, "function");
+      assert.equal(typeof goalOptions.getArgumentCompletions, "function");
+    });
+  });
+
+  // =========================================================================
+  // 14. Goal visibility in /workflow status (Issue #9)
+  // =========================================================================
+  describe("Goal visibility in /workflow status", () => {
+    it("labels goal runs with type goal while named workflows remain type workflow", async () => {
+      const goalController = createGoalCommandController({ workflowController: controller });
+
+      const started = await goalController.execute("verify goal visibility");
+      assert.equal(started.ok, true, started.output);
+      const goalRunId = (started.data as any).runId as string;
+
+      const detail = await controller.executeStatusRun(goalRunId);
+      assert.equal(detail.ok, true);
+      assert.match(detail.output, /Type:\s+goal/);
+      assert.match(detail.output, /Objective:\s+verify goal visibility/);
+      assert.match(detail.output, /Verification:\s+not configured/);
+      assert.equal((detail.data as any).type, "goal");
+
+      const list = await controller.executeStatusList();
+      assert.match(list.output, /Type:\s+goal/);
+      const listed = (list.data as any).runs.find((r: any) => r.id === goalRunId);
+      assert.equal(listed.type, "goal");
+
+      // A named workflow run remains an ordinary workflow.
+      const namedStart = await controller.executeStart("example");
+      assert.equal(namedStart.ok, true, namedStart.output);
+      const namedRunId = (namedStart.data as any).runId as string;
+      const namedDetail = await controller.executeStatusRun(namedRunId);
+      assert.match(namedDetail.output, /Type:\s+workflow/);
     });
   });
 });

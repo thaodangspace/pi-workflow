@@ -33,6 +33,8 @@ import {
   WorkflowRunNotFoundError,
   WorkflowUnsupportedBudgetError,
   WorkflowValidationError,
+  isGoalKind,
+  workflowKindOf,
 } from "./types.ts";
 
 /**
@@ -183,6 +185,27 @@ export function formatNextWakeup(
 }
 
 /**
+ * Describes the verification state of a run without ever implying that an
+ * unconfigured (or not-yet-performed) verification happened.
+ */
+export function describeVerification(run: WorkflowRun): string {
+  const findings = run.verificationFindings;
+  if (findings) {
+    return findings.decision === "accepted"
+      ? `accepted by verifier (attempt ${findings.attempt})`
+      : `rejected by verifier (attempt ${findings.attempt})`;
+  }
+  const verifyConfigured = run.snapshot.completion?.verify === true;
+  if (!verifyConfigured) {
+    return run.lifecycle === "completed" ? "not configured (unverified completion)" : "not configured";
+  }
+  if (run.lifecycle === "verifying") {
+    return "pending (awaiting verifier decision)";
+  }
+  return "configured (awaiting completion claim)";
+}
+
+/**
  * Parsed representation of a CLI invocation.
  */
 export interface ParsedWorkflowCommand {
@@ -330,6 +353,14 @@ export class WorkflowCommandController {
     run: WorkflowRun,
     pi?: ExtensionAPI
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // Synthetic, snapshot-only goal definitions have no on-disk file by design.
+    // Their immutable snapshot is authoritative; there is nothing on disk to
+    // compare against, and the reserved goal name cannot be produced by the
+    // loader, so this bypass is safe and cannot skip a real compatibility check.
+    if (isGoalKind(run) || isGoalKind(run.snapshot)) {
+      return { ok: true };
+    }
+
     await this.ensureDefinitionsLoaded();
     const onDiskDef = this.discoveredDefinitions.get(run.workflow);
 
@@ -561,6 +592,28 @@ export class WorkflowCommandController {
       return { ok: false, action: "start", output: errorMsg, error: errorMsg };
     }
 
+    return this.startDefinition(def, {
+      pi: options.pi,
+      initialData: options.initialData,
+    });
+  }
+
+  /**
+   * Shared durable-run start path used by both `/workflow start <name>` and the
+   * `/goal` facade. Performs the common validation (required capabilities,
+   * enforceable budget dimensions, scheduler availability) and then creates the
+   * durable run and schedules it through the single pi-loop adapter. It never
+   * defines a second scheduler or run-creation path.
+   */
+  async startDefinition(
+    def: WorkflowDefinitionV1,
+    options: {
+      pi?: ExtensionAPI;
+      initialData?: Record<string, JsonValue>;
+      initialStep?: string;
+      existingPolicy?: "fail" | "returnExisting";
+    } = {}
+  ): Promise<WorkflowCommandResult> {
     // 1. Validate required capabilities
     const capCheck = await this.validateCapabilities(def.name, declaredRequirements(def), options.pi);
     if (!capCheck.ok) {
@@ -588,6 +641,8 @@ export class WorkflowCommandController {
     try {
       const { run, task } = await this.adapter.startRun(def, {
         initialData: options.initialData,
+        initialStep: options.initialStep,
+        existingPolicy: options.existingPolicy,
       });
 
       const output =
@@ -636,6 +691,7 @@ export class WorkflowCommandController {
 
       lines.push(`  • ${run.id}`);
       lines.push(`    Workflow:    ${run.workflow}`);
+      lines.push(`    Type:        ${workflowKindOf(run)}`);
       lines.push(`    Lifecycle:   ${run.lifecycle}`);
       lines.push(`    Step:        ${run.step}`);
       lines.push(`    Age:         ${ageStr}`);
@@ -653,6 +709,7 @@ export class WorkflowCommandController {
       dataRuns.push({
         id: run.id,
         workflow: run.workflow,
+        type: workflowKindOf(run),
         lifecycle: run.lifecycle,
         step: run.step,
         createdAt: run.createdAt,
@@ -704,6 +761,7 @@ export class WorkflowCommandController {
     const lines: string[] = [
       `Workflow Run: ${run.id}`,
       `  Workflow:    ${run.workflow}`,
+      `  Type:        ${workflowKindOf(run)}`,
       `  Lifecycle:   ${run.lifecycle}`,
       `  Step:        ${run.step}`,
       `  Age:         ${ageStr}`,
@@ -713,6 +771,10 @@ export class WorkflowCommandController {
       `  Created:     ${new Date(run.createdAt).toISOString()}`,
       `  Updated:     ${new Date(run.updatedAt).toISOString()}`,
     ];
+
+    if (run.objective !== undefined) {
+      lines.push(`  Objective:   ${run.objective}`);
+    }
 
     if (run.startedAt) {
       lines.push(`  Started:     ${new Date(run.startedAt).toISOString()}`);
@@ -725,6 +787,25 @@ export class WorkflowCommandController {
     lines.push(`    Source:    ${run.definitionSource}`);
     lines.push(`    Mode:      ${run.snapshot.mode}`);
     lines.push(`    Requires:  ${requiresStr}`);
+
+    const effectiveBudget = run.budget ?? run.snapshot.budget;
+    if (effectiveBudget && Object.keys(effectiveBudget).length > 0) {
+      lines.push(`  Budget:`);
+      if (effectiveBudget.maxTurns !== undefined) {
+        lines.push(`    Max Turns:     ${effectiveBudget.maxTurns}`);
+      }
+      if (effectiveBudget.maxDuration !== undefined) {
+        lines.push(`    Max Duration:  ${effectiveBudget.maxDuration}`);
+      }
+      if (effectiveBudget.maxAttempts !== undefined) {
+        lines.push(`    Max Attempts:  ${effectiveBudget.maxAttempts}`);
+      }
+      if (effectiveBudget.onExhaustion !== undefined) {
+        lines.push(`    On Exhaustion: ${effectiveBudget.onExhaustion}`);
+      }
+    }
+
+    lines.push(`  Verification: ${describeVerification(run)}`);
 
     const dataKeys = Object.keys(run.data);
     if (dataKeys.length === 0) {

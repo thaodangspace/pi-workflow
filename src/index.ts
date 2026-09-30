@@ -18,6 +18,7 @@ import {
   type WorkflowCommandControllerOptions,
   registerWorkflowCommand,
 } from "./commands.ts";
+import { GoalCommandController, registerGoalCommand } from "./goal-commands.ts";
 import { createWorkflowTools } from "./tools.ts";
 import type { WorkflowSessionTarget } from "./types.ts";
 
@@ -76,6 +77,10 @@ export * from "pi-loop/service";
 // Re-export commands & lifecycle controller
 export * from "./commands.ts";
 
+// Re-export built-in goal definition factory and /goal facade
+export * from "./goal.ts";
+export * from "./goal-commands.ts";
+
 /**
  * Factory to create a WorkflowRunRegistry.
  */
@@ -112,6 +117,15 @@ export function createWorkflowCommandController(
   return new WorkflowCommandController(options);
 }
 
+/**
+ * Factory to create a GoalCommandController.
+ */
+export function createGoalCommandController(
+  options: ConstructorParameters<typeof GoalCommandController>[0]
+): GoalCommandController {
+  return new GoalCommandController(options);
+}
+
 export interface WorkflowExtensionOptions {
   /**
    * Optional pre-built, session-scoped capability registry. When provided,
@@ -131,6 +145,7 @@ export interface WorkflowExtensionHandle {
   dispatcher: WorkflowDispatcher;
   adapter: LoopSchedulerAdapter;
   controller: WorkflowCommandController;
+  goalController: GoalCommandController;
 }
 
 /**
@@ -170,6 +185,13 @@ export default function workflowExtension(
   });
 
   registerWorkflowCommand(pi, controller);
+
+  const goalController = new GoalCommandController({
+    workflowController: controller,
+    pi,
+  });
+
+  registerGoalCommand(pi, goalController);
 
   const events = (pi as any).events;
   if (events && typeof capabilityRegistry.bindEventBus === "function") {
@@ -285,5 +307,5 @@ export default function workflowExtension(
     capabilityRegistry.dispose();
   });
 
-  return { registry, capabilityRegistry, dispatcher, adapter, controller };
+  return { registry, capabilityRegistry, dispatcher, adapter, controller, goalController };
 }

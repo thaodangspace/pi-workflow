@@ -14,6 +14,8 @@ import {
   LOOP_SERVICE_VERSION,
 } from "pi-loop/service";
 import workflowExtension, {
+  createGoalDefinition,
+  extractWorkflowRunId,
   LoopSchedulerAdapter,
   WorkflowDispatcher,
   WorkflowOwnershipError,
@@ -259,6 +261,34 @@ describe("LoopSchedulerAdapter session lifecycle", () => {
     assert.equal(adapter.ownerId, owner);
     assert.equal(adapter.getSessionGeneration(), generation);
     assert.equal(adapter.getActiveSessionId(), "session-A");
+  });
+
+  // 8b. A goal run keeps its durable identity/objective and a single linkage
+  // across a same-session tree refresh (reconstruction from the branch only).
+  it("retains goal identity/objective and one scheduler linkage across a same-session refresh", async () => {
+    const { adapter, registry, service } = createHarness();
+    adapter.beginSession("session-A");
+    adapter.attachService(service);
+
+    const goalDef = createGoalDefinition("keep goal identity across a tree refresh");
+    const { run } = await adapter.startRun(goalDef, { runId: "run-goal-refresh" });
+    assert.equal(run.type, "goal");
+
+    // Simulate session_tree: rebuild run state from the active branch only.
+    registry.refresh();
+    adapter.beginSession("session-A"); // same session => no ownership rotation
+
+    const report = await adapter.reconcile();
+    const reloaded = registry.requireRun(run.id);
+    assert.equal(reloaded.type, "goal");
+    assert.equal(reloaded.snapshot.type, "goal");
+    assert.equal(reloaded.objective, "keep goal identity across a tree refresh");
+    assert.equal(reloaded.snapshot.objective, "keep goal identity across a tree refresh");
+
+    const linked = service.listTasks().filter((t) => extractWorkflowRunId(t.prompt) === run.id);
+    assert.equal(linked.length, 1);
+    assert.ok(linked[0].prompt.includes("keep goal identity across a tree refresh"));
+    assert.equal(report.orphans.filter((o) => o.runId === run.id).length, 0);
   });
 
   // 9. Shutdown leaves the adapter with no active session/service binding.
