@@ -29,6 +29,28 @@ export function deterministicJsonStringify(value: any, space = 2): string {
   return JSON.stringify(sortJson(value), null, space);
 }
 
+/**
+ * Extracts a workflow run ID from an iteration prompt text.
+ * Matches standard prompt header "- Run ID: <id>" or explicit marker "[pi-workflow:run:<id>]".
+ * Returns undefined if no run ID is present.
+ */
+export function extractWorkflowRunId(prompt: string): string | undefined {
+  if (typeof prompt !== "string" || !prompt) {
+    return undefined;
+  }
+  const match = prompt.match(/(?:^|\n)-\s*Run ID:\s*([^\s\r\n]+)/m);
+  if (match) {
+    return match[1].trim();
+  }
+  const markerMatch =
+    prompt.match(/\[pi-workflow:run:([^\s\]]+)\]/) ||
+    prompt.match(/<!--\s*pi-workflow:run:([^\s>]+)\s*-->/);
+  if (markerMatch) {
+    return markerMatch[1].trim();
+  }
+  return undefined;
+}
+
 export interface BuildIterationPromptOptions {
   /** Authoritative run record */
   run: WorkflowRun;
