@@ -321,9 +321,8 @@ describe("LoopSchedulerAdapter & pi-loop Integration", () => {
         }
       );
 
-      // Ensure no dangling active run was created
-      assert.equal(registry.hasRun("run-fail-unavailable"), true);
-      assert.equal(registry.getRun("run-fail-unavailable")?.lifecycle, "cancelled");
+      // Ensure no dummy run was created in registry
+      assert.equal(registry.hasRun("run-fail-unavailable"), false);
     });
 
     it("scheduleWakeup fails with WorkflowSchedulerUnavailableError when service is disposed", async () => {
@@ -357,6 +356,37 @@ describe("LoopSchedulerAdapter & pi-loop Integration", () => {
           assert.match(err.message, /no linked scheduler task ID/);
           return true;
         }
+      );
+    });
+
+    it("scheduleRun fails closed when listTasks throws error without blindly creating duplicate tasks", async () => {
+      const def = parseWorkflowContent(WORKFLOW_SELF_PACED_1, { path: "/test/alpha.md", scope: "project" });
+      const run = registry.createRun(def, { runId: "run-dup-test" });
+      registry.updateRun(run.id, { loopTaskId: "task-existing-123" });
+
+      const brokenService: any = {
+        version: LOOP_SERVICE_VERSION,
+        sessionId: "broken-session",
+        isAvailable: () => true,
+        listTasks: () => {
+          throw new Error("Internal scheduler storage failure");
+        },
+        scheduleSelfPaced: () => {
+          assert.fail("scheduleSelfPaced should not be called when listTasks throws!");
+        },
+      };
+
+      const customAdapter = new LoopSchedulerAdapter({
+        registry,
+        dispatcher,
+        service: brokenService,
+      });
+
+      await assert.rejects(
+        async () => {
+          await customAdapter.scheduleRun(run.id);
+        },
+        /Internal scheduler storage failure/
       );
     });
   });
@@ -571,6 +601,76 @@ describe("LoopSchedulerAdapter & pi-loop Integration", () => {
           {} as any
         );
       }, /tool call signal does not match the active iteration signal/);
+    });
+
+    it("injects fresh current prompt reflecting updated step, turns, and data on subsequent iterations", async () => {
+      const def = parseWorkflowContent(WORKFLOW_SELF_PACED_1, { path: "/test/alpha.md", scope: "project" });
+      const { run, task } = await adapter.startRun(def, { runId: "run-fresh-prompt" });
+
+      // Initial prompt stored in pi-loop has step: INITIAL, turns: 0
+      const initialPromptInLoop = task.prompt;
+      assert.match(initialPromptInLoop, /- Current Step: INITIAL/);
+      assert.match(initialPromptInLoop, /- Turn: 0/);
+
+      // --- Iteration 1 ---
+      const controller1 = new AbortController();
+      const beforeRes1 = adapter.handleBeforeAgentStart({ prompt: initialPromptInLoop });
+      assert(beforeRes1?.message);
+      assert.match(beforeRes1.message.content[0].text, /- Current Step: INITIAL/);
+
+      adapter.handleTurnStart({ signal: controller1.signal });
+
+      const tools = createWorkflowTools({ dispatcher, registry });
+      const transitionTool = tools.find((t) => t.name === "workflow_transition")!;
+      const continueTool = tools.find((t) => t.name === "workflow_continue")!;
+
+      // Transition step to "IMPLEMENTING" and update run data
+      await transitionTool.execute(
+        "t-1",
+        { toStep: "IMPLEMENTING", data: { filesChanged: ["auth.ts"], status: "in-progress" } },
+        controller1.signal,
+        undefined,
+        {} as any
+      );
+
+      // Continue to next wakeup
+      await continueTool.execute(
+        "t-2",
+        { wakeupName: "retry", reason: "waiting for test run" },
+        controller1.signal,
+        undefined,
+        {} as any
+      );
+
+      adapter.handleAgentSettled();
+
+      // --- Iteration 2 (Wakeup arrives) ---
+      // In pi-loop, the dispatched prompt text is the original text registered at task creation
+      const controller2 = new AbortController();
+      const beforeRes2 = adapter.handleBeforeAgentStart({ prompt: initialPromptInLoop });
+
+      // handleBeforeAgentStart must intercept and return fresh prompt
+      assert(beforeRes2?.message);
+      const freshText = beforeRes2.message.content[0].text;
+      assert.match(freshText, /- Current Step: IMPLEMENTING/);
+      assert.doesNotMatch(freshText, /- Current Step: INITIAL/);
+      assert.match(freshText, /- Turn: 1/);
+      assert.match(freshText, /"filesChanged": \[\s*"auth.ts"\s*\]/);
+      assert.match(freshText, /"status": "in-progress"/);
+
+      // Verify details payload
+      assert.deepEqual(beforeRes2.message.details, {
+        runId: run.id,
+        workflow: run.workflow,
+        step: "IMPLEMENTING",
+        turns: 1,
+        attempts: 0,
+        lifecycle: "active",
+        data: {
+          filesChanged: ["auth.ts"],
+          status: "in-progress",
+        },
+      });
     });
   });
 });

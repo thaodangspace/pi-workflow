@@ -132,7 +132,7 @@ export default function workflowExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    adapter.handleBeforeAgentStart(event, ctx);
+    return adapter.handleBeforeAgentStart(event, ctx) as any;
   });
 
   pi.on("turn_start", async (_event, ctx) => {

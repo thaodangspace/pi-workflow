@@ -351,6 +351,16 @@ export interface WorkflowSchedulerDiagnostic {
   taskId?: string;
 }
 
+export interface WorkflowBeforeAgentStartResult {
+  message?: {
+    customType: string;
+    content: Array<{ type: "text"; text: string }>;
+    display: boolean;
+    details?: unknown;
+  };
+  systemPrompt?: string;
+}
+
 export interface ReconcileResult {
   matched: Array<{ runId: string; taskId: string }>;
   recreated: Array<{ runId: string; oldTaskId?: string; newTaskId: string }>;
@@ -519,14 +529,10 @@ export class LoopSchedulerAdapter {
     // Idempotency: check if run already has a live scheduled task in pi-loop
     const existingTaskId = this.runToTaskMap.get(run.id) ?? run.loopTaskId;
     if (existingTaskId) {
-      try {
-        const liveTasks = service.listTasks();
-        const existing = liveTasks.find((t) => t.id === existingTaskId);
-        if (existing) {
-          return existing;
-        }
-      } catch {
-        // If listing fails, proceed with scheduling
+      const liveTasks = service.listTasks();
+      const existing = liveTasks.find((t) => t.id === existingTaskId);
+      if (existing) {
+        return existing;
       }
     }
 
@@ -614,6 +620,9 @@ export class LoopSchedulerAdapter {
     definitionOrSnapshot: WorkflowDefinitionV1 | WorkflowSnapshotV1,
     options: StartRunOptions = {}
   ): Promise<{ run: WorkflowRun; task: LoopTaskSummary }> {
+    // Assert scheduler service is available before creating any run record
+    this.assertServiceAvailable();
+
     const run = this.registry.createRun(definitionOrSnapshot, options);
     try {
       const task = await this.scheduleRun(run, options);
@@ -817,16 +826,45 @@ export class LoopSchedulerAdapter {
   }
 
   /**
-   * Lifecycle hook: inspects outgoing prompt before agent start and records workflow run ID if present.
+   * Lifecycle hook: inspects outgoing prompt before agent start.
+   * If prompt belongs to an active workflow run, records run ID for turn binding
+   * and returns a fresh, deterministic iteration prompt containing current step,
+   * counters, and run data to append to the turn context.
    */
-  handleBeforeAgentStart(event: { prompt: string }, _ctx?: unknown): void {
+  handleBeforeAgentStart(
+    event: { prompt: string; systemPromptOptions?: unknown },
+    _ctx?: unknown
+  ): WorkflowBeforeAgentStartResult | undefined {
     const runId = extractWorkflowRunId(event.prompt);
-    if (runId) {
-      const run = this.registry.getRun(runId);
-      if (run && run.lifecycle === "active") {
-        this.pendingTurnRunId = runId;
-      }
+    if (!runId) {
+      return undefined;
     }
+    const run = this.registry.getRun(runId);
+    if (!run || run.lifecycle !== "active") {
+      return undefined;
+    }
+
+    this.pendingTurnRunId = runId;
+
+    // Generate fresh, deterministic prompt reflecting current run state, step, turn counters, and data
+    const freshPrompt = this.dispatcher.buildPrompt(run.id);
+
+    return {
+      message: {
+        customType: "workflow_iteration_prompt",
+        content: [{ type: "text", text: freshPrompt }],
+        display: false,
+        details: {
+          runId: run.id,
+          workflow: run.workflow,
+          step: run.step,
+          turns: run.turns,
+          attempts: run.attempts,
+          lifecycle: run.lifecycle,
+          data: run.data,
+        },
+      },
+    };
   }
 
   /**
