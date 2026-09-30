@@ -145,6 +145,20 @@ export interface ReconcileResult {
   diagnostics: WorkflowSchedulerDiagnostic[];
 }
 
+/**
+ * Safe, read-only projection of a run's linked task from authoritative
+ * scheduler state. Never exposes the task ID or prompt text (issue #10).
+ */
+export interface LinkedTaskProjection {
+  /** True when a task with the linked ID exists in authoritative state. */
+  readonly found: boolean;
+  /** True when the live task's prompt identity belongs to `runId`. */
+  readonly ownedByRun: boolean;
+  /** Absolute next fire time when the task exposes one. */
+  readonly nextFireAt?: number;
+  readonly pending: boolean;
+}
+
 export interface LoopSchedulerAdapterOptions {
   registry: WorkflowRunRegistry;
   dispatcher: WorkflowDispatcher;
@@ -580,6 +594,47 @@ export class LoopSchedulerAdapter {
   }
 
   /**
+   * Read-only, safe projection of a run's linked scheduler task from
+   * authoritative scheduler state.
+   *
+   * Ownership is proven from the live task's **prompt identity**
+   * (`extractWorkflowRunId`), not from the ephemeral in-memory run↔task map.
+   * After a restart or a corrupt cross-link, a durable link that points at a
+   * user `/loop` task or another run is therefore reported as not owned by this
+   * run instead of being misreported as `linked`. The task ID and prompt are
+   * never exposed by the returned projection.
+   *
+   * Returns `undefined` when the scheduler service cannot be consulted, so the
+   * caller can distinguish "unavailable" from "task absent".
+   */
+  getLinkedTaskProjection(runId: string, taskId?: string): LinkedTaskProjection | undefined {
+    const id = taskId ?? this.getLinkedTaskId(runId);
+    if (!id) {
+      return Object.freeze({ found: false, ownedByRun: false, pending: false });
+    }
+    if (!this.service || !this.service.isAvailable()) {
+      return undefined;
+    }
+    let tasks: LoopTaskSummary[];
+    try {
+      tasks = this.service.listTasks();
+    } catch {
+      return undefined;
+    }
+    const task = tasks.find((candidate) => candidate.id === id);
+    if (!task) {
+      return Object.freeze({ found: false, ownedByRun: false, pending: false });
+    }
+    const declaredRunId = extractWorkflowRunId(task.prompt);
+    return Object.freeze({
+      found: true,
+      ownedByRun: declaredRunId === runId,
+      ...(task.nextFireAt !== undefined && task.nextFireAt !== null ? { nextFireAt: task.nextFireAt } : {}),
+      pending: task.pending === true,
+    });
+  }
+
+  /**
    * Returns true when an ownership lease is still in force at the given time.
    * A lease without an expiry never lapses until explicitly released.
    */
@@ -873,6 +928,12 @@ export class LoopSchedulerAdapter {
 
     try {
       const decision = service.scheduleTaskWakeup(taskId, delayMs, reason);
+      // Durable, replay-equivalent high-value history fact (issue #10): record
+      // only the clamped delay, never the arbitrary reason/prompt/task ID, so
+      // the fact survives session reconstruction without carrying free text.
+      if (run) {
+        this.registry.recordWakeupScheduled(runId, { delayMs: decision.delayMs });
+      }
       // Next-wakeup is authoritative scheduler state, not a registry mutation:
       // notify observers so a passive status line reflects the new fire time.
       this.notifyChange();

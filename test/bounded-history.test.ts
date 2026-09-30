@@ -14,15 +14,19 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { WorkflowDispatcher } from "../src/dispatcher.ts";
 import { parseWorkflowContent } from "../src/parser.ts";
 import { WorkflowRunRegistry } from "../src/registry.ts";
+import { LoopSchedulerAdapter } from "../src/scheduler-adapter.ts";
 import {
+  MAX_DIAGNOSTIC_TEXT_LENGTH,
   MAX_RUN_HISTORY_ENTRIES,
   MAX_RUN_HISTORY_QUERY_LIMIT,
   MAX_RUN_RECOVERY_EVENTS,
 } from "../src/constants.ts";
 import { appendHistoryEntry } from "../src/run.ts";
 import type { WorkflowRunHistoryEntry } from "../src/types.ts";
+import { FakeLoopService } from "./fake-loop-service.ts";
 import { FakeSessionManager } from "./fake-session-manager.ts";
 
 const WORKFLOW_YAML = `---
@@ -471,6 +475,78 @@ describe("Bounded run history (issue #24)", () => {
       );
       assert.match(onB.history![1].summary, /BRANCH_B_ONLY/);
       assert.equal(onB.history!.length, 2);
+    });
+  });
+
+  // =========================================================================
+  // Issue #10 — durable wakeup fact and projection-boundary sanitization
+  // =========================================================================
+  describe("issue #10 history coverage", () => {
+    it("records a bounded wakeup_scheduled fact (no free text) that survives reconstruction", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const service = new FakeLoopService();
+      const adapter = new LoopSchedulerAdapter({
+        registry,
+        dispatcher: new WorkflowDispatcher(registry),
+        service,
+      });
+
+      const run = registry.createRun(parseDef(), { runId: "wfrun-wakeup" });
+      await adapter.scheduleRun(run.id);
+      // The arbitrary reason must never be retained; only the clamped delay.
+      const decision = await adapter.scheduleWakeup({
+        runId: run.id,
+        delayMs: 5 * 60_000,
+        reason: "secret reason token=abcdef123456 should not be recorded",
+      });
+      assert.equal(decision.delayMs, 5 * 60_000);
+
+      const live = registry.requireRun(run.id);
+      const entry = live.history!.find((h) => h.action === "wakeup_scheduled");
+      assert.ok(entry, "wakeup_scheduled history fact missing");
+      assert.equal((entry!.details as any).delayMs, 5 * 60_000);
+      assert.match(entry!.summary, /Wakeup scheduled in 300000ms/);
+      assert.ok(!JSON.stringify(entry).includes("abcdef123456"), "free-text reason leaked into history");
+      assert.ok(!JSON.stringify(entry).includes("secret reason"));
+      assert.ok(!JSON.stringify(entry).includes("task-self-"), "task id leaked into history");
+
+      // Reconstruction restores the same bounded projection, including the wakeup fact.
+      const replayed = new WorkflowRunRegistry();
+      replayed.reconstructFromSession(session);
+      const replayedRun = replayed.requireRun("wfrun-wakeup");
+      assert.deepEqual(replayedRun.history, live.history);
+      assert.equal(replayedRun.history!.some((h) => h.action === "wakeup_scheduled"), true);
+    });
+
+    it("sanitizes raw history summaries/details at the projection boundary and replays identically", () => {
+      const session = new FakeSessionManager();
+      const live = new WorkflowRunRegistry(session);
+      const run = live.createRun(parseDef(), { runId: "wfrun-hist-raw" });
+
+      const longReason = `${"x".repeat(2000)} password is hunter2`;
+      live.transitionStep(run.id, { toStep: "STEP_B", reason: longReason });
+      live.blockRun(run.id, { reason: "token is abcdef123456", requiresHuman: true });
+
+      const entries = live.getRunHistory(run.id).entries;
+      const transition = entries.find((e) => e.action === "transition")!;
+      const block = entries.find((e) => e.action === "block")!;
+
+      // Summary is bounded and redacted; arbitrary long prose is not copied wholesale.
+      assert.ok(transition.summary.length <= MAX_DIAGNOSTIC_TEXT_LENGTH + 64);
+      assert.ok(transition.summary.length < longReason.length);
+      assert.ok(!transition.summary.includes("hunter2"));
+      assert.ok(!JSON.stringify(transition.details).includes("hunter2"));
+      assert.ok(!JSON.stringify(block.details).includes("abcdef123456"));
+      assert.match(String((block.details as any).reason), /\[redacted\]/);
+
+      // Effect/target state semantics are preserved (only the projection is transformed).
+      assert.equal(live.requireRun(run.id).blocker!.reason, "token is abcdef123456");
+
+      // Replay reproduces the sanitized projection byte-for-byte.
+      const replayed = new WorkflowRunRegistry();
+      replayed.reconstructFromSession(session);
+      assert.deepEqual(replayed.requireRun(run.id).history, live.requireRun(run.id).history);
     });
   });
 });

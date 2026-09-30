@@ -38,6 +38,16 @@ import {
   MAX_STATUS_LINE_LENGTH,
 } from "./constants.ts";
 import { isTerminalLifecycle } from "./run.ts";
+import { sanitizeDiagnosticText } from "./sanitize.ts";
+
+// The canonical sanitization policy lives in `./sanitize.ts` (shared with the
+// history-projection boundary). Re-exported here to preserve the public surface.
+export {
+  sanitizeDiagnosticText,
+  sanitizeHistoryDetails,
+  type SanitizedText,
+  type SanitizeDetailsOptions,
+} from "./sanitize.ts";
 import type { LoopSchedulerAdapter } from "./scheduler-adapter.ts";
 import {
   type BlockerCategory,
@@ -50,94 +60,6 @@ import {
   type WorkflowKind,
   workflowKindOf,
 } from "./types.ts";
-
-// ---------------------------------------------------------------------------
-// Free-text sanitization
-// ---------------------------------------------------------------------------
-
-/** Result of sanitizing a user/model-controlled diagnostic string. */
-export interface SanitizedText {
-  /** Bounded, inline-safe, redacted text (empty when omitted). */
-  readonly text: string;
-  /** True when the source was truncated to the bounded length. */
-  readonly truncated: boolean;
-  /** True when at least one credential-shaped substring was redacted. */
-  readonly redacted: boolean;
-  /** True when the source was absent/empty and nothing is shown. */
-  readonly omitted: boolean;
-}
-
-const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
-const WHITESPACE_RUN = /[ \t\r\n]+/g;
-
-interface RedactionRule {
-  readonly pattern: RegExp;
-  readonly replacement: string;
-}
-
-/**
- * Credential-shaped substrings redacted from diagnostic text. Best-effort only:
- * the policy is explicitly that arbitrary prose cannot be proven secret-free,
- * so values are also bounded and omission-marked.
- */
-const REDACTION_RULES: readonly RedactionRule[] = [
-  {
-    pattern: /-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?-----END[^-]*PRIVATE KEY-----/gi,
-    replacement: "[redacted private key]",
-  },
-  { pattern: /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b/g, replacement: "[redacted key]" },
-  { pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, replacement: "[redacted token]" },
-  { pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, replacement: "[redacted token]" },
-  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: "[redacted aws key]" },
-  {
-    pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
-    replacement: "[redacted jwt]",
-  },
-  {
-    pattern: /\b(authorization|bearer|password|passwd|secret|token|api[_-]?key)\b(\s*[:=]\s*|\s+)(?!\[redacted)([^\s,;]+)/gi,
-    replacement: "$1$2[redacted]",
-  },
-  { pattern: /\/\/[^/\s:@]+:[^/\s@]+@/g, replacement: "//[redacted]@" },
-];
-
-/**
- * Sanitize a user/model-controlled diagnostic string for inline display.
- *
- * See the module-level "Free-text safety policy". Never claims the result is
- * secret-free; it bounds, normalizes, and redacts obvious credential shapes.
- */
-export function sanitizeDiagnosticText(
-  value: unknown,
-  maxLength: number = MAX_DIAGNOSTIC_TEXT_LENGTH
-): SanitizedText {
-  if (typeof value !== "string") {
-    return Object.freeze({ text: "", truncated: false, redacted: false, omitted: true });
-  }
-  const normalized = value.replace(/\r\n?/g, "\n").replace(CONTROL_CHARS, "");
-  const inline = normalized.replace(WHITESPACE_RUN, " ").trim();
-  if (inline.length === 0) {
-    return Object.freeze({ text: "", truncated: false, redacted: false, omitted: true });
-  }
-
-  let redactedFlag = false;
-  let safe = inline;
-  for (const rule of REDACTION_RULES) {
-    safe = safe.replace(rule.pattern, (match, ...groups) => {
-      redactedFlag = true;
-      // Re-expand `$1`/`$2` capture references in the replacement.
-      return rule.replacement.replace(/\$(\d)/g, (_, n: string) => String(groups[Number(n) - 1] ?? ""));
-    });
-  }
-
-  const limit = Number.isFinite(maxLength) ? Math.max(0, Math.floor(maxLength)) : MAX_DIAGNOSTIC_TEXT_LENGTH;
-  let truncated = false;
-  if (safe.length > limit) {
-    truncated = true;
-    safe = `${safe.slice(0, limit)}…[+${safe.length - limit} chars]`;
-  }
-
-  return Object.freeze({ text: safe, truncated, redacted: redactedFlag, omitted: false });
-}
 
 // ---------------------------------------------------------------------------
 // Time helpers (shared by status output and the TUI line)
@@ -234,7 +156,10 @@ export function projectSchedulerLinkage(
   }
 
   const ownedByCurrent = Boolean(run.lease && run.lease.ownerId === adapter.ownerId);
-  if (!adapter.isAvailable()) {
+  // Ownership is proven from the live task's prompt identity, never from the
+  // ephemeral run↔task map, so a stale/corrupt cross-link cannot be misreported.
+  const projection = adapter.getLinkedTaskProjection(run.id, taskId);
+  if (!projection) {
     return Object.freeze({
       state: "unavailable",
       taskLinked: true,
@@ -242,31 +167,7 @@ export function projectSchedulerLinkage(
       detail: "pi-loop scheduler service is unavailable; linkage cannot be verified",
     });
   }
-
-  const service = adapter.getService();
-  if (!service) {
-    return Object.freeze({
-      state: "unavailable",
-      taskLinked: true,
-      ownedByCurrent,
-      detail: "pi-loop scheduler service is not attached; linkage cannot be verified",
-    });
-  }
-
-  let tasks;
-  try {
-    tasks = service.listTasks();
-  } catch {
-    return Object.freeze({
-      state: "unavailable",
-      taskLinked: true,
-      ownedByCurrent,
-      detail: "pi-loop scheduler query failed; linkage cannot be verified",
-    });
-  }
-
-  const task = tasks.find((candidate) => candidate.id === taskId);
-  if (!task) {
+  if (!projection.found) {
     return Object.freeze({
       state: "stale",
       taskLinked: true,
@@ -274,24 +175,22 @@ export function projectSchedulerLinkage(
       detail: "linked scheduler task no longer exists",
     });
   }
-
-  const mappedRunId = adapter.getLinkedRunId(taskId);
-  if (mappedRunId !== undefined && mappedRunId !== run.id) {
+  if (!projection.ownedByRun) {
     return Object.freeze({
       state: "ambiguous",
       taskLinked: true,
       ownedByCurrent,
-      detail: "linked scheduler task belongs to a different run",
+      detail: "linked scheduler task is not owned by this run",
     });
   }
 
   return Object.freeze({
     state: "linked",
     taskLinked: true,
-    ...(task.nextFireAt !== undefined && task.nextFireAt !== null ? { nextFireAt: task.nextFireAt } : {}),
-    pending: task.pending === true,
+    ...(projection.nextFireAt !== undefined ? { nextFireAt: projection.nextFireAt } : {}),
+    pending: projection.pending,
     ownedByCurrent,
-    detail: task.pending === true ? "linked; a missed run is queued" : "linked",
+    detail: projection.pending ? "linked; a missed run is queued" : "linked",
   });
 }
 

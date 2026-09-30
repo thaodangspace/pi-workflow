@@ -28,6 +28,7 @@ import {
   applyRunUpdate,
   applyStepTransition,
   applyVerifyRun,
+  applyWakeupScheduled,
   createWorkflowRun,
   getHistoryProjection,
   getRecoveryProjection,
@@ -54,6 +55,7 @@ import {
   type TransitionStepOptions,
   type UpdateRunOptions,
   type VerifyCompletionOptions,
+  type WakeupScheduledOptions,
   WorkflowConcurrencyError,
   type WorkflowDefinitionV1,
   WorkflowInvalidTransitionError,
@@ -504,6 +506,31 @@ export class WorkflowRunRegistry {
   }
 
   /**
+   * Record a durable, replay-equivalent `wakeup_scheduled` history fact.
+   *
+   * Audit-only: no run lifecycle transition. Terminal runs are not persisted so
+   * replay matches the live path. Only safe scalar metadata (the clamped delay)
+   * is stored; never the wakeup reason, task prompt or task ID.
+   */
+  recordWakeupScheduled(runId: string, options: WakeupScheduledOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    if (isTerminalLifecycle(current.lifecycle)) {
+      return current;
+    }
+    const updated = applyWakeupScheduled(current, options);
+    const entryData = buildMutationEntryData(
+      "wakeup_scheduled",
+      runId,
+      updated.workflow,
+      { delayMs: options.delayMs },
+      { timestamp: updated.updatedAt }
+    );
+    this.persistEntry(entryData);
+    this.commitRun(runId, updated);
+    return updated;
+  }
+
+  /**
    * Acquire or renew an ownership lease on a run.
    */
   acquireLease(runId: string, options: AcquireLeaseOptions): WorkflowRun {
@@ -878,6 +905,12 @@ export class WorkflowRunRegistry {
                 resultSummary: p.resultSummary,
                 reconciledAt: timestamp,
                 eventId: typeof p.eventId === "string" ? p.eventId : undefined,
+              });
+              break;
+            case "wakeup_scheduled":
+              updated = applyWakeupScheduled(current, {
+                delayMs: typeof p.delayMs === "number" ? p.delayMs : 0,
+                timestamp,
               });
               break;
             case "recovery":

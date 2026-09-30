@@ -18,6 +18,7 @@ import {
   formatStatusList,
   projectSchedulerLinkage,
   sanitizeDiagnosticText,
+  sanitizeHistoryDetails,
 } from "../src/observability.ts";
 import { parseWorkflowContent } from "../src/parser.ts";
 import { WorkflowRunRegistry } from "../src/registry.ts";
@@ -107,6 +108,38 @@ describe("diagnostic text sanitization policy (issue #10)", () => {
     assert.equal(out.redacted, true);
     assert.ok(!out.text.includes("p4ssw0rd"));
   });
+
+  it("redacts natural-language copula forms (password is …, token is …, api key was …)", () => {
+    const cases: Array<[string, string]> = [
+      ["password is hunter2", "hunter2"],
+      ["token is abcdef123456", "abcdef123456"],
+      ["secret: shhhh-value", "shhhh-value"],
+      ["api key was zzzyyy123456", "zzzyyy123456"],
+      ["passwd = p@ss", "p@ss"],
+    ];
+    for (const [input, secret] of cases) {
+      const out = sanitizeDiagnosticText(input);
+      assert.equal(out.redacted, true, `expected redaction for ${input}`);
+      assert.ok(!out.text.includes(secret), `value "${secret}" leaked for "${input}"`);
+      assert.match(out.text, /\[redacted\]/);
+    }
+  });
+
+  it("recursively sanitizes and bounds history detail values", () => {
+    const out = sanitizeHistoryDetails({
+      reason: "token is abcdef123456",
+      nested: { note: "password is hunter2", codes: [1, 2, true, null, "secret is zzzyyy"] },
+      count: 3,
+    })!;
+    const json = JSON.stringify(out);
+    assert.ok(!json.includes("abcdef123456"));
+    assert.ok(!json.includes("hunter2"));
+    assert.ok(!json.includes("zzzyyy"));
+    assert.equal((out.nested as any).codes[0], 1);
+    assert.equal((out.nested as any).codes[2], true);
+    assert.equal((out.nested as any).codes[3], null);
+    assert.equal(out.count, 3);
+  });
 });
 
 describe("aggregate status projection (issue #10)", () => {
@@ -192,6 +225,26 @@ describe("scheduler linkage projection (issue #10)", () => {
     // Paused/blocked/terminal runs have no active wakeup.
     const paused = registry.pauseRun(run.id, { reason: "pause" });
     assert.equal(projectSchedulerLinkage(paused, adapter).state, "not-applicable");
+  });
+
+  it("classifies a durable link to a user /loop task or another run's task as ambiguous", async () => {
+    const { registry, adapter, service } = harness();
+    const runA = registry.createRun(parseDef(), { runId: "wfrun-cross-a" });
+    const runB = registry.createRun(parseDef(), { runId: "wfrun-cross-b" });
+    await adapter.scheduleRun(runA.id);
+    const taskA = adapter.getLinkedTaskId(runA.id)!;
+
+    // Corrupt cross-link: run B durably points at run A's task.
+    registry.updateRun(runB.id, { loopTaskId: taskA });
+    assert.equal(projectSchedulerLinkage(registry.requireRun(runB.id), adapter).state, "ambiguous");
+
+    // Durable link to a user /loop task (no workflow prompt identity).
+    const userTask = service.scheduleFixed(60_000, "ordinary user /loop task");
+    registry.updateRun(runB.id, { loopTaskId: userTask.id });
+    assert.equal(projectSchedulerLinkage(registry.requireRun(runB.id), adapter).state, "ambiguous");
+
+    // The genuine owner still resolves as linked.
+    assert.equal(projectSchedulerLinkage(registry.requireRun(runA.id), adapter).state, "linked");
   });
 
   it("never exposes a raw scheduler task id in the projection detail", async () => {

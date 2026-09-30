@@ -47,6 +47,7 @@ export const VALID_ACTIONS = new Set<WorkflowRunMutationAction>([
   "effect_begin",
   "effect_commit",
   "effect_reconcile",
+  "wakeup_scheduled",
   "recovery",
   "lease",
 ]);
@@ -403,6 +404,18 @@ function validatePayloadForAction(
         }
         if (p.reason !== undefined && typeof p.reason === "string") {
           validateEffectNote(p.reason, { runId });
+        }
+        break;
+      }
+      case "wakeup_scheduled": {
+        if (typeof p.delayMs !== "number" || !Number.isFinite(p.delayMs) || p.delayMs < 0) {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Wakeup scheduled mutation requires finite non-negative number "delayMs"`,
+            runId,
+            entryId,
+          };
         }
         break;
       }
