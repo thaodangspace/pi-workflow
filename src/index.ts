@@ -66,6 +66,10 @@ export * from "./tools.ts";
 // Re-export scheduler adapter
 export * from "./scheduler-adapter.ts";
 
+// Re-export the authoritative pi-loop service contract consumed for scheduling.
+// pi-loop/service is the single source of truth; pi-workflow does not redefine it.
+export * from "pi-loop/service";
+
 // Re-export commands & lifecycle controller
 export * from "./commands.ts";
 

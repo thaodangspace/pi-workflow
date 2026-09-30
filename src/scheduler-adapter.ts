@@ -5,11 +5,26 @@
  * pi-workflow owns workflow orchestration state, lifecycle, and model tools;
  * pi-loop owns timers, due queues, wakeups, coalescing, and scheduler persistence.
  *
- * This module conforms to the public versioned pi-loop/service boundary and discovery protocol
- * over pi.events without importing private pi-loop modules or duplicating timer/due-queue logic.
+ * This module consumes the authoritative public `pi-loop/service` contract and
+ * discovery protocol (imported, never copied) and translates scheduler errors into
+ * workflow-level errors. It never imports private pi-loop modules or duplicates
+ * timer/due-queue logic. Workflow-specific adapter/error/reconciliation logic stays here.
  */
 
 import { randomUUID } from "node:crypto";
+import {
+  DEFAULT_DISCOVERY_TIMEOUT_MS,
+  discoverLoopService,
+  LOOP_SERVICE_VERSION,
+  LoopServiceUnavailableError,
+  onLoopServiceChange,
+  type DiscoverLoopServiceOptions,
+  type EventBusLike,
+  type LoopServiceDiscovery,
+  type LoopServiceV1,
+  type LoopServiceWakeupDecision,
+  type LoopTaskSummary,
+} from "pi-loop/service";
 import {
   createLoopCapabilityRegistration,
   type WorkflowCapabilityRegistry,
@@ -39,129 +54,6 @@ import {
 } from "./types.ts";
 
 // ---------------------------------------------------------------------------
-// Public Versioned Service Protocol (pi-loop/service V1 Contract)
-// ---------------------------------------------------------------------------
-
-export const LOOP_SERVICE_VERSION = 1 as const;
-export type LoopServiceVersion = typeof LOOP_SERVICE_VERSION;
-
-/** Event-bus channel a consumer emits a discovery request on. */
-export const LOOP_SERVICE_DISCOVER_CHANNEL = "pi-loop:service:discover:v1";
-
-/** Prefix of the per-request reply channel. */
-export const LOOP_SERVICE_REPLY_CHANNEL_PREFIX = "pi-loop:service:reply:v1:";
-
-/** Event-bus channel a provider emits availability changes on. */
-export const LOOP_SERVICE_CHANGED_CHANNEL = "pi-loop:service:changed:v1";
-
-/** Default timeout for discovery requests in milliseconds. */
-export const DEFAULT_DISCOVERY_TIMEOUT_MS = 1_000;
-
-/** Minimal subset of pi.events required for the discovery protocol. */
-export interface EventBusLike {
-  emit(channel: string, data: unknown): void;
-  on(channel: string, handler: (data: unknown) => void): (() => void) | void;
-}
-
-export type LoopTaskMode = "fixed" | "self-paced" | "one-shot";
-
-/** Frozen summary snapshot of a scheduled task in pi-loop. */
-export interface LoopTaskSummary {
-  readonly id: string;
-  readonly mode: LoopTaskMode;
-  readonly prompt: string;
-  readonly maintenance: boolean;
-  readonly intervalMs?: number;
-  readonly cron?: string;
-  readonly timeZone?: string;
-  readonly nextFireAt?: number;
-  readonly expiresAt?: number;
-  readonly pending: boolean;
-  readonly reason?: string;
-}
-
-export interface LoopScheduleOptions {
-  readonly expiresAt?: number;
-}
-
-export interface LoopCronOptions extends LoopScheduleOptions {
-  readonly timeZone?: string;
-}
-
-export interface LoopSelfPacedOptions extends LoopScheduleOptions {
-  readonly fallbackDelayMs?: number;
-}
-
-export interface LoopServiceWakeupDecision {
-  readonly requestedMs: number;
-  readonly delayMs: number;
-  readonly clamped: boolean;
-  readonly nextFireAt: number;
-  readonly reason?: string;
-}
-
-/**
- * Public versioned LoopServiceV1 contract provided by pi-loop.
- */
-export interface LoopServiceV1 {
-  readonly version: LoopServiceVersion;
-  readonly sessionId: string;
-  isAvailable(): boolean;
-  scheduleFixed(intervalMs: number, prompt: string, options?: LoopScheduleOptions): LoopTaskSummary;
-  scheduleCron(expression: string, prompt: string, options?: LoopCronOptions): LoopTaskSummary;
-  scheduleOnce(at: number, prompt: string, options?: LoopScheduleOptions): LoopTaskSummary;
-  scheduleSelfPaced(prompt: string, options?: LoopSelfPacedOptions): LoopTaskSummary;
-  listTasks(): LoopTaskSummary[];
-  deleteTask(id: string): boolean;
-  scheduleTaskWakeup(id: string, delayMs: number, reason?: string): LoopServiceWakeupDecision;
-  stopTask(id: string): boolean;
-}
-
-export class LoopServiceUnavailableError extends Error {
-  readonly code = "loop-service-unavailable";
-  constructor(message = "the pi-loop service for this session is no longer available") {
-    super(message);
-    this.name = "LoopServiceUnavailableError";
-  }
-}
-
-export class LoopServiceInputError extends Error {
-  readonly code = "loop-service-input";
-  constructor(message: string) {
-    super(message);
-    this.name = "LoopServiceInputError";
-  }
-}
-
-export type LoopServiceStatus =
-  | { readonly version: LoopServiceVersion; readonly available: true; readonly sessionId: string }
-  | { readonly version: LoopServiceVersion; readonly available: false; readonly reason: string };
-
-export type LoopServiceDiscoveryResponse =
-  | {
-      readonly version: LoopServiceVersion;
-      readonly available: true;
-      readonly sessionId: string;
-      readonly service: LoopServiceV1;
-    }
-  | { readonly version: LoopServiceVersion; readonly available: false; readonly reason: string };
-
-export type LoopServiceDiscoveryFailure = "unavailable" | "timeout" | "invalid-response";
-
-export type LoopServiceDiscovery =
-  | { readonly ok: true; readonly service: LoopServiceV1 }
-  | {
-      readonly ok: false;
-      readonly reason: LoopServiceDiscoveryFailure;
-      readonly message: string;
-    };
-
-export interface DiscoverLoopServiceOptions {
-  timeoutMs?: number;
-  requestId?: () => string;
-}
-
-// ---------------------------------------------------------------------------
 // Scheduler Error Classes
 // ---------------------------------------------------------------------------
 
@@ -186,141 +78,6 @@ export class WorkflowSchedulerTaskNotFoundError extends WorkflowSchedulerError {
     this.name = "WorkflowSchedulerTaskNotFoundError";
     this.taskId = options?.taskId;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Protocol Validation Helpers
-// ---------------------------------------------------------------------------
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-export function isLoopServiceV1(value: unknown): value is LoopServiceV1 {
-  if (!isRecord(value) || value.version !== LOOP_SERVICE_VERSION || typeof value.sessionId !== "string") {
-    return false;
-  }
-  return (
-    typeof value.isAvailable === "function" &&
-    typeof value.scheduleFixed === "function" &&
-    typeof value.scheduleCron === "function" &&
-    typeof value.scheduleOnce === "function" &&
-    typeof value.scheduleSelfPaced === "function" &&
-    typeof value.listTasks === "function" &&
-    typeof value.deleteTask === "function" &&
-    typeof value.scheduleTaskWakeup === "function" &&
-    typeof value.stopTask === "function"
-  );
-}
-
-function parseStatus(data: unknown): LoopServiceStatus | undefined {
-  if (!isRecord(data) || data.version !== LOOP_SERVICE_VERSION || typeof data.available !== "boolean") {
-    return undefined;
-  }
-  if (data.available === false) {
-    return typeof data.reason === "string"
-      ? { version: LOOP_SERVICE_VERSION, available: false, reason: data.reason }
-      : undefined;
-  }
-  return typeof data.sessionId === "string"
-    ? { version: LOOP_SERVICE_VERSION, available: true, sessionId: data.sessionId }
-    : undefined;
-}
-
-function parseDiscoveryResponse(data: unknown): LoopServiceDiscoveryResponse | undefined {
-  const status = parseStatus(data);
-  if (status === undefined) {
-    return undefined;
-  }
-  if (!status.available) {
-    return { version: LOOP_SERVICE_VERSION, available: false, reason: status.reason };
-  }
-  const service = isRecord(data) ? data.service : undefined;
-  if (!isLoopServiceV1(service)) {
-    return undefined;
-  }
-  return { version: LOOP_SERVICE_VERSION, available: true, sessionId: status.sessionId, service };
-}
-
-/**
- * Discover the active pi-loop service for the current session over pi.events.
- */
-export function discoverLoopService(
-  events: EventBusLike,
-  options: DiscoverLoopServiceOptions = {}
-): Promise<LoopServiceDiscovery> {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS;
-  const requestId = (options.requestId ?? (() => randomUUID()))();
-  const replyChannel = `${LOOP_SERVICE_REPLY_CHANNEL_PREFIX}${requestId}`;
-
-  return new Promise<LoopServiceDiscovery>((resolve) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let unsubscribe: (() => void) | undefined;
-
-    const finish = (result: LoopServiceDiscovery): void => {
-      if (settled) return;
-      settled = true;
-      unsubscribe?.();
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
-      resolve(result);
-    };
-
-    const subscription = events.on(replyChannel, (data) => {
-      const response = parseDiscoveryResponse(data);
-      if (response === undefined) {
-        finish({
-          ok: false,
-          reason: "invalid-response",
-          message: "pi-loop replied with an unrecognized discovery response",
-        });
-        return;
-      }
-      if (!response.available) {
-        finish({ ok: false, reason: "unavailable", message: response.reason });
-        return;
-      }
-      finish({ ok: true, service: response.service });
-    });
-
-    if (typeof subscription === "function") {
-      unsubscribe = subscription;
-    }
-
-    events.emit(LOOP_SERVICE_DISCOVER_CHANNEL, {
-      version: LOOP_SERVICE_VERSION,
-      requestId,
-      replyChannel,
-    });
-
-    if (!settled) {
-      timer = setTimeout(() => {
-        finish({
-          ok: false,
-          reason: "timeout",
-          message: `no pi-loop service replied within ${timeoutMs}ms`,
-        });
-      }, timeoutMs);
-    }
-  });
-}
-
-/**
- * Watch for pi-loop service availability broadcasts.
- */
-export function onLoopServiceChange(
-  events: EventBusLike,
-  handler: (status: LoopServiceStatus) => void
-): () => void {
-  const subscription = events.on(LOOP_SERVICE_CHANGED_CHANNEL, (data) => {
-    const status = parseStatus(data);
-    if (status !== undefined) {
-      handler(status);
-    }
-  });
-  return typeof subscription === "function" ? subscription : () => {};
 }
 
 // ---------------------------------------------------------------------------

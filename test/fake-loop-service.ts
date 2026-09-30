@@ -5,7 +5,6 @@
 import { randomUUID } from "node:crypto";
 import {
   type EventBusLike,
-  isLoopServiceV1,
   LOOP_SERVICE_CHANGED_CHANNEL,
   LOOP_SERVICE_DISCOVER_CHANNEL,
   LOOP_SERVICE_VERSION,
@@ -15,11 +14,10 @@ import {
   type LoopServiceStatus,
   type LoopServiceV1,
   type LoopServiceWakeupDecision,
-  type LoopTaskMode,
   type LoopTaskSummary,
   LoopServiceInputError,
   LoopServiceUnavailableError,
-} from "../src/scheduler-adapter.ts";
+} from "pi-loop/service";
 
 export interface FakeLoopServiceOptions {
   sessionId?: string;
