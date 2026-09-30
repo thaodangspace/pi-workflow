@@ -8,11 +8,13 @@ import { randomUUID } from "node:crypto";
 import { formatDuration, parseDuration } from "./duration.ts";
 import { buildIterationPrompt } from "./prompt.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
+import { checkRunBudgetExhaustion } from "./run.ts";
 import {
   type DispatchIterationOptions,
   type IterationBinding,
   type ResolveWakeupDelayOptions,
   type ResolvedWakeupDelay,
+  WorkflowBudgetExhaustedError,
   WorkflowInvalidTransitionError,
   WorkflowIterationError,
   type WorkflowIterationContext,
@@ -140,11 +142,37 @@ export class WorkflowDispatcher {
    */
   beginIteration(runId: string, options: DispatchIterationOptions = {}): IterationBinding {
     const run = this.registry.requireRun(runId);
-    if (run.lifecycle !== "active") {
+    if (run.lifecycle !== "active" && run.lifecycle !== "verifying") {
       throw new WorkflowInvalidTransitionError(
         runId,
-        `Cannot dispatch iteration for run "${runId}" in lifecycle "${run.lifecycle}". Run must be "active".`,
+        `Cannot dispatch iteration for run "${runId}" in lifecycle "${run.lifecycle}". Run must be "active" or "verifying".`,
         { fromLifecycle: run.lifecycle, action: "dispatch" }
+      );
+    }
+
+    // Check hard budget limits before dispatching
+    const exhaustion = checkRunBudgetExhaustion(run);
+    if (exhaustion.exhausted) {
+      const budgetPolicy = run.budget ?? run.snapshot.budget;
+      if (budgetPolicy?.onExhaustion === "cancel") {
+        this.registry.cancelRun(runId, { reason: exhaustion.reason });
+      } else {
+        this.registry.blockRun(runId, {
+          reason: exhaustion.reason!,
+          category: "human-required",
+          requiresHuman: true,
+        });
+      }
+      if (options.schedulerPort?.cancelWakeup) {
+        try {
+          options.schedulerPort.cancelWakeup(runId);
+        } catch {
+          // ignore
+        }
+      }
+      throw new WorkflowBudgetExhaustedError(
+        `Cannot dispatch iteration for run "${runId}": ${exhaustion.reason}`,
+        { runId, dimension: exhaustion.dimension, limit: exhaustion.limit, actual: exhaustion.actual }
       );
     }
 
@@ -324,12 +352,13 @@ export class WorkflowDispatcher {
     const run = this.registry.requireRun(active.runId);
     const snapshot = run.snapshot;
 
-    const budget = snapshot.budget;
+    const budget = run.budget ?? snapshot.budget;
     const maxTurns = budget?.maxTurns;
     const maxAttempts = budget?.maxAttempts;
     const maxDuration = budget?.maxDuration;
     const maxDurationMs = budget?.maxDurationMs;
     const maxCost = budget?.maxCost;
+    const maxTokens = budget?.maxTokens;
 
     const turnsRemaining = maxTurns !== undefined ? Math.max(0, maxTurns - run.turns) : undefined;
     const attemptsRemaining = maxAttempts !== undefined ? Math.max(0, maxAttempts - run.attempts) : undefined;
@@ -339,6 +368,8 @@ export class WorkflowDispatcher {
       const elapsed = Math.max(0, now - (run.startedAt ?? run.createdAt));
       durationRemainingMs = Math.max(0, maxDurationMs - elapsed);
     }
+
+    const exhaustion = checkRunBudgetExhaustion(run, now);
 
     const capabilitiesRecord: Record<string, boolean> = {};
     for (const req of snapshot.requires) {
@@ -362,6 +393,12 @@ export class WorkflowDispatcher {
         maxAttempts,
         attemptsRemaining,
         maxCost,
+        ...(maxCost !== undefined ? { costStatus: "unavailable" as const } : {}),
+        maxTokens,
+        ...(maxTokens !== undefined ? { tokensStatus: "unavailable" as const } : {}),
+        isExhausted: exhaustion.exhausted,
+        exhaustedDimension: exhaustion.dimension,
+        exhaustionReason: exhaustion.reason,
       },
       definition: {
         name: snapshot.name,

@@ -8,6 +8,7 @@ import {
   createWorkflowCompleteTool,
   createWorkflowContinueTool,
   createWorkflowTransitionTool,
+  createWorkflowVerifyTool,
 } from "../src/tools.ts";
 import {
   type WorkflowScheduleWakeupParams,
@@ -77,6 +78,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     const continueTool = createWorkflowContinueTool(dispatcher, registry);
     const blockTool = createWorkflowBlockTool(dispatcher, registry);
     const completeTool = createWorkflowCompleteTool(dispatcher, registry);
+    const verifyTool = createWorkflowVerifyTool(dispatcher, registry);
 
     const def = parseWorkflowContent(WORKFLOW_WITH_POLICIES, {
       path: "/workflows/lifecycle-test.md",
@@ -97,6 +99,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
       continueTool,
       blockTool,
       completeTool,
+      verifyTool,
       run,
       ac,
     };
@@ -431,7 +434,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
 
   describe("workflow_complete", () => {
     it("enters verification phase when definition specifies completion.verify: true", async () => {
-      const { registry, dispatcher, schedulerPort, completeTool, run, ac } = setup();
+      const { registry, dispatcher, schedulerPort, completeTool, verifyTool, run, ac } = setup();
 
       dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
@@ -453,15 +456,33 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
 
       const inVerify = registry.requireRun(run.id);
       assert.equal(inVerify.step, "VERIFYING");
-      assert.equal(inVerify.lifecycle, "active"); // Still active during verification
+      assert.equal(inVerify.lifecycle, "verifying");
       assert.equal(inVerify.data._verificationRequested, true);
 
-      // Second call to complete while in VERIFYING step completes the run
-      const finalResult = await completeTool.execute(
-        "call-comp2",
+      // Calling completeTool again while in VERIFYING step must fail closed to prevent gate bypass
+      await assert.rejects(
+        async () => {
+          await completeTool.execute(
+            "call-comp2",
+            { summary: "Trying to complete while verifying" },
+            ac.signal,
+            undefined,
+            {} as any
+          );
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowRunError);
+          assert.match(err.message, /currently in the verification phase/);
+          return true;
+        }
+      );
+
+      // Explicit verifier decision via workflow_verify completes the run
+      const finalResult = await verifyTool.execute(
+        "call-comp-verify",
         {
-          summary: "Verification passed with all checks green",
-          evidence: [{ type: "test", description: "suite passed 100%" }],
+          decision: "accept",
+          findings: "Verification passed with all checks green",
         },
         ac.signal,
         undefined,
@@ -474,7 +495,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
 
       const completed = registry.requireRun(run.id);
       assert.equal(completed.lifecycle, "completed");
-      assert.equal(completed.completion?.summary, "Verification passed with all checks green");
+      assert.equal(completed.completion?.summary, "Implementation finished, ready for verification");
 
       // Verify schedulerPort.cancelWakeup was invoked
       assert(schedulerPort.cancelled.includes(run.id));
@@ -505,11 +526,11 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("rejects completion of an already completed run", async () => {
-      const { registry, dispatcher, schedulerPort, completeTool, run, ac } = setup();
+      const { registry, dispatcher, schedulerPort, completeTool, verifyTool, run, ac } = setup();
 
       dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
-      // First complete verification
+      // First submit claim for verification
       await completeTool.execute(
         "call-comp4",
         { summary: "Verify", evidence: [{ type: "t", description: "d" }] },
@@ -517,9 +538,10 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
         undefined,
         {} as any
       );
-      await completeTool.execute(
+      // Verify and accept claim to complete run
+      await verifyTool.execute(
         "call-comp5",
-        { summary: "Done", evidence: [{ type: "t", description: "d" }] },
+        { decision: "accept", findings: "Done" },
         ac.signal,
         undefined,
         {} as any

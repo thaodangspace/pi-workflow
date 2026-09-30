@@ -61,6 +61,81 @@ export interface BuildIterationPromptOptions {
 }
 
 /**
+ * Builds a constrained verification iteration prompt combining:
+ * 1. Engine preamble describing verification role and Run ID
+ * 2. Submitted completion claim summary and evidence items
+ * 3. Specific workflow verifierPrompt policy instructions (if defined)
+ * 4. Current durable run data
+ * 5. Constrained verifier actions (workflow_verify accept/reject, or workflow_block)
+ */
+export function buildVerifierPrompt(options: BuildIterationPromptOptions): string {
+  const { run } = options;
+  const snapshot = run.snapshot;
+  const claim = run.completionClaim;
+  const verifierPrompt = snapshot.completion?.verifierPrompt;
+
+  const claimSummary = claim?.summary ?? (run.data?._pendingCompletionSummary as string) ?? "No summary provided";
+  const claimEvidence = claim?.evidence ?? [];
+
+  const lines: (string | null)[] = [
+    `# Workflow Completion Verification: ${run.workflow}`,
+    `- Run ID: ${run.id}`,
+    `- Definition: ${snapshot.name}`,
+    `- Source: ${run.definitionSource}`,
+    `- Step: VERIFYING`,
+    `- Verification Attempt: ${(run.verificationAttempts ?? 0) + 1}`,
+    ``,
+    `You are executing an authoritative verification turn for workflow "${run.workflow}".`,
+    `A completion claim has been submitted and must be verified before the workflow can be marked complete.`,
+    ``,
+    `## Submitted Completion Claim`,
+    `- Summary: ${claimSummary}`,
+  ];
+
+  if (claimEvidence.length > 0) {
+    lines.push(`- Evidence Items (${claimEvidence.length}):`);
+    for (const ev of claimEvidence) {
+      lines.push(`  * [${ev.type}] ${ev.description}${ev.url ? ` (${ev.url})` : ""}${ev.path ? ` (${ev.path})` : ""}`);
+    }
+  } else {
+    lines.push(`- Evidence Items: None provided`);
+  }
+
+  lines.push(``);
+  lines.push(`## Verification Instructions`);
+  if (verifierPrompt) {
+    lines.push(verifierPrompt.trim());
+  } else {
+    lines.push(
+      `Inspect the claimed deliverables, outputs, and evidence above. Verify that all requirements and acceptance criteria have been satisfied.`
+    );
+  }
+
+  lines.push(``);
+  lines.push(`## Current Run State & Data`);
+  lines.push(`- Lifecycle: ${run.lifecycle}`);
+  lines.push(`- Data:`);
+  lines.push("```json");
+  lines.push(deterministicJsonStringify(run.data, 2));
+  lines.push("```");
+
+  lines.push(``);
+  lines.push(`## Required Verification Action`);
+  lines.push(`You must execute one of the following model tools to record your authoritative verification finding:`);
+  lines.push(
+    `1. \`workflow_verify({ decision: "accept", findings: "..." })\` to accept the claim and mark the workflow completed.`
+  );
+  lines.push(
+    `2. \`workflow_verify({ decision: "reject", findings: "...", returnStep?: "..." })\` to reject the claim and return for rework.`
+  );
+  lines.push(
+    `3. \`workflow_block({ reason: "...", requiresHuman?: boolean })\` if verification is blocked by external conditions.`
+  );
+
+  return lines.filter((line) => line !== null).join("\n");
+}
+
+/**
  * Builds a deterministic iteration prompt combining:
  * 1. Engine preamble describing run context and tool contracts
  * 2. Workflow definition Markdown policy body
@@ -69,6 +144,10 @@ export interface BuildIterationPromptOptions {
  */
 export function buildIterationPrompt(options: BuildIterationPromptOptions): string {
   const { run } = options;
+  if (run.step === "VERIFYING" || run.data?._verificationRequested === true) {
+    return buildVerifierPrompt(options);
+  }
+
   const snapshot = run.snapshot;
   const maxTurns = snapshot.budget?.maxTurns;
   const maxAttempts = snapshot.budget?.maxAttempts;

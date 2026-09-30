@@ -73,10 +73,11 @@ You are an autonomous engineering agent executing tasks.
 | `concurrency` | object | No | Concurrency policy. Defaults to `{ maxRuns: 1 }`. |
 | `concurrency.maxRuns` | integer | No | Maximum simultaneous runs (>= 1). |
 | `budget` | object | No | Execution limits and safeguards. |
-| `budget.maxTurns` | integer | No | Maximum agent iterations (>= 1). |
-| `budget.maxDuration` | string / number | No | Maximum wall-clock duration (e.g. `"8h"`, `"30m"`). |
+| `budget.maxTurns` | integer | No | Maximum agent iterations (>= 1). Hard budget prevents further iterations. |
+| `budget.maxDuration` | string / number | No | Maximum wall-clock duration (e.g. `"8h"`, `"30m"`). Hard budget prevents further iterations. |
 | `budget.maxAttempts` | integer | No | Maximum implementation or retry attempts (>= 1). |
-| `budget.maxCost` | number | No | Optional monetary budget limit. |
+| `budget.maxCost` | number | No | Optional monetary budget limit (unsupported; rejected fail-closed at start). |
+| `budget.onExhaustion` | string | No | Policy on budget exhaustion: `"block"` (default, requires human) or `"cancel"`. |
 | `wakeups` | object | No | Wakeup delay policy for self-paced runs. |
 | `wakeups.default` | string / number | No | Default wakeup interval (e.g. `"5m"`). |
 | `wakeups.min` | string / number | No | Minimum allowed wakeup delay. |
@@ -88,7 +89,9 @@ You are an autonomous engineering agent executing tasks.
 | `completion.requireEvidence` | boolean | No | Requires structured evidence references on finish. |
 | `completion.verify` | boolean | No | Triggers an independent verification pass before completion. |
 | `completion.verifierPrompt` | string | No | Custom verifier instructions. |
-| `completion.maxVerificationAttempts` | integer | No | Maximum verification retries. |
+| `completion.maxVerificationAttempts` | integer | No | Maximum verification retries before blocking. |
+| `completion.returnStep` | string | No | Target step to return to when verification is rejected. |
+| `completion.onRejectionExhausted` | string | No | Policy when verification retries are exhausted: `"block"` (default) or `"fail"`. |
 | `metadata` | object | No | Arbitrary custom metadata mapping. |
 
 ### Markdown Body
@@ -155,10 +158,41 @@ interface WorkflowRun {
 ### Lifecycle State Machine
 
 - **`active`**: Currently executing or eligible to run.
-- **`paused`**: Suspended by user or policy. Nonterminal. Can be resumed to `active` or cancelled.
-- **`blocked`**: Waiting on an external condition (e.g., human approval, PR review, CI run). Nonterminal. Can be resumed to `active` (clearing blocker) or cancelled.
-- **`completed`**: Finished successfully (terminal). Requires summary and structured evidence references. Immutable.
+- **`verifying`**: In the independent verification phase evaluating a submitted completion claim. Nonterminal.
+- **`paused`**: Human/user-controlled suspension (`/workflow pause <run-id>`). Nonterminal. Zero automatic polling or wakeups. Resumed only via explicit human action (`/workflow resume <run-id>`).
+- **`blocked`**: The workflow cannot currently proceed due to an environmental condition or unmet dependency. Nonterminal. Records concrete reason and category:
+  - `external-retryable`: External prerequisite (e.g. CI in progress, waiting on webhook). May wake conservatively and re-check.
+  - `human-required`: Requires human decision, approval, credentials, or budget extension. Automatic wakeups are stopped until explicit action.
+  - `terminal`: Fatal blocker; no further autonomous progress is possible. Zero automatic polling.
+- **`completed`**: Finished successfully (terminal). Requires an explicit completion claim, summary, and structured evidence references. Immutable.
 - **`cancelled`**: Terminated early (terminal). Immutable.
+
+### Budgets & Enforceable Limits
+
+Workflows can configure definition-level and run-level execution budgets:
+- **`maxTurns`**: Maximum agent iterations. Enforced before each turn dispatch and before follow-up scheduling (`workflow_continue`).
+- **`maxDuration` / `maxDurationMs`**: Maximum wall-clock duration from start. Enforced before each dispatch, before follow-up scheduling, and linked to scheduler task expiration.
+- **`maxAttempts`**: Maximum implementation or retry attempts.
+- **Hard Budget Exhaustion**: When a hard budget is exhausted:
+  1. No further autonomous iteration is scheduled;
+  2. Linked scheduler tasks are immediately stopped/cancelled;
+  3. The run transitions to `blocked` (category: `human-required`, `requiresHuman: true`) by default, preserving the exhaustion reason and last known run state, or `cancelled` if `budget.onExhaustion: "cancel"` is configured;
+  4. Subsequent autonomous dispatches fail closed with `WorkflowBudgetExhaustedError`.
+- **Unsupported Budget Dimensions**: Pi runtime does not expose authoritative cumulative execution token or billing cost accounting data. The engine refuses to guess or approximate; definitions requesting `budget.maxTokens` are rejected at parse time, and definitions specifying `budget.maxCost` fail closed with `WorkflowUnsupportedBudgetError` when started.
+- **Persistence Across Reload**: Turn counts, attempt counts, creation timestamps, and budget policies are persisted in the append-only session log and reconstructed deterministically upon session restart or branch navigation.
+
+### Completion Gate & Generic Verification
+
+Completion in `pi-workflow` is an explicit engine concept rather than “the model stopped talking”:
+1. **Explicit Completion Claim**: Calling `workflow_complete` submits an explicit completion claim with a required summary and structured evidence references (e.g. PR URLs, commit hashes, test results). The engine stores evidence references durably in session history without blindly assuming claims are true.
+2. **Deterministic Phase Transition**:
+   - If `completion.verify` is `false` (default): The claim is accepted and the run transitions to `completed`.
+   - If `completion.verify` is `true`: The engine persists the completion claim and transitions the run to the `VERIFYING` step.
+3. **Constrained Verifier Prompt**: When in the verification phase, the dispatcher builds a specialized verifier prompt detailing the submitted claim, evidence items, workflow verifier instructions, and current run state.
+4. **Authoritative Decision**: The verifier must explicitly record a verification finding using `workflow_verify` (or `workflow_complete` with `decision`):
+   - **`accept`**: Marks the run `completed`, records verification findings, and stops scheduler wakeups.
+   - **`reject`**: Rejects the claim with evaluator findings. If verification attempts are below `maxVerificationAttempts` (default: 3), the run transitions back to active execution at `returnStep` (default: `completion.returnStep` or pre-verification step) for rework. If attempts are exhausted, the run transitions to `blocked` (`human-required`), preventing infinite loops and ensuring a rejected claim never leaves a run marked complete.
+5. **No Auto-Approval**: If the model stops talking or turns settle without an explicit acceptance tool call, the run is NOT completed.
 
 ### Concurrency & Nonterminal Occupancy
 
@@ -206,7 +240,8 @@ When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral i
 | `workflow_transition` | Atomically advances workflow `step`, merges bounded JSON `data`, and appends an audit `reason`. | `{ toStep: string, data?: object, reason?: string }` |
 | `workflow_continue` | Requests the next wakeup iteration for the run using named wakeup policy, explicit bounded delay, or default delay. | `{ delay?: string, delayMs?: number, wakeupName?: string, reason?: string }` |
 | `workflow_block` | Moves run to `blocked` lifecycle with reason, records `requiresHuman` flag, and cancels pending wakeups. | `{ reason: string, requiresHuman?: boolean, data?: object }` |
-| `workflow_complete` | Submits completion summary and evidence. Triggers verification gate (`VERIFYING` step) if policy specifies `verify: true`. | `{ summary: string, evidence?: object[], data?: object }` |
+| `workflow_complete` | Submits completion summary and evidence. Triggers verification gate (`VERIFYING` step) if policy specifies `verify: true`. During verification, accepts or rejects claim. | `{ summary?: string, decision?: "accept" \| "reject", findings?: string, checks?: object[], returnStep?: string, evidence?: object[], data?: object }` |
+| `workflow_verify` | Evaluates a completion claim during verification, accepting to complete or rejecting with findings to return for rework or block. | `{ decision: "accept" \| "reject", findings?: string, checks?: object[], returnStep?: string, data?: object }` |
 
 ### Safety & Ownership Rules
 

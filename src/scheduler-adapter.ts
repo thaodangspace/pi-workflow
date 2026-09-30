@@ -14,18 +14,21 @@ import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { parseDuration } from "./duration.ts";
 import { extractWorkflowRunId } from "./prompt.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
-import { isTerminalLifecycle } from "./run.ts";
+import { isTerminalLifecycle, checkRunBudgetExhaustion } from "./run.ts";
 import {
   type DispatchIterationOptions,
   type IterationBinding,
   type JsonValue,
+  type WorkflowBudgetPolicy,
   type WorkflowDefinitionV1,
+  WorkflowBudgetExhaustedError,
   WorkflowInvalidTransitionError,
   type WorkflowRun,
   WorkflowRunError,
   type WorkflowScheduleWakeupParams,
   type WorkflowSchedulerPort,
   type WorkflowSnapshotV1,
+  WorkflowUnsupportedBudgetError,
 } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -331,6 +334,8 @@ export interface StartRunOptions extends ScheduleRunOptions {
   initialStep?: string;
   /** Initial workflow state */
   initialData?: Record<string, JsonValue>;
+  /** Optional run-level budget override */
+  budget?: WorkflowBudgetPolicy;
   /** Custom run ID */
   runId?: string;
   /** Concurrency resolution policy */
@@ -519,11 +524,30 @@ export class LoopSchedulerAdapter {
     const run = typeof runOrId === "string" ? this.registry.requireRun(runOrId) : runOrId;
     const service = this.assertServiceAvailable(run.id);
 
-    if (run.lifecycle !== "active") {
+    if (run.lifecycle !== "active" && run.lifecycle !== "verifying") {
       throw new WorkflowInvalidTransitionError(
         run.id,
         `Cannot schedule scheduler task for run "${run.id}" in lifecycle "${run.lifecycle}". Run must be active.`,
         { fromLifecycle: run.lifecycle, action: "schedule" }
+      );
+    }
+
+    // Check hard budget limits before scheduling
+    const exhaustion = checkRunBudgetExhaustion(run);
+    if (exhaustion.exhausted) {
+      const budgetPolicy = run.budget ?? run.snapshot.budget;
+      if (budgetPolicy?.onExhaustion === "cancel") {
+        this.registry.cancelRun(run.id, { reason: exhaustion.reason });
+      } else {
+        this.registry.blockRun(run.id, {
+          reason: exhaustion.reason!,
+          category: "human-required",
+          requiresHuman: true,
+        });
+      }
+      throw new WorkflowBudgetExhaustedError(
+        `Cannot schedule task for run "${run.id}": ${exhaustion.reason}`,
+        { runId: run.id, dimension: exhaustion.dimension, limit: exhaustion.limit, actual: exhaustion.actual }
       );
     }
 
@@ -624,6 +648,27 @@ export class LoopSchedulerAdapter {
     // Assert scheduler service is available before creating any run record
     this.assertServiceAvailable();
 
+    const snapshot =
+      "snapshot" in definitionOrSnapshot
+        ? ((definitionOrSnapshot as any).snapshot as WorkflowSnapshotV1)
+        : (definitionOrSnapshot as WorkflowSnapshotV1);
+
+    const budget = options.budget ?? snapshot.budget;
+    if (budget?.maxCost !== undefined) {
+      throw new WorkflowUnsupportedBudgetError(
+        snapshot.name,
+        "maxCost",
+        `Workflow "${snapshot.name}" specifies budget dimension "maxCost", which is unsupported because Pi runtime does not expose authoritative cost accounting data.`
+      );
+    }
+    if ((budget as any)?.maxTokens !== undefined) {
+      throw new WorkflowUnsupportedBudgetError(
+        snapshot.name,
+        "maxTokens",
+        `Workflow "${snapshot.name}" specifies budget dimension "maxTokens", which is unsupported because Pi runtime does not expose authoritative token accounting data.`
+      );
+    }
+
     const run = this.registry.createRun(definitionOrSnapshot, options);
     try {
       const task = await this.scheduleRun(run, options);
@@ -655,6 +700,28 @@ export class LoopSchedulerAdapter {
         `Cannot schedule wakeup: workflow run "${runId}" has no linked scheduler task ID.`,
         { runId }
       );
+    }
+
+    const run = this.registry.getRun(runId);
+    if (run) {
+      const exhaustion = checkRunBudgetExhaustion(run);
+      if (exhaustion.exhausted) {
+        const budgetPolicy = run.budget ?? run.snapshot.budget;
+        if (budgetPolicy?.onExhaustion === "cancel") {
+          this.registry.cancelRun(run.id, { reason: exhaustion.reason });
+        } else {
+          this.registry.blockRun(run.id, {
+            reason: exhaustion.reason!,
+            category: "human-required",
+            requiresHuman: true,
+          });
+        }
+        await this.cancelWakeup(runId);
+        throw new WorkflowBudgetExhaustedError(
+          `Cannot schedule wakeup for run "${runId}": ${exhaustion.reason}`,
+          { runId, dimension: exhaustion.dimension, limit: exhaustion.limit, actual: exhaustion.actual }
+        );
+      }
     }
 
     try {
@@ -793,13 +860,82 @@ export class LoopSchedulerAdapter {
     for (const run of nonterminalRuns) {
       const existingTaskId = run.loopTaskId;
 
+      // Check hard budget exhaustion
+      const exhaustion = checkRunBudgetExhaustion(run);
+      if (exhaustion.exhausted) {
+        if (existingTaskId && taskMap.has(existingTaskId)) {
+          try {
+            this.service.deleteTask(existingTaskId);
+          } catch {
+            // ignore
+          }
+          this.runToTaskMap.delete(run.id);
+          this.taskToRunMap.delete(existingTaskId);
+        }
+        if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+          const reason = exhaustion.reason!;
+          const budgetPolicy = run.budget ?? run.snapshot.budget;
+          if (budgetPolicy?.onExhaustion === "cancel") {
+            this.registry.cancelRun(run.id, { reason });
+          } else {
+            this.registry.blockRun(run.id, {
+              reason,
+              category: "human-required",
+              requiresHuman: true,
+            });
+            result.blocked.push({ runId: run.id, reason });
+          }
+        }
+        continue;
+      }
+
+      // Paused runs: must NOT have active scheduler task
+      if (run.lifecycle === "paused") {
+        if (existingTaskId && taskMap.has(existingTaskId)) {
+          try {
+            this.service.deleteTask(existingTaskId);
+          } catch {
+            // ignore
+          }
+          this.runToTaskMap.delete(run.id);
+          this.taskToRunMap.delete(existingTaskId);
+        }
+        continue;
+      }
+
+      // Blocked runs: human-required or terminal must NOT have active scheduler task
+      if (run.lifecycle === "blocked") {
+        const isRetryable = run.blocker?.category === "external-retryable";
+        if (!isRetryable) {
+          if (existingTaskId && taskMap.has(existingTaskId)) {
+            try {
+              this.service.deleteTask(existingTaskId);
+            } catch {
+              // ignore
+            }
+            this.runToTaskMap.delete(run.id);
+            this.taskToRunMap.delete(existingTaskId);
+          }
+          continue;
+        } else {
+          // external-retryable may keep its live task if matched
+          if (existingTaskId && taskMap.has(existingTaskId)) {
+            this.runToTaskMap.set(run.id, existingTaskId);
+            this.taskToRunMap.set(existingTaskId, run.id);
+            claimedTaskIds.add(existingTaskId);
+            result.matched.push({ runId: run.id, taskId: existingTaskId });
+          }
+          continue;
+        }
+      }
+
       if (existingTaskId && taskMap.has(existingTaskId)) {
         // Live matching task
         this.runToTaskMap.set(run.id, existingTaskId);
         this.taskToRunMap.set(existingTaskId, run.id);
         claimedTaskIds.add(existingTaskId);
         result.matched.push({ runId: run.id, taskId: existingTaskId });
-      } else if (run.lifecycle === "active") {
+      } else if (run.lifecycle === "active" || run.lifecycle === "verifying") {
         // Active run missing its scheduler task (e.g. after reload where ephemeral self-paced task was dropped)
         if (options.recreateMissing !== false) {
           try {
@@ -812,7 +948,7 @@ export class LoopSchedulerAdapter {
             });
           } catch (err) {
             const reason = `Failed to recreate missing scheduler task: ${err instanceof Error ? err.message : String(err)}`;
-            this.registry.blockRun(run.id, { reason });
+            this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
             result.blocked.push({ runId: run.id, reason });
             result.diagnostics.push({
               type: "error",
@@ -823,7 +959,7 @@ export class LoopSchedulerAdapter {
           }
         } else {
           const reason = "Linked scheduler task lost during recovery and recreation is disabled.";
-          this.registry.blockRun(run.id, { reason });
+          this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
           result.blocked.push({ runId: run.id, reason });
         }
       } else {
@@ -886,7 +1022,20 @@ export class LoopSchedulerAdapter {
       return undefined;
     }
     const run = this.registry.getRun(runId);
-    if (!run || run.lifecycle !== "active") {
+    if (!run || (run.lifecycle !== "active" && run.lifecycle !== "verifying")) {
+      return undefined;
+    }
+
+    const exhaustion = checkRunBudgetExhaustion(run);
+    if (exhaustion.exhausted) {
+      const reason = exhaustion.reason!;
+      const budgetPolicy = run.budget ?? run.snapshot.budget;
+      if (budgetPolicy?.onExhaustion === "cancel") {
+        this.registry.cancelRun(run.id, { reason });
+      } else {
+        this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
+      }
+      this.cancelWakeup(run.id).catch(() => {});
       return undefined;
     }
 
@@ -928,7 +1077,12 @@ export class LoopSchedulerAdapter {
     }
 
     const run = this.registry.getRun(runId);
-    if (!run || run.lifecycle !== "active") {
+    if (!run || (run.lifecycle !== "active" && run.lifecycle !== "verifying")) {
+      return undefined;
+    }
+
+    const exhaustion = checkRunBudgetExhaustion(run);
+    if (exhaustion.exhausted) {
       return undefined;
     }
 

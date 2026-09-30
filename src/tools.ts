@@ -10,18 +10,30 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+  DEFAULT_RETRYABLE_BLOCKER_DELAY_MS,
+  MAX_VERIFICATION_ATTEMPTS_DEFAULT,
+} from "./constants.ts";
+import {
   validateBlockerInfo,
+  validateCompletionClaim,
   validateCompletionInfo,
   validateRunData,
   validateStepName,
+  validateVerificationFindings,
 } from "./data-bounds.ts";
 import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { resolveWakeupDelay } from "./dispatcher.ts";
-import { formatDuration } from "./duration.ts";
+import { formatDuration, parseDuration } from "./duration.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
+import { checkRunBudgetExhaustion } from "./run.ts";
 import {
+  type BlockerCategory,
   type JsonValue,
+  type WorkflowBlockerInfo,
+  type WorkflowCompletionClaim,
   type WorkflowCompletionInfo,
+  type WorkflowVerificationFindings,
+  WorkflowBudgetExhaustedError,
   WorkflowInvalidTransitionError,
   WorkflowIterationError,
   type WorkflowRunLifecycle,
@@ -32,9 +44,22 @@ export interface WorkflowCompleteDetails {
   runId: string;
   lifecycle: WorkflowRunLifecycle;
   step: string;
-  status: "completed" | "verifying";
+  status: "completed" | "verifying" | "blocked" | "rejected";
   pendingSummary?: string;
   completion?: Readonly<WorkflowCompletionInfo>;
+  blocker?: Readonly<WorkflowBlockerInfo>;
+  verificationFindings?: Readonly<WorkflowVerificationFindings>;
+  data?: Readonly<Record<string, JsonValue>>;
+}
+
+export interface WorkflowVerifyDetails {
+  runId: string;
+  status: "completed" | "blocked" | "rejected";
+  lifecycle: WorkflowRunLifecycle;
+  step: string;
+  completion?: Readonly<WorkflowCompletionInfo>;
+  blocker?: Readonly<WorkflowBlockerInfo>;
+  verificationFindings?: Readonly<WorkflowVerificationFindings>;
   data?: Readonly<Record<string, JsonValue>>;
 }
 
@@ -185,6 +210,29 @@ export function createWorkflowContinueTool(
         );
       }
 
+      // Check hard budget limits before scheduling follow-up
+      const exhaustion = checkRunBudgetExhaustion(run);
+      if (exhaustion.exhausted) {
+        if (binding.schedulerPort?.cancelWakeup) {
+          await binding.schedulerPort.cancelWakeup(run.id);
+        }
+        const budgetPolicy = run.budget ?? run.snapshot.budget;
+        if (budgetPolicy?.onExhaustion === "cancel") {
+          registry.cancelRun(run.id, { reason: exhaustion.reason });
+        } else {
+          registry.blockRun(run.id, {
+            reason: exhaustion.reason!,
+            category: "human-required",
+            requiresHuman: true,
+          });
+        }
+        dispatcher.assertToolBinding(signal, token, generation);
+        throw new WorkflowBudgetExhaustedError(
+          exhaustion.reason!,
+          { runId: run.id, dimension: exhaustion.dimension, limit: exhaustion.limit, actual: exhaustion.actual }
+        );
+      }
+
       if (!binding.schedulerPort) {
         throw new WorkflowRunError(
           `No scheduler port is configured for workflow iteration continue on run "${run.id}".`,
@@ -250,6 +298,19 @@ export function createWorkflowBlockTool(
       requiresHuman: Type.Optional(
         Type.Boolean({ description: "Whether human intervention is required to unblock the run (default: false)" })
       ),
+      category: Type.Optional(
+        Type.Union([
+          Type.Literal("external-retryable"),
+          Type.Literal("human-required"),
+          Type.Literal("terminal"),
+        ], {
+          description:
+            "Blocker category: 'external-retryable' (may wake conservatively to recheck), 'human-required' (stops automatic wakeups), or 'terminal' (no further autonomous progress)",
+        })
+      ),
+      retryDelay: Type.Optional(
+        Type.String({ description: "Optional conservative retry delay duration for external-retryable blocker (e.g. '15m')" })
+      ),
       data: Type.Optional(
         Type.Record(Type.String(), Type.Unknown(), {
           description: "Optional state updates to merge into durable run data",
@@ -264,6 +325,7 @@ export function createWorkflowBlockTool(
       const validatedBlocker = validateBlockerInfo(
         {
           reason: params.reason,
+          category: params.category,
           requiresHuman: params.requiresHuman,
         },
         { runId: binding.runId }
@@ -285,15 +347,51 @@ export function createWorkflowBlockTool(
         );
       }
 
+      let retryDelayMs: number | undefined;
+      if (validatedBlocker.category === "external-retryable") {
+        if (params.retryDelay) {
+          retryDelayMs = parseDuration(params.retryDelay, "retryDelay");
+        } else if (run.snapshot.wakeups?.named?.retry) {
+          retryDelayMs = parseDuration(run.snapshot.wakeups.named.retry, "wakeups.named.retry");
+        } else if (run.snapshot.wakeups?.namedMs?.retry) {
+          retryDelayMs = run.snapshot.wakeups.namedMs.retry;
+        } else {
+          retryDelayMs = DEFAULT_RETRYABLE_BLOCKER_DELAY_MS;
+        }
+      } else {
+        // human-required or terminal: cancel any pending wakeup before blocking
+        if (binding.schedulerPort?.cancelWakeup) {
+          await binding.schedulerPort.cancelWakeup(binding.runId);
+        }
+      }
+
       const updated = registry.blockRun(binding.runId, {
         reason: validatedBlocker.reason,
+        category: validatedBlocker.category,
         requiresHuman: validatedBlocker.requiresHuman,
+        retryDelayMs,
         data: validatedData,
       });
 
-      // Cancel any pending wakeup on the scheduler port
-      if (binding.schedulerPort?.cancelWakeup) {
-        await binding.schedulerPort.cancelWakeup(binding.runId);
+      // Handle scheduler wakeup for external-retryable category
+      if (validatedBlocker.category === "external-retryable" && retryDelayMs !== undefined && binding.schedulerPort) {
+        try {
+          await binding.schedulerPort.scheduleWakeup({
+            runId: binding.runId,
+            delayMs: retryDelayMs,
+            reason: `Conservative retry for blocked run: ${updated.blocker?.reason}`,
+          });
+        } catch (scheduleErr: unknown) {
+          // If scheduling retry wakeup fails, fail closed to human-required blocker
+          const reason = `Failed to schedule conservative retry wakeup: ${scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr)}`;
+          registry.blockRun(binding.runId, {
+            reason,
+            category: "human-required",
+            requiresHuman: true,
+          });
+          dispatcher.assertToolBinding(signal, token, generation);
+          throw new WorkflowRunError(reason, binding.runId);
+        }
       }
 
       dispatcher.assertToolBinding(signal, token, generation);
@@ -302,7 +400,7 @@ export function createWorkflowBlockTool(
         content: [
           {
             type: "text",
-            text: `Workflow "${run.workflow}" is now blocked: ${updated.blocker?.reason}${
+            text: `Workflow "${run.workflow}" is now blocked (${updated.blocker?.category}): ${updated.blocker?.reason}${
               updated.blocker?.requiresHuman ? " (requires human action)" : ""
             }.`,
           },
@@ -330,7 +428,7 @@ export function createWorkflowCompleteTool(
     name: "workflow_complete",
     label: "Workflow Complete",
     description:
-      "Submit completion summary and evidence to complete the workflow run, or trigger verification gate if required by definition policy.",
+      "Submit completion summary and structured evidence to complete the workflow run, or trigger the verification gate if required by definition policy.",
     parameters: Type.Object({
       summary: Type.String({ description: "Executive summary of completed work, outcomes, and deliverables" }),
       evidence: Type.Optional(
@@ -356,6 +454,35 @@ export function createWorkflowCompleteTool(
       const token = binding.token;
       const generation = binding.generation;
 
+      const run = registry.requireRun(binding.runId);
+      if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
+        throw new WorkflowInvalidTransitionError(
+          run.id,
+          `Cannot complete a run that is already in terminal lifecycle "${run.lifecycle}".`,
+          { fromLifecycle: run.lifecycle, toLifecycle: "completed", action: "complete" }
+        );
+      }
+
+      // If the run is already in the verification phase, completeTool cannot bypass the gate!
+      if (run.lifecycle === "verifying" || run.step === "VERIFYING" || run.data?._verificationRequested === true) {
+        throw new WorkflowRunError(
+          `Cannot submit completion claim: workflow "${run.workflow}" is currently in the verification phase (lifecycle: ${run.lifecycle}, step: ${run.step}). Authoritative verification decisions must be submitted via workflow_verify({ decision: "accept" | "reject" }).`,
+          run.id
+        );
+      }
+
+      if (run.lifecycle !== "active") {
+        throw new WorkflowInvalidTransitionError(
+          run.id,
+          `Cannot submit completion claim on run in lifecycle "${run.lifecycle}". Run must be "active".`,
+          { fromLifecycle: run.lifecycle, toLifecycle: "verifying", action: "claim" }
+        );
+      }
+
+      if (!params.summary || params.summary.trim() === "") {
+        throw new WorkflowRunError("Completion requires a non-empty summary.", run.id);
+      }
+
       const validatedCompletion = validateCompletionInfo(
         {
           summary: params.summary,
@@ -369,17 +496,6 @@ export function createWorkflowCompleteTool(
           ? validateRunData(params.data as Record<string, JsonValue>, { runId: binding.runId })
           : undefined;
 
-      dispatcher.assertToolBinding(signal, token, generation);
-
-      const run = registry.requireRun(binding.runId);
-      if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
-        throw new WorkflowInvalidTransitionError(
-          run.id,
-          `Cannot complete a run that is already in terminal lifecycle "${run.lifecycle}".`,
-          { fromLifecycle: run.lifecycle, toLifecycle: "completed", action: "complete" }
-        );
-      }
-
       const completionPolicy = run.snapshot.completion;
       if (
         completionPolicy?.requireEvidence &&
@@ -388,55 +504,74 @@ export function createWorkflowCompleteTool(
         throw new WorkflowRunError("Completion policy requires at least one evidence item.", run.id);
       }
 
+      dispatcher.assertToolBinding(signal, token, generation);
+
       // Check if verification gate applies
       if (completionPolicy?.verify) {
-        const isVerifying = run.step === "VERIFYING" || run.data?._verificationRequested === true;
-        if (!isVerifying) {
-          // Transition to verification phase
-          const verificationData: Record<string, JsonValue> = {
-            ...(validatedData ?? {}),
-            _verificationRequested: true,
-            _pendingCompletionSummary: validatedCompletion.summary,
-          };
-          const updated = registry.transitionStep(binding.runId, {
-            toStep: "VERIFYING",
-            data: verificationData,
-            reason: "Entering verification phase before final completion",
-          });
+        // Submit completion claim and transition to verification phase
+        const verificationData: Record<string, JsonValue> = {
+          ...(validatedData ?? {}),
+          _verificationRequested: true,
+          _pendingCompletionSummary: validatedCompletion.summary,
+        };
+        const updated = registry.claimCompletion(binding.runId, {
+          summary: validatedCompletion.summary,
+          evidence: validatedCompletion.evidence,
+          data: verificationData,
+        });
 
-          dispatcher.assertToolBinding(signal, token, generation);
-
-          const details: WorkflowCompleteDetails = {
-            runId: updated.id,
-            lifecycle: updated.lifecycle,
-            step: updated.step,
-            status: "verifying",
-            pendingSummary: validatedCompletion.summary,
-            data: updated.data,
-          };
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow "${run.workflow}" entered verification phase (step: VERIFYING). Final completion requires verification confirmation.`,
-              },
-            ],
-            details,
-          };
+        if (binding.schedulerPort) {
+          try {
+            await binding.schedulerPort.scheduleWakeup({
+              runId: binding.runId,
+              delayMs: 1_000,
+              reason: "Scheduled verification iteration for completion claim",
+            });
+          } catch (scheduleErr: unknown) {
+            // Fail closed with actionable blocked state rather than leaving verifying run unscheduled
+            const reason = `Failed to schedule verification iteration: ${scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr)}`;
+            registry.blockRun(binding.runId, {
+              reason,
+              category: "human-required",
+              requiresHuman: true,
+            });
+            dispatcher.assertToolBinding(signal, token, generation);
+            throw new WorkflowRunError(reason, binding.runId);
+          }
         }
+
+        dispatcher.assertToolBinding(signal, token, generation);
+
+        const details: WorkflowCompleteDetails = {
+          runId: updated.id,
+          lifecycle: updated.lifecycle,
+          step: updated.step,
+          status: "verifying",
+          pendingSummary: validatedCompletion.summary,
+          data: updated.data,
+        };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow "${run.workflow}" entered verification phase (step: VERIFYING). Final completion requires verification confirmation.`,
+            },
+          ],
+          details,
+        };
       }
 
-      // Complete run
+      // Direct completion without verification gate:
+      // Safe ordering: cancel pending scheduler wakeups BEFORE committing terminal completed state
+      if (binding.schedulerPort?.cancelWakeup) {
+        await binding.schedulerPort.cancelWakeup(binding.runId);
+      }
+
       const updated = registry.completeRun(binding.runId, {
         summary: validatedCompletion.summary,
         evidence: validatedCompletion.evidence,
         data: validatedData,
       });
-
-      // Cancel any pending wakeup on scheduler port
-      if (binding.schedulerPort?.cancelWakeup) {
-        await binding.schedulerPort.cancelWakeup(binding.runId);
-      }
 
       dispatcher.assertToolBinding(signal, token, generation);
 
@@ -463,7 +598,215 @@ export function createWorkflowCompleteTool(
 }
 
 /**
- * Creates all 5 model-callable workflow tools.
+ * Creates the workflow_verify tool.
+ */
+export function createWorkflowVerifyTool(
+  dispatcher: WorkflowDispatcher,
+  registry: WorkflowRunRegistry
+): ToolDefinition {
+  return defineTool({
+    name: "workflow_verify",
+    label: "Workflow Verify",
+    description:
+      "Authoritatively evaluate a submitted completion claim, accepting to complete the workflow or rejecting with findings to return for rework or block.",
+    parameters: Type.Object({
+      decision: Type.Union([Type.Literal("accept"), Type.Literal("reject")], {
+        description: "Verification decision: 'accept' marks run completed, 'reject' returns run for rework or blocks",
+      }),
+      findings: Type.Optional(
+        Type.String({ description: "Authoritative findings, evidence evaluation, or rejection feedback" })
+      ),
+      checks: Type.Optional(
+        Type.Array(
+          Type.Object({
+            name: Type.String({ description: "Verification check name" }),
+            passed: Type.Boolean({ description: "Whether check passed" }),
+            message: Type.Optional(Type.String({ description: "Optional check diagnostic message" })),
+          }),
+          { description: "Optional structured evaluation checks" }
+        )
+      ),
+      returnStep: Type.Optional(
+        Type.String({ description: "Target step to return to if rejected (defaults to definition policy or pre-verification step)" })
+      ),
+      data: Type.Optional(
+        Type.Record(Type.String(), Type.Unknown(), {
+          description: "Optional state updates to merge into durable run data",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const binding = dispatcher.assertToolBinding(signal);
+      const token = binding.token;
+      const generation = binding.generation;
+
+      const run = registry.requireRun(binding.runId);
+      if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
+        throw new WorkflowInvalidTransitionError(
+          run.id,
+          `Cannot verify a run in terminal lifecycle "${run.lifecycle}".`,
+          { fromLifecycle: run.lifecycle, action: "verify" }
+        );
+      }
+
+      // Verify that the run is in the verification phase
+      if (run.lifecycle !== "verifying") {
+        throw new WorkflowRunError(
+          `Cannot verify completion: workflow "${run.workflow}" is not currently in the verification phase (lifecycle: "${run.lifecycle}", step: "${run.step}"). Submit a completion claim with workflow_complete first.`,
+          run.id
+        );
+      }
+
+      const validatedFindings = validateVerificationFindings(
+        {
+          decision: params.decision,
+          findings: params.findings,
+          checks: params.checks,
+          returnStep: params.returnStep,
+        },
+        { runId: binding.runId }
+      );
+
+      const validatedData =
+        params.data !== undefined
+          ? validateRunData(params.data as Record<string, JsonValue>, { runId: binding.runId })
+          : undefined;
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      if (validatedFindings.decision === "accepted") {
+        // Safe ordering: cancel pending scheduler wakeups BEFORE committing terminal completed state
+        if (binding.schedulerPort?.cancelWakeup) {
+          await binding.schedulerPort.cancelWakeup(binding.runId);
+        }
+
+        const updated = registry.verifyRun(binding.runId, {
+          decision: "accepted",
+          findings: validatedFindings.feedback,
+          checks: validatedFindings.checks,
+          data: validatedData,
+        });
+
+        dispatcher.assertToolBinding(signal, token, generation);
+
+        const details: WorkflowVerifyDetails = {
+          runId: updated.id,
+          status: "completed",
+          lifecycle: updated.lifecycle,
+          step: updated.step,
+          completion: updated.completion,
+          verificationFindings: updated.verificationFindings,
+          data: updated.data,
+        };
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Verification accepted for workflow "${run.workflow}": run marked completed. ${updated.completion?.summary}`,
+            },
+          ],
+          details,
+        };
+      }
+
+      // Decision is "rejected"
+      const maxAttempts = run.snapshot.completion?.maxVerificationAttempts ?? MAX_VERIFICATION_ATTEMPTS_DEFAULT;
+      const willBlock = ((run.verificationAttempts ?? 0) + 1) >= maxAttempts;
+
+      if (willBlock) {
+        // Safe ordering: cancel pending scheduler wakeups BEFORE committing blocked state
+        if (binding.schedulerPort?.cancelWakeup) {
+          await binding.schedulerPort.cancelWakeup(binding.runId);
+        }
+
+        const updated = registry.verifyRun(binding.runId, {
+          decision: "rejected",
+          findings: validatedFindings.feedback,
+          checks: validatedFindings.checks,
+          returnStep: validatedFindings.returnStep,
+          data: validatedData,
+        });
+
+        dispatcher.assertToolBinding(signal, token, generation);
+
+        const details: WorkflowVerifyDetails = {
+          runId: updated.id,
+          status: "blocked",
+          lifecycle: updated.lifecycle,
+          step: updated.step,
+          blocker: updated.blocker,
+          verificationFindings: updated.verificationFindings,
+          data: updated.data,
+        };
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Verification rejected for workflow "${run.workflow}" and max verification attempts reached: run blocked. ${updated.blocker?.reason}`,
+            },
+          ],
+          details,
+        };
+      }
+
+      // Rejection with retries remaining: return to active rework step
+      const updated = registry.verifyRun(binding.runId, {
+        decision: "rejected",
+        findings: validatedFindings.feedback,
+        checks: validatedFindings.checks,
+        returnStep: validatedFindings.returnStep,
+        data: validatedData,
+      });
+
+      // Schedule next iteration for rework
+      if (binding.schedulerPort) {
+        try {
+          await binding.schedulerPort.scheduleWakeup({
+            runId: binding.runId,
+            delayMs: 1_000,
+            reason: "Resumed active iteration following verification rejection",
+          });
+        } catch (scheduleErr: unknown) {
+          // Fail closed with actionable blocked state rather than swallowing schedule failure
+          const reason = `Failed to schedule rework iteration following verification rejection: ${scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr)}`;
+          registry.blockRun(binding.runId, {
+            reason,
+            category: "human-required",
+            requiresHuman: true,
+          });
+          dispatcher.assertToolBinding(signal, token, generation);
+          throw new WorkflowRunError(reason, binding.runId);
+        }
+      }
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      const details: WorkflowVerifyDetails = {
+        runId: updated.id,
+        status: "rejected",
+        lifecycle: updated.lifecycle,
+        step: updated.step,
+        verificationFindings: updated.verificationFindings,
+        data: updated.data,
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Verification rejected for workflow "${run.workflow}": returned to step "${updated.step}" for rework. Findings: ${updated.verificationFindings?.feedback ?? "None"}`,
+          },
+        ],
+        details,
+      };
+    },
+  });
+}
+
+/**
+ * Creates all model-callable workflow tools registered with the agent runtime.
  */
 export function createWorkflowTools(options: {
   dispatcher: WorkflowDispatcher;
@@ -475,5 +818,6 @@ export function createWorkflowTools(options: {
     createWorkflowContinueTool(options.dispatcher, options.registry),
     createWorkflowBlockTool(options.dispatcher, options.registry),
     createWorkflowCompleteTool(options.dispatcher, options.registry),
+    createWorkflowVerifyTool(options.dispatcher, options.registry),
   ];
 }

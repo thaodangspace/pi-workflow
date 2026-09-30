@@ -22,6 +22,7 @@ import {
   type WorkflowRun,
   WorkflowRunError,
   WorkflowRunNotFoundError,
+  WorkflowUnsupportedBudgetError,
   WorkflowValidationError,
 } from "./types.ts";
 
@@ -464,13 +465,23 @@ export class WorkflowCommandController {
       return { ok: false, action: "start", output: msg, error: msg };
     }
 
-    // 2. Validate scheduler service availability
+    // 2. Validate enforceable budget dimensions
+    if (def.budget?.maxCost !== undefined) {
+      const errorMsg = `Failed to start workflow "${def.name}": Workflow "${def.name}" specifies budget dimension "maxCost", which is unsupported because Pi runtime does not expose authoritative cost accounting data.`;
+      return { ok: false, action: "start", output: errorMsg, error: errorMsg };
+    }
+    if ((def.budget as any)?.maxTokens !== undefined) {
+      const errorMsg = `Failed to start workflow "${def.name}": Workflow "${def.name}" specifies budget dimension "maxTokens", which is unsupported because Pi runtime does not expose authoritative token accounting data.`;
+      return { ok: false, action: "start", output: errorMsg, error: errorMsg };
+    }
+
+    // 3. Validate scheduler service availability
     if (!this.adapter.isAvailable()) {
       const errorMsg = "Cannot start workflow: pi-loop scheduler service is not available in the current session.";
       return { ok: false, action: "start", output: errorMsg, error: errorMsg };
     }
 
-    // 3. Create durable run & attach scheduler state
+    // 4. Create durable run & attach scheduler state
     try {
       const { run, task } = await this.adapter.startRun(def, {
         initialData: options.initialData,
@@ -622,8 +633,26 @@ export class WorkflowCommandController {
     if (run.blocker) {
       lines.push(`  Blocker:`);
       lines.push(`    Reason:        ${run.blocker.reason}`);
+      if (run.blocker.category) {
+        lines.push(`    Category:      ${run.blocker.category}`);
+      }
       lines.push(`    RequiresHuman: ${run.blocker.requiresHuman ?? false}`);
       lines.push(`    BlockedAt:     ${new Date(run.blocker.blockedAt).toISOString()}`);
+    }
+
+    if (run.completionClaim) {
+      lines.push(`  Completion Claim:`);
+      lines.push(`    Summary:       ${run.completionClaim.summary}`);
+      lines.push(`    Evidence:      ${run.completionClaim.evidence.length} item(s)`);
+    }
+
+    if (run.verificationFindings) {
+      lines.push(`  Verification Findings:`);
+      lines.push(`    Decision:      ${run.verificationFindings.decision}`);
+      if (run.verificationFindings.feedback) {
+        lines.push(`    Feedback:      ${run.verificationFindings.feedback}`);
+      }
+      lines.push(`    Attempt:       ${run.verificationFindings.attempt}`);
     }
 
     if (run.completion) {
