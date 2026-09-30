@@ -113,6 +113,14 @@ function requireName(value: unknown, field: string, runId: string): string {
   return (value as string).trim();
 }
 
+/**
+ * Bounds and redacts provider-controlled text (status reasons, validator
+ * errors) before it can reach a model-visible error message.
+ */
+function safeText(value: unknown): string {
+  return sanitizeDiagnosticText(value, MAX_DIAGNOSTIC_TEXT_LENGTH).text;
+}
+
 /** Structurally validates a JSON payload and enforces the provider-call byte cap. */
 function boundCallPayload(value: unknown, runId: string, field: string): JsonValue {
   const validated = validateJsonValue(value, {
@@ -189,7 +197,7 @@ export async function dispatchProviderAction(
   }
   if (provider.status === "unavailable") {
     refuse(
-      `Capability "${capability}" provider is unavailable${provider.reason ? `: ${provider.reason}` : ""}.`,
+      `Capability "${capability}" provider is unavailable${provider.reason ? `: ${safeText(provider.reason)}` : ""}.`,
       { runId: run.id, code: "capability_unavailable", capability, operation }
     );
   }
@@ -199,7 +207,7 @@ export async function dispatchProviderAction(
   const item = resolution.items[0];
   if (!item || !item.satisfied) {
     refuse(
-      `Capability "${capability}" no longer satisfies the run's declared requirement: ${item?.reason ?? "unsatisfied"}.`,
+      `Capability "${capability}" no longer satisfies the run's declared requirement: ${safeText(item?.reason ?? "unsatisfied")}.`,
       { runId: run.id, code: "capability_incompatible", capability, operation }
     );
   }
@@ -226,7 +234,7 @@ export async function dispatchProviderAction(
   // perform a mutation.
   if (mutating && provider.status === "degraded") {
     refuse(
-      `Refusing mutating operation "${operation}": capability "${capability}" is degraded${provider.reason ? ` (${provider.reason})` : ""}.`,
+      `Refusing mutating operation "${operation}": capability "${capability}" is degraded${provider.reason ? ` (${safeText(provider.reason)})` : ""}.`,
       { runId: run.id, code: "provider_degraded", capability, operation }
     );
   }
@@ -286,9 +294,21 @@ export async function dispatchProviderAction(
   }
 
   // 6. Structurally bound the input, then apply the mandatory provider validator.
+  // The validator is provider code and may throw credential-bearing prose, so
+  // its error is bounded and redacted before it can reach the model.
   let input: JsonValue = boundCallPayload(request.input === undefined ? {} : request.input, run.id, "provider.input");
   if (op.validateInput) {
-    input = boundCallPayload(op.validateInput(input), run.id, "provider.input");
+    let validated: unknown;
+    try {
+      validated = op.validateInput(input);
+    } catch (err: unknown) {
+      const message = safeText(err instanceof Error ? err.message : String(err));
+      refuse(
+        `Provider operation "${capability}.${operation}" rejected its input: ${message || "invalid input"}`,
+        { runId: run.id, code: "input_invalid", capability, operation }
+      );
+    }
+    input = boundCallPayload(validated, run.id, "provider.input");
   }
 
   const context: WorkflowProviderCallContext = {
@@ -312,7 +332,7 @@ export async function dispatchProviderAction(
     const rawMessage = err instanceof Error ? err.message : String(err);
     // Provider errors can carry credential-bearing internal prose; bound and
     // redact before it can reach the model.
-    const safeMessage = sanitizeDiagnosticText(rawMessage, MAX_DIAGNOSTIC_TEXT_LENGTH).text;
+    const safeMessage = safeText(rawMessage);
     refuse(
       `Provider operation "${capability}.${operation}" failed: ${safeMessage || "provider error"}`,
       { runId: run.id, code: "execution_failed", capability, operation }
@@ -336,7 +356,7 @@ export async function dispatchProviderAction(
   } catch (err: unknown) {
     if (err instanceof WorkflowDataBoundsError) throw err;
     const rawMessage = err instanceof Error ? err.message : String(err);
-    const safeMessage = sanitizeDiagnosticText(rawMessage, MAX_DIAGNOSTIC_TEXT_LENGTH).text;
+    const safeMessage = safeText(rawMessage);
     refuse(
       `Provider operation "${capability}.${operation}" produced an invalid result projection: ${safeMessage || "invalid projection"}`,
       { runId: run.id, code: "execution_failed", capability, operation }
@@ -367,9 +387,7 @@ export async function dispatchProviderAction(
       version: provider.version,
       features: provider.features,
       status: provider.status,
-      ...(provider.reason
-        ? { reason: sanitizeDiagnosticText(provider.reason, MAX_DIAGNOSTIC_TEXT_LENGTH).text }
-        : {}),
+      ...(provider.reason ? { reason: safeText(provider.reason) } : {}),
     },
     correlationId,
     durationMs: Math.max(0, Date.now() - startedAt),

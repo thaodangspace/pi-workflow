@@ -760,12 +760,15 @@ function makeOperation(overrides: Partial<WorkflowProviderOperation> = {}): Work
   };
 }
 
-function setupCustomProvider(operations: WorkflowProviderOperation[]) {
+function setupCustomProvider(
+  operations: WorkflowProviderOperation[],
+  extras: { status?: "available" | "degraded" | "unavailable"; reason?: string } = {}
+) {
   const session = new FakeSessionManager({ sessionId: "seam-session" });
   const registry = new WorkflowRunRegistry(session);
   const dispatcher = new WorkflowDispatcher(registry);
   const capabilityRegistry = createWorkflowCapabilityRegistry({ sessionId: "seam-session" });
-  capabilityRegistry.register({ name: "custom", version: 1, features: ["x"], operations });
+  capabilityRegistry.register({ name: "custom", version: 1, features: ["x"], operations, ...extras });
   const def = parseWorkflowContent(CUSTOM_WORKFLOW, { path: "custom.md", scope: "project" });
   const run = registry.createRun(def);
   const tool = createWorkflowProviderCallTool(dispatcher, registry, capabilityRegistry);
@@ -870,6 +873,73 @@ describe("workflow_provider_call seam (Issue #12)", () => {
         assert.ok(err instanceof WorkflowProviderCallError);
         assert.equal((err as WorkflowProviderCallError).code, "execution_failed");
         assert.ok(!err.message.includes("ghp_"), "error text must not leak the token");
+        assert.match(err.message, /\[redacted/);
+        return true;
+      }
+    );
+  });
+
+  it("bounds and redacts provider validator error text", async () => {
+    const secretToken = `ghp_${"a".repeat(30)}`;
+    const { invoke } = setupCustomProvider([
+      makeOperation({
+        name: "strict",
+        validateInput: () => {
+          throw new Error(`invalid input for token=${secretToken}`);
+        },
+      }),
+    ]);
+
+    await assert.rejects(
+      async () => invoke({ capability: "custom", operation: "strict", input: {} }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "input_invalid");
+        assert.ok(!err.message.includes("ghp_"), "validator error must not leak the token");
+        assert.match(err.message, /\[redacted/);
+        return true;
+      }
+    );
+  });
+
+  it("bounds and redacts provider reason text in unavailable/degraded refusals", async () => {
+    const secretToken = `ghp_${"b".repeat(30)}`;
+    const reader = makeOperation({ name: "read", execute: () => ({ ok: true }) });
+
+    const unavailable = setupCustomProvider([reader], {
+      status: "unavailable",
+      reason: `remote down for token=${secretToken}`,
+    });
+    await assert.rejects(
+      async () => unavailable.invoke({ capability: "custom", operation: "read", input: {} }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "capability_unavailable");
+        assert.ok(!err.message.includes("ghp_"), "unavailable reason must not leak the token");
+        assert.match(err.message, /\[redacted/);
+        return true;
+      }
+    );
+
+    const degraded = setupCustomProvider(
+      [
+        makeOperation({
+          name: "mutate",
+          mutating: true,
+          effectKind: "custom.mutate",
+          execute: () => ({ applied: true }),
+          projectResult: () => ({ applied: true }),
+        }),
+      ],
+      { status: "degraded", reason: `reduced mode for token=${secretToken}` }
+    );
+    await assert.rejects(
+      async () =>
+        degraded.invoke({ capability: "custom", operation: "mutate", input: {}, effectKey: "any" }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "provider_degraded");
+        assert.ok(!err.message.includes("ghp_"), "degraded reason must not leak the token");
         assert.match(err.message, /\[redacted/);
         return true;
       }

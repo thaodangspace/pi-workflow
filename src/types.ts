@@ -1013,6 +1013,7 @@ export type WorkflowProviderCallCode =
   | "capability_incompatible"
   | "operations_unavailable"
   | "operation_not_allowlisted"
+  | "input_invalid"
   | "effect_required"
   | "effect_unexpected"
   | "effect_not_started"
