@@ -1,0 +1,10 @@
+# Issue #4 implementation plan
+
+Source: https://github.com/thaodangspace/pi-workflow/issues/4. Upstream pi-loop #28 and #30 are closed; inspect public `pi-loop/service` package export and README in `~/code/pi-loop` (read-only), verify installed published dependency/version can expose the same interface. Build on merged issues #1–#3.
+
+1. Read Pi extension docs plus pi-loop public integration README and public exported `pi-loop/service` types (not private src imports). Define LoopSchedulerAdapter using supported session-scoped discovery/service contract. Handle no service, wrong version, disposal and recreation cleanly; never create timers or a separate scheduler.
+2. Start run from a freshly loaded definition, create self-paced task (and fixed/cron when spec supports), persist run↔task linkage, dispatch workflow prompt with real per-turn signal ownership; model-facing continue uses scoped service wakeup. Complete/cancel/permanent block stops only linked task. Ensure ordinary /loop remains independent.
+3. Reconcile on session restart/tree changes: list authoritative scheduler tasks, inspect missing and orphan linkages and safely recreate or block/report instead of duplicating. Session shutdown delegates timer ownership to pi-loop, no local timers. Validate dispatch prompt route and failure modes with actual service semantics rather than guessing.
+4. Test against fake versioned loop service plus at least one production-faithful composition test (if practical); exercise two runs, /loop independence, variable wakeups, single-task cancellation, missing/disposed service, reload and orphan reconciliation. Run npm ci/test/typecheck/diff check, document limits. Child owns code/tests/docs except plan, may commit but not push/PR/merge/delegate.
+
+Boundary: no changes to pi-loop repository, no private `pi-loop/src/*` imports, no unbounded arbitrary approvals. If public service cannot dispatch workflow-specific prompts with secure turn identity, identify exact blocker and stop rather than claim completion.

@@ -255,7 +255,81 @@ await dispatcher.withIteration(run.id, { schedulerPort }, async (binding) => {
 });
 ```
 
-> **Boundary Note**: In accordance with the modular design, `pi-workflow` does not use private `pi-loop` imports or homegrown timer implementations (`setTimeout`/`setInterval`). Integration with the live `pi-loop` scheduler service is owned by Issue #4. Because Pi's `ExtensionToolContext` does not natively carry per-invocation workflow identities, `pi-workflow` enforces in-process exclusive token and generation binding to guarantee fail-closed safety for all model-facing tool calls.
+---
+
+## Scheduler Integration (pi-loop)
+
+`pi-workflow` uses `pi-loop` as its single scheduling backend. `pi-workflow` owns workflow orchestration state, lifecycle, and model tools; `pi-loop` owns timers, due queues, wakeups, coalescing, and scheduler persistence.
+
+`pi-workflow` never creates `setTimeout`/`setInterval` timers or a secondary due queue.
+
+### Scheduler Adapter (`LoopSchedulerAdapter`)
+
+The `LoopSchedulerAdapter` bridges workflow runs to the public, versioned `pi-loop` service contract (`LoopServiceV1`):
+
+```typescript
+import {
+  WorkflowRunRegistry,
+  WorkflowDispatcher,
+  LoopSchedulerAdapter,
+  createLoopSchedulerAdapter,
+} from "pi-workflow";
+
+const registry = new WorkflowRunRegistry();
+const dispatcher = new WorkflowDispatcher(registry);
+
+// Create scheduler adapter attached to discovery bus (pi.events)
+const adapter = createLoopSchedulerAdapter({
+  registry,
+  dispatcher,
+  events: pi.events,
+});
+
+// Discover pi-loop service on session start
+await adapter.discover(pi.events);
+
+// Start and schedule workflow run
+const { run, task } = await adapter.startRun(workflowDefinition);
+console.log(`Workflow run ${run.id} scheduled as pi-loop task ${task.id}`);
+```
+
+### Supported Scheduling Modes
+
+| Workflow Mode | Scheduler Operation | Behavior |
+|---|---|---|
+| `self-paced` | `service.scheduleSelfPaced(prompt, options)` | First iteration runs immediately; each iteration paces its next wakeup with `workflow_continue`. Delays clamped to [1m, 1h]. |
+| `fixed` / `interval` | `service.scheduleFixed(intervalMs, prompt, options)` | Repeats at fixed cadence (e.g. `15m`, `2h`). |
+| `cron` | `service.scheduleCron(cron, prompt, options)` | 5-field calendar schedule with timezone support. |
+| `once` | `service.scheduleOnce(at, prompt, options)` | Executes once at absolute epoch timestamp and then removes itself. |
+
+### Runtime Behavior & Turn Signal Identity
+
+1. **Start Run**: `adapter.startRun` creates the durable run record in `WorkflowRunRegistry` and schedules the independent task in `pi-loop`, linking `runId ↔ loopTaskId`.
+2. **Scheduled Dispatch**: When due, `pi-loop` dispatches the task as a user message. The prompt carries the unique workflow run identifier (`- Run ID: <id>`).
+3. **Turn Signal Binding**: On `before_agent_start` and `turn_start`, `pi-workflow` correlates the prompt to the active run and binds the iteration with the host's per-turn `AbortSignal` (`ctx.signal`).
+4. **Execution & Next Wakeup**: The agent inspects context (`workflow_get_context`), advances state (`workflow_transition`), and requests the next wakeup (`workflow_continue`). `workflow_continue` calls `service.scheduleTaskWakeup(loopTaskId, delayMs, reason)`.
+5. **Termination & Cancellation**: Completing (`workflow_complete`), blocking (`workflow_block`), or cancelling (`cancelWakeup`) the run stops only its linked scheduler task in `pi-loop`.
+
+### Coexistence with `/loop`
+
+- Workflow tasks are **independent** of the user's command-owned `/loop`.
+- Starting, replacing, or stopping `/loop` never removes or cancels workflow scheduler tasks.
+- Stopping or completing a workflow task never cancels the user's `/loop`.
+
+### Authoritative Reconciliation on Reload
+
+When a session restarts or navigates history (`session_tree`):
+- `adapter.reconcile()` queries `service.listTasks()` from `pi-loop`.
+- **Matched runs**: Live runs are reconnected to their authoritative scheduler task IDs.
+- **Lost active runs**: Active self-paced runs whose ephemeral scheduler task was lost during restart are safely recreated without duplicating.
+- **Orphan tasks**: Scheduled tasks in `pi-loop` with a workflow run prompt whose run was completed, cancelled, or missing are safely pruned with `deleteTask()`.
+- **Non-workflow tasks**: User `/loop` tasks and ordinary scheduled tasks are strictly untouched.
+
+### Failure Handling
+
+- If `pi-loop` is unavailable or times out during discovery, workflow scheduling fails clearly with `WorkflowSchedulerUnavailableError`. Pi does not crash, and no local fallback timers are spawned.
+- If the bound session generation is invalidated, calls fail closed with `WorkflowSchedulerUnavailableError`.
+
 
 ### Deterministic Prompt Construction
 

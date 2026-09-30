@@ -8,6 +8,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { WorkflowDispatcher } from "./dispatcher.ts";
 import { WorkflowRunRegistry } from "./registry.ts";
+import {
+  LoopSchedulerAdapter,
+  type LoopSchedulerAdapterOptions,
+} from "./scheduler-adapter.ts";
 import { createWorkflowTools } from "./tools.ts";
 import type { WorkflowSessionTarget } from "./types.ts";
 
@@ -50,6 +54,9 @@ export * from "./dispatcher.ts";
 // Re-export tools
 export * from "./tools.ts";
 
+// Re-export scheduler adapter
+export * from "./scheduler-adapter.ts";
+
 /**
  * Factory to create a WorkflowRunRegistry.
  */
@@ -69,13 +76,28 @@ export function createWorkflowDispatcher(
 }
 
 /**
+ * Factory to create a LoopSchedulerAdapter.
+ */
+export function createLoopSchedulerAdapter(
+  options: LoopSchedulerAdapterOptions
+): LoopSchedulerAdapter {
+  return new LoopSchedulerAdapter(options);
+}
+
+/**
  * Pi extension entrypoint.
  * Automatically synchronizes workflow runs with the active session branch across reloads and tree navigation,
- * registers model-facing workflow tools, and enforces safe iteration clearing across lifecycle events.
+ * discovers and bridges to pi-loop for workflow scheduling, registers model-facing workflow tools,
+ * and enforces safe iteration clearing across lifecycle events.
  */
 export default function workflowExtension(pi: ExtensionAPI): void {
   const registry = new WorkflowRunRegistry();
   const dispatcher = new WorkflowDispatcher(registry);
+  const adapter = new LoopSchedulerAdapter({
+    registry,
+    dispatcher,
+    events: (pi as any).events,
+  });
   const tools = createWorkflowTools({ dispatcher, registry });
 
   if (typeof pi.registerTool === "function") {
@@ -91,18 +113,38 @@ export default function workflowExtension(pi: ExtensionAPI): void {
       getBranch: (fromId?: string) => ctx.sessionManager.getBranch(fromId),
     });
     registry.refresh();
+
+    if ((pi as any).events) {
+      adapter.bindEvents((pi as any).events);
+      await adapter.discover((pi as any).events, { timeoutMs: 500 }).catch(() => {});
+      if (adapter.isAvailable()) {
+        await adapter.reconcile().catch(() => {});
+      }
+    }
   });
 
   pi.on("session_tree", async () => {
     dispatcher.clearActiveIteration("session_tree");
     registry.refresh();
+    if (adapter.isAvailable()) {
+      await adapter.reconcile().catch(() => {});
+    }
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    return adapter.handleBeforeAgentStart(event, ctx) as any;
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    adapter.handleTurnStart(ctx);
   });
 
   pi.on("agent_settled", async () => {
-    dispatcher.clearActiveIteration("agent_settled");
+    adapter.handleAgentSettled();
   });
 
   pi.on("session_shutdown", async () => {
     dispatcher.clearActiveIteration("session_shutdown");
+    adapter.detachService();
   });
 }
