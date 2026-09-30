@@ -20,7 +20,8 @@ import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { loadWorkflows, type LoadWorkflowsOptions } from "./loader.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
 import { isTerminalLifecycle } from "./run.ts";
-import { LOOP_SERVICE_VERSION, type LoopSchedulerAdapter } from "./scheduler-adapter.ts";
+import { LOOP_SERVICE_VERSION } from "pi-loop/service";
+import type { LoopSchedulerAdapter } from "./scheduler-adapter.ts";
 import {
   type JsonValue,
   type WorkflowDefinitionV1,

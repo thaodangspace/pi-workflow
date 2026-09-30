@@ -2,11 +2,13 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   discoverLoopService,
-  extractWorkflowRunId,
   isLoopServiceV1,
-  LoopSchedulerAdapter,
   LOOP_SERVICE_VERSION,
   LoopServiceUnavailableError,
+} from "pi-loop/service";
+import {
+  extractWorkflowRunId,
+  LoopSchedulerAdapter,
   WorkflowDispatcher,
   WorkflowRunRegistry,
   WorkflowSchedulerError,

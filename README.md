@@ -302,6 +302,26 @@ await dispatcher.withIteration(run.id, { schedulerPort }, async (binding) => {
 
 `pi-workflow` never creates `setTimeout`/`setInterval` timers or a secondary due queue.
 
+### Contract Source of Truth: `pi-loop/service`
+
+`pi-loop/service` is the **single authoritative definition** of the scheduler
+service protocol (`LoopServiceV1`). `pi-workflow` imports it directly and does
+**not** copy or redefine its constants, types, errors, validators, or discovery
+implementation. `pi-workflow` owns only workflow-specific adapter behavior:
+run/task reconciliation, ownership and linkage, and translation of scheduler
+failures into workflow-level errors.
+
+- **Supported contract**: `pi-loop/service` **V1** (`LOOP_SERVICE_VERSION === 1`).
+- **Resolved via a pinned dependency** (`package.json` → `dependencies["pi-loop"]`,
+  metadata under `piWorkflow.piLoopService`) pointing at the upstream commit that
+  exposes the `./service` entrypoint, so the consumed contract cannot drift
+  silently. This is the same commit/origin as `thaodangspace/pi-loop`.
+- **No private `pi-loop` modules** (registry, scheduler, due queue, or provider
+  internals) are imported; only the public `pi-loop/service` entrypoint is used.
+- **A missing or stale live service is handled dynamically**: discovery fails
+  closed with `WorkflowSchedulerUnavailableError`, and no fallback scheduler or
+  timers are created.
+
 ### Scheduler Adapter (`LoopSchedulerAdapter`)
 
 The `LoopSchedulerAdapter` bridges workflow runs to the public, versioned `pi-loop` service contract (`LoopServiceV1`):
@@ -572,7 +592,7 @@ proof of a provider: a registered tool confirms only that a tool exists in the P
 process, not that an external dependency (e.g. a `tmux` binary, GitHub token) is
 installed, authenticated, or compatible.
 
-- The public `pi-loop` `LoopServiceV1` contract registers/provides the `loop`
+- The public `pi-loop/service` `LoopServiceV1` contract registers/provides the `loop`
   capability; a workflow requiring `loop` fails clearly when no compatible loop
   provider exists.
 - `tmux`/worker-runtime and `github` are logical capabilities satisfied by
