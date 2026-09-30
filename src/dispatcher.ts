@@ -5,6 +5,11 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type {
+  CapabilityResolution,
+  CapabilityStatus,
+  WorkflowCapabilityRequirement,
+} from "./capabilities.ts";
 import { formatDuration, parseDuration } from "./duration.ts";
 import { buildIterationPrompt } from "./prompt.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
@@ -151,7 +156,24 @@ export class WorkflowDispatcher {
       );
     }
 
-    // Check hard budget limits before dispatching
+    // Ownership lease enforcement MUST precede any registry mutation (budget
+    // cancellation/blocking, turn increments) so a non-owner can never mutate
+    // another live owner's run:
+    // A run with a LIVE ownership lease may only be dispatched by the owning instance.
+    // A missing or expired lease permits takeover, which the scheduler adapter records
+    // durably before dispatching. Omitting ownerId while a live lease exists is denied.
+    if (run.lease) {
+      const leaseLive = run.lease.expiresAt === undefined || run.lease.expiresAt > Date.now();
+      if (leaseLive && run.lease.ownerId !== options.ownerId) {
+        throw new WorkflowOwnershipError(
+          `Cannot dispatch iteration for run "${runId}": run is leased to owner "${run.lease.ownerId}".`,
+          { runId, currentOwnerId: run.lease.ownerId, requestedOwnerId: options.ownerId }
+        );
+      }
+    }
+
+    // Check hard budget limits before dispatching. Any resulting cancel/block
+    // mutation only runs after ownership has been proven above.
     const exhaustion = checkRunBudgetExhaustion(run);
     if (exhaustion.exhausted) {
       const budgetPolicy = run.budget ?? run.snapshot.budget;
@@ -175,20 +197,6 @@ export class WorkflowDispatcher {
         `Cannot dispatch iteration for run "${runId}": ${exhaustion.reason}`,
         { runId, dimension: exhaustion.dimension, limit: exhaustion.limit, actual: exhaustion.actual }
       );
-    }
-
-    // Ownership lease enforcement (fail closed):
-    // A run with a LIVE ownership lease may only be dispatched by the owning instance.
-    // A missing or expired lease permits takeover, which the scheduler adapter records
-    // durably before dispatching. Omitting ownerId while a live lease exists is denied.
-    if (run.lease) {
-      const leaseLive = run.lease.expiresAt === undefined || run.lease.expiresAt > Date.now();
-      if (leaseLive && run.lease.ownerId !== options.ownerId) {
-        throw new WorkflowOwnershipError(
-          `Cannot dispatch iteration for run "${runId}": run is leased to owner "${run.lease.ownerId}".`,
-          { runId, currentOwnerId: run.lease.ownerId, requestedOwnerId: options.ownerId }
-        );
-      }
     }
 
     // Safely invalidate any existing active iteration
@@ -225,6 +233,7 @@ export class WorkflowDispatcher {
       createdAt: Date.now(),
       schedulerPort: options.schedulerPort,
       capabilities: capsSet,
+      capabilityReport: options.capabilityReport,
       signal: options.signal,
       ownerId: options.ownerId,
     };
@@ -400,9 +409,43 @@ export class WorkflowDispatcher {
 
     const exhaustion = checkRunBudgetExhaustion(run, now);
 
+    const requirementList: readonly (string | WorkflowCapabilityRequirement)[] =
+      snapshot.capabilityRequirements && snapshot.capabilityRequirements.length > 0
+        ? snapshot.capabilityRequirements
+        : snapshot.requires;
+
     const capabilitiesRecord: Record<string, boolean> = {};
-    for (const req of snapshot.requires) {
-      capabilitiesRecord[req] = active.capabilities ? active.capabilities.has(req) : true;
+    const capabilityStatusRecord: Record<string, CapabilityStatus | "missing" | "incompatible"> = {};
+    const capabilityIssues: Record<string, string> = {};
+    let missingCapabilities: string[] | undefined;
+    let incompatibleCapabilities: string[] | undefined;
+    let degradedCapabilities: string[] | undefined;
+    let optionalCapabilitiesMissing: string[] | undefined;
+    let optionalCapabilitiesIncompatible: string[] | undefined;
+    let capabilitiesSatisfied: boolean | undefined;
+
+    const report = active.capabilityReport;
+    if (report) {
+      for (const item of report.items) {
+        capabilityStatusRecord[item.name] = item.status;
+        capabilitiesRecord[item.name] = item.satisfied;
+        if (item.reason) {
+          capabilityIssues[item.name] = item.reason;
+        }
+      }
+      missingCapabilities = report.missing;
+      incompatibleCapabilities = report.incompatible;
+      degradedCapabilities = report.degraded;
+      optionalCapabilitiesMissing = report.optionalMissing;
+      optionalCapabilitiesIncompatible = report.optionalIncompatible;
+      capabilitiesSatisfied = report.ok;
+    } else {
+      for (const req of requirementList) {
+        const name = typeof req === "string" ? req : req.name;
+        const satisfied = active.capabilities ? active.capabilities.has(name) : true;
+        capabilitiesRecord[name] = satisfied;
+        capabilityStatusRecord[name] = satisfied ? "available" : "missing";
+      }
     }
 
     return {
@@ -438,6 +481,14 @@ export class WorkflowDispatcher {
       },
       requires: snapshot.requires,
       capabilities: capabilitiesRecord,
+      capabilityStatus: capabilityStatusRecord,
+      ...(Object.keys(capabilityIssues).length > 0 ? { capabilityIssues } : {}),
+      ...(missingCapabilities ? { missingCapabilities } : {}),
+      ...(incompatibleCapabilities ? { incompatibleCapabilities } : {}),
+      ...(degradedCapabilities ? { degradedCapabilities } : {}),
+      ...(optionalCapabilitiesMissing ? { optionalCapabilitiesMissing } : {}),
+      ...(optionalCapabilitiesIncompatible ? { optionalCapabilitiesIncompatible } : {}),
+      ...(capabilitiesSatisfied !== undefined ? { capabilitiesSatisfied } : {}),
       wakeups: {
         default: snapshot.wakeups.default,
         defaultMs: snapshot.wakeups.defaultMs,
@@ -463,11 +514,15 @@ export class WorkflowDispatcher {
   /**
    * Deterministically constructs the iteration prompt for the specified run.
    */
-  buildPrompt(runId: string, options?: { availableCapabilities?: Iterable<string>; now?: number }): string {
+  buildPrompt(
+    runId: string,
+    options?: { availableCapabilities?: Iterable<string>; capabilityReport?: CapabilityResolution; now?: number }
+  ): string {
     const run = this.registry.requireRun(runId);
     return buildIterationPrompt({
       run,
       availableCapabilities: options?.availableCapabilities ?? this.activeBinding?.capabilities,
+      capabilityReport: options?.capabilityReport ?? this.activeBinding?.capabilityReport,
       now: options?.now,
     });
   }

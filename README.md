@@ -83,7 +83,7 @@ You are an autonomous engineering agent executing tasks.
 | `wakeups.min` | string / number | No | Minimum allowed wakeup delay. |
 | `wakeups.max` | string / number | No | Maximum allowed wakeup delay. |
 | `wakeups.named` | object | No | Named delays e.g. `{ idle: "15m", retry: "1m" }`. |
-| `requires` | string[] | No | Required capability dependencies (e.g. `["loop", "tmux"]`). |
+| `requires` | string[] / object[] | No | Required capability dependencies. Bare names (e.g. `["loop", "tmux"]`) or structured constraints `{ name, version?, features?, optional? }`. See [Capability Providers](docs/capability-providers.md). |
 | `completion` | object | No | Completion gate and verification policies. |
 | `completion.requireSummary` | boolean | No | Requires completion summary on finish. |
 | `completion.requireEvidence` | boolean | No | Requires structured evidence references on finish. |
@@ -480,11 +480,16 @@ import {
   createWorkflowSnapshot,
   WorkflowRunRegistry,
   createWorkflowRunRegistry,
+  createWorkflowCapabilityRegistry,
 } from "pi-workflow";
 
 // Load workflow definition and create immutable snapshot
 const def = await loadWorkflow("github-coding");
 const registry = new WorkflowRunRegistry();
+
+// Session-scoped capability providers (loop is auto-provided by pi-loop).
+const capabilities = createWorkflowCapabilityRegistry({ sessionId });
+capabilities.register({ name: "tmux", version: 2, features: ["pty"], api: {/* trusted handle */} });
 
 // 1. Create a run
 const run = registry.createRun(def, {
@@ -559,9 +564,30 @@ The command surface exposes workflow concepts without exposing raw scheduler tas
   3. **New Requirements**: Any additional capabilities in the on-disk definition's `requires` list must also be satisfied.
 - **Rollback Guarantee**: If scheduling the next iteration in the scheduler fails during `resume`, the run is rolled back to its previous lifecycle (`paused` or `blocked`) rather than remaining in an un-scheduled active state.
 
-### Capability Detection Limitations
+### Capability Detection & Providers
 
-Inspecting Pi tool names or namespaces (via `pi.getAllTools()`) is only a discovery heuristic. It confirms that a tool or namespace is registered in the Pi process, but does **not** prove that an external system dependency (such as an installed `tmux` binary or docker daemon) is functional, nor that remote credentials or service tokens (such as GitHub OAuth or API tokens) are authenticated. Deployments requiring strict verification should supply an explicit capability provider.
+Capabilities are resolved through a session-scoped, versioned provider registry.
+Inspecting Pi tool names or namespaces (via `pi.getAllTools()`) is **not** used as
+proof of a provider: a registered tool confirms only that a tool exists in the Pi
+process, not that an external dependency (e.g. a `tmux` binary, GitHub token) is
+installed, authenticated, or compatible.
+
+- The public `pi-loop` `LoopServiceV1` contract registers/provides the `loop`
+  capability; a workflow requiring `loop` fails clearly when no compatible loop
+  provider exists.
+- `tmux`/worker-runtime and `github` are logical capabilities satisfied by
+  pluggable providers (extension/plugin/CLI-backed adapters), not hard-coded
+  executables or GitHub policy.
+- Version/feature mismatches produce actionable errors; `degraded` providers
+  satisfy requirements but are surfaced in the iteration context and prompt.
+- Optional capabilities never block unrelated workflow runs.
+- Provider registration is bound to the active Pi session on `session_start`;
+  event-bus register and unregister payloads must carry that session's
+  non-empty id (missing/mismatched ids are ignored), and session-scoped
+  providers are reset on session switch.
+
+See [Capability Providers](docs/capability-providers.md) for the model, the
+minimal third-party provider example, and session-scope/lifecycle guarantees.
 
 
 ---

@@ -6,6 +6,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createWorkflowCapabilityRegistry, type WorkflowCapabilityRegistry } from "./capabilities.ts";
 import { WorkflowDispatcher } from "./dispatcher.ts";
 import { WorkflowRunRegistry } from "./registry.ts";
 import {
@@ -25,6 +26,9 @@ export * from "./constants.ts";
 
 // Re-export types
 export * from "./types.ts";
+
+// Re-export capability/provider registry
+export * from "./capabilities.ts";
 
 // Re-export duration utilities
 export * from "./duration.ts";
@@ -101,19 +105,46 @@ export function createWorkflowCommandController(
   return new WorkflowCommandController(options);
 }
 
+export interface WorkflowExtensionOptions {
+  /**
+   * Optional pre-built, session-scoped capability registry. When provided,
+   * third-party provider extensions can register capabilities before the
+   * workflow engine starts.
+   */
+  capabilityRegistry?: WorkflowCapabilityRegistry;
+}
+
+/**
+ * Internals returned by the extension entrypoint for programmatic use and
+ * testing. Pi ignores the return value.
+ */
+export interface WorkflowExtensionHandle {
+  registry: WorkflowRunRegistry;
+  capabilityRegistry: WorkflowCapabilityRegistry;
+  dispatcher: WorkflowDispatcher;
+  adapter: LoopSchedulerAdapter;
+  controller: WorkflowCommandController;
+}
+
 /**
  * Pi extension entrypoint.
  * Automatically synchronizes workflow runs with the active session branch across reloads and tree navigation,
  * discovers and bridges to pi-loop for workflow scheduling, registers model-facing workflow tools,
  * and enforces safe iteration clearing across lifecycle events.
  */
-export default function workflowExtension(pi: ExtensionAPI): void {
+export default function workflowExtension(
+  pi: ExtensionAPI,
+  options: WorkflowExtensionOptions = {}
+): WorkflowExtensionHandle {
   const registry = new WorkflowRunRegistry();
+  const capabilityRegistry =
+    options.capabilityRegistry ?? createWorkflowCapabilityRegistry();
   const dispatcher = new WorkflowDispatcher(registry);
   const adapter = new LoopSchedulerAdapter({
     registry,
     dispatcher,
     events: (pi as any).events,
+    capabilityRegistry,
   });
   const tools = createWorkflowTools({ dispatcher, registry });
 
@@ -128,12 +159,32 @@ export default function workflowExtension(pi: ExtensionAPI): void {
     adapter,
     dispatcher,
     pi,
+    capabilityRegistry,
   });
 
   registerWorkflowCommand(pi, controller);
 
+  const events = (pi as any).events;
+  if (events && typeof capabilityRegistry.bindEventBus === "function") {
+    capabilityRegistry.bindEventBus(events);
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     dispatcher.clearActiveIteration("session_start");
+    // Bind the capability registry to the concrete active session before any
+    // provider advertisement is honored. Bus ads from other sessions are
+    // ignored, and providers attributed to a previous session are reset.
+    const sessionId =
+      typeof (ctx?.sessionManager as any)?.getSessionId === "function"
+        ? (ctx.sessionManager as any).getSessionId()
+        : undefined;
+    if (typeof sessionId === "string" && sessionId.length > 0) {
+      try {
+        capabilityRegistry.beginSession(sessionId);
+      } catch {
+        // Registry disposal or invalid id must not crash session startup.
+      }
+    }
     registry.bindSession({
       appendEntry: (customType: string, data?: unknown) => pi.appendEntry(customType, data),
       getBranch: (fromId?: string) => ctx.sessionManager.getBranch(fromId),
@@ -172,5 +223,8 @@ export default function workflowExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     dispatcher.clearActiveIteration("session_shutdown");
     adapter.detachService();
+    capabilityRegistry.dispose();
   });
+
+  return { registry, capabilityRegistry, dispatcher, adapter, controller };
 }

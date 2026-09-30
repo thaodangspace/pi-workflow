@@ -3,6 +3,11 @@
  */
 
 import type { ALLOWED_WORKFLOW_MODES, WORKFLOW_SCHEMA_VERSION } from "./constants.ts";
+import type {
+  CapabilityResolution,
+  CapabilityStatus,
+  WorkflowCapabilityRequirement,
+} from "./capabilities.ts";
 
 export type WorkflowMode = (typeof ALLOWED_WORKFLOW_MODES)[number];
 
@@ -115,8 +120,14 @@ export interface WorkflowDefinitionV1 {
   budget: WorkflowBudgetPolicy;
   /** Timing/wakeup delay policy */
   wakeups: WorkflowWakeupPolicy;
-  /** Required capability dependencies */
+  /** Required capability names (legacy, string form; preserved for compatibility) */
   requires: string[];
+  /**
+   * Normalized capability requirements with optional version/feature/optional
+   * constraints. Always present after parsing; entries mirror `requires` when
+   * only bare names were declared.
+   */
+  capabilityRequirements?: WorkflowCapabilityRequirement[];
   /** Optional completion and verification gate policy */
   completion?: WorkflowCompletionPolicy;
   /** Optional arbitrary metadata */
@@ -149,6 +160,7 @@ export interface WorkflowSnapshotV1 {
   readonly budget: DeepReadonly<WorkflowBudgetPolicy>;
   readonly wakeups: DeepReadonly<WorkflowWakeupPolicy>;
   readonly requires: ReadonlyArray<string>;
+  readonly capabilityRequirements?: DeepReadonly<WorkflowCapabilityRequirement[]>;
   readonly completion?: DeepReadonly<WorkflowCompletionPolicy>;
   readonly metadata?: DeepReadonly<Record<string, unknown>>;
   readonly body: string;
@@ -755,8 +767,18 @@ export class WorkflowPersistenceError extends WorkflowRunError {
 export class WorkflowCapabilityError extends WorkflowRunError {
   readonly workflow: string;
   readonly missingCapabilities: readonly string[];
+  /** Capabilities present but at an incompatible version/features. */
+  readonly incompatibleCapabilities: readonly string[];
+  /** Per-requirement resolution detail when available. */
+  readonly resolution?: CapabilityResolution;
 
-  constructor(workflow: string, missingCapabilities: string[], message?: string, runId?: string) {
+  constructor(
+    workflow: string,
+    missingCapabilities: string[],
+    message?: string,
+    runId?: string,
+    options?: { incompatible?: string[]; resolution?: CapabilityResolution }
+  ) {
     super(
       message ??
         `Workflow "${workflow}" requires capabilities: [${missingCapabilities.join(
@@ -767,6 +789,8 @@ export class WorkflowCapabilityError extends WorkflowRunError {
     this.name = "WorkflowCapabilityError";
     this.workflow = workflow;
     this.missingCapabilities = Object.freeze([...missingCapabilities]);
+    this.incompatibleCapabilities = Object.freeze([...(options?.incompatible ?? [])]);
+    this.resolution = options?.resolution;
   }
 }
 
@@ -912,6 +936,8 @@ export interface IterationBinding {
   readonly createdAt: number;
   readonly schedulerPort?: WorkflowSchedulerPort;
   readonly capabilities?: ReadonlySet<string>;
+  /** Structured capability resolution captured at dispatch time (if any). */
+  readonly capabilityReport?: CapabilityResolution;
   readonly signal?: AbortSignal;
   readonly ownerId?: string;
 }
@@ -920,6 +946,8 @@ export interface IterationBinding {
 export interface DispatchIterationOptions {
   schedulerPort?: WorkflowSchedulerPort;
   capabilities?: Iterable<string> | Record<string, boolean>;
+  /** Structured resolution of the run's required capabilities. */
+  capabilityReport?: CapabilityResolution;
   signal?: AbortSignal;
   incrementTurns?: boolean;
   ownerId?: string;
@@ -962,6 +990,22 @@ export interface WorkflowIterationContext {
   };
   requires: readonly string[];
   capabilities: Record<string, boolean>;
+  /** Provider status per required capability (available/degraded/missing/incompatible). */
+  capabilityStatus?: Record<string, CapabilityStatus | "missing" | "incompatible">;
+  /** Actionable issues per required capability (version/feature/availability). */
+  capabilityIssues?: Record<string, string>;
+  /** Required capabilities that are missing or unavailable at dispatch. */
+  missingCapabilities?: readonly string[];
+  /** Required capabilities present at an incompatible version/features. */
+  incompatibleCapabilities?: readonly string[];
+  /** Required capabilities currently degraded. */
+  degradedCapabilities?: readonly string[];
+  /** Optional capabilities that are missing or unavailable. */
+  optionalCapabilitiesMissing?: readonly string[];
+  /** Optional capabilities present at an incompatible version/features. */
+  optionalCapabilitiesIncompatible?: readonly string[];
+  /** Whether all required capabilities were satisfied at dispatch. */
+  capabilitiesSatisfied?: boolean;
   wakeups: {
     default?: string;
     defaultMs?: number;

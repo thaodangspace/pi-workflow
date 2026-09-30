@@ -60,6 +60,14 @@ export function createWorkflowSnapshot(
       ...(definition.wakeups.namedMs ? { namedMs: { ...definition.wakeups.namedMs } } : {}),
     },
     requires: [...definition.requires],
+    ...(definition.capabilityRequirements
+      ? {
+          capabilityRequirements: definition.capabilityRequirements.map((r) => ({
+            ...r,
+            ...(r.features ? { features: [...r.features] } : {}),
+          })),
+        }
+      : {}),
     ...(definition.completion ? { completion: { ...definition.completion } } : {}),
     ...(definition.metadata ? { metadata: JSON.parse(JSON.stringify(definition.metadata)) } : {}),
     body: definition.body,
@@ -80,6 +88,7 @@ export function createWorkflowSnapshot(
     budget: clonedDef.budget,
     wakeups: clonedDef.wakeups,
     requires: clonedDef.requires,
+    capabilityRequirements: clonedDef.capabilityRequirements,
     completion: clonedDef.completion,
     metadata: clonedDef.metadata,
     body: clonedDef.body,
