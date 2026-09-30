@@ -907,9 +907,11 @@ without creating any workflow resources:
 
 ```bash
 # `-e` / `--extension` is Pi's documented local extension flag.
-# `--mode rpc` is headless and `--no-session` loads the extension without
-# starting a session; exits 0 with an empty stderr when the extension loads.
-PI_OFFLINE=1 pi --mode rpc --no-session --extension ./src/index.ts </dev/null >/dev/null
+# `--mode rpc` is headless, `--no-session` loads the extension without starting
+# a session, and `--no-extensions` disables discovery/built-ins so unrelated
+# user-installed extensions cannot affect the result (explicit -e paths still
+# load). Exits 0 with empty stdout and stderr when the extension loads cleanly.
+PI_OFFLINE=1 pi --mode rpc --no-session --no-extensions --extension ./src/index.ts </dev/null >/dev/null
 ```
 
 A genuinely broken extension fails this load with a non-zero exit code and an
