@@ -65,13 +65,15 @@ describe("Workflow Iteration Context Inspection", () => {
   it("returns complete model context for the active run and hides internal loopTaskId", async () => {
     const { registry, dispatcher, getContextTool, run } = setup();
 
-    // Begin iteration with git and tmux available, docker missing
+    const ac = new AbortController();
+    // Begin iteration with git and tmux available, docker missing, and turn signal bound
     const binding = dispatcher.beginIteration(run.id, {
       capabilities: ["git", "tmux"],
+      signal: ac.signal,
       incrementTurns: false,
     });
 
-    const result = await getContextTool.execute("call-1", {}, undefined, undefined, {} as any);
+    const result = await getContextTool.execute("call-1", {}, ac.signal, undefined, {} as any);
 
     assert(result.content && result.content[0]);
     assert.equal(result.content[0].type, "text");
@@ -142,13 +144,71 @@ describe("Workflow Iteration Context Inspection", () => {
   it("fails closed when called outside an active iteration", async () => {
     const { getContextTool } = setup();
 
+    const ac = new AbortController();
     await assert.rejects(
       async () => {
-        await getContextTool.execute("call-outside", {}, undefined, undefined, {} as any);
+        await getContextTool.execute("call-outside", {}, ac.signal, undefined, {} as any);
       },
       (err: any) => {
         assert(err instanceof WorkflowIterationError);
         assert.match(err.message, /no workflow iteration is currently active/i);
+        return true;
+      }
+    );
+  });
+
+  it("regression: fails closed when active iteration has no turn-bound signal", async () => {
+    const { dispatcher, getContextTool, run } = setup();
+
+    // Dispatched without signal
+    dispatcher.beginIteration(run.id, { incrementTurns: false });
+
+    const ac = new AbortController();
+    await assert.rejects(
+      async () => {
+        await getContextTool.execute("call-no-bound-sig", {}, ac.signal, undefined, {} as any);
+      },
+      (err: any) => {
+        assert(err instanceof WorkflowIterationError);
+        assert.match(err.message, /turn-bound AbortSignal is required/i);
+        return true;
+      }
+    );
+  });
+
+  it("regression: fails closed when tool invocation does not supply a signal", async () => {
+    const { dispatcher, getContextTool, run } = setup();
+
+    const ac = new AbortController();
+    dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
+
+    // Invocation without signal
+    await assert.rejects(
+      async () => {
+        await getContextTool.execute("call-no-sig", {}, undefined, undefined, {} as any);
+      },
+      (err: any) => {
+        assert(err instanceof WorkflowIterationError);
+        assert.match(err.message, /tool invocation did not receive an AbortSignal/i);
+        return true;
+      }
+    );
+  });
+
+  it("regression: fails closed when invocation signal does not match turn-bound signal", async () => {
+    const { dispatcher, getContextTool, run } = setup();
+
+    const ac1 = new AbortController();
+    const ac2 = new AbortController();
+    dispatcher.beginIteration(run.id, { signal: ac1.signal, incrementTurns: false });
+
+    await assert.rejects(
+      async () => {
+        await getContextTool.execute("call-mismatched-sig", {}, ac2.signal, undefined, {} as any);
+      },
+      (err: any) => {
+        assert(err instanceof WorkflowIterationError);
+        assert.match(err.message, /tool call signal does not match the active iteration signal/i);
         return true;
       }
     );

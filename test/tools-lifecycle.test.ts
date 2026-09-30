@@ -71,6 +71,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     const registry = new WorkflowRunRegistry(session);
     const dispatcher = new WorkflowDispatcher(registry);
     const schedulerPort = new MockSchedulerPort();
+    const ac = new AbortController();
 
     const transitionTool = createWorkflowTransitionTool(dispatcher, registry);
     const continueTool = createWorkflowContinueTool(dispatcher, registry);
@@ -97,14 +98,15 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
       blockTool,
       completeTool,
       run,
+      ac,
     };
   }
 
   describe("workflow_transition", () => {
     it("atomically advances step, merges data, and persists to sessionTarget", async () => {
-      const { session, registry, dispatcher, transitionTool, run } = setup();
+      const { session, registry, dispatcher, transitionTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { incrementTurns: false });
+      dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
 
       const result = await transitionTool.execute(
         "call-t1",
@@ -113,7 +115,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           data: { counter: 1, file: "src/index.ts" },
           reason: "Beginning implementation phase",
         },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -139,16 +141,16 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("rejects invalid step names with WorkflowDataBoundsError", async () => {
-      const { dispatcher, transitionTool, run } = setup();
+      const { dispatcher, transitionTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { incrementTurns: false });
+      dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
 
       await assert.rejects(
         async () => {
           await transitionTool.execute(
             "call-t2",
             { toStep: "INVALID\nSTEP" },
-            undefined,
+            ac.signal,
             undefined,
             {} as any
           );
@@ -161,9 +163,9 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("rejects invalid JSON run data bounds", async () => {
-      const { dispatcher, transitionTool, run } = setup();
+      const { dispatcher, transitionTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { incrementTurns: false });
+      dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
 
       await assert.rejects(
         async () => {
@@ -173,7 +175,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
               toStep: "VALID_STEP",
               data: { invalidValue: NaN as any },
             },
-            undefined,
+            ac.signal,
             undefined,
             {} as any
           );
@@ -204,9 +206,9 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
 
   describe("workflow_continue", () => {
     it("resolves named wakeup delay and calls schedulerPort with current run ID", async () => {
-      const { dispatcher, schedulerPort, continueTool, run } = setup();
+      const { dispatcher, schedulerPort, continueTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       const result = await continueTool.execute(
         "call-c1",
@@ -214,7 +216,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           wakeupName: "idle",
           reason: "Waiting for next polling period",
         },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -231,14 +233,14 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("resolves explicit delay duration string", async () => {
-      const { dispatcher, schedulerPort, continueTool, run } = setup();
+      const { dispatcher, schedulerPort, continueTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       const result = await continueTool.execute(
         "call-c2",
         { delay: "10m", reason: "Quick retry" },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -251,11 +253,11 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("resolves default delay when neither delay nor wakeupName is provided", async () => {
-      const { dispatcher, schedulerPort, continueTool, run } = setup();
+      const { dispatcher, schedulerPort, continueTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
-      const result = await continueTool.execute("call-c3", {}, undefined, undefined, {} as any);
+      const result = await continueTool.execute("call-c3", {}, ac.signal, undefined, {} as any);
 
       const details = result.details as any;
       assert.equal(details.delayMs, 5 * 60 * 1000); // 5m default from definition
@@ -265,15 +267,15 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("clamps delay against min and max policy bounds", async () => {
-      const { dispatcher, schedulerPort, continueTool, run } = setup();
+      const { dispatcher, schedulerPort, continueTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       // 'fast' is 10s, min bound in wakeups policy is 30s
       const resultMin = await continueTool.execute(
         "call-c4",
         { wakeupName: "fast" },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -286,7 +288,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
       const resultMax = await continueTool.execute(
         "call-c5",
         { delay: "2h" },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -297,16 +299,16 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("throws on unknown named wakeup", async () => {
-      const { dispatcher, schedulerPort, continueTool, run } = setup();
+      const { dispatcher, schedulerPort, continueTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       await assert.rejects(
         async () => {
           await continueTool.execute(
             "call-c6",
             { wakeupName: "nonexistent" },
-            undefined,
+            ac.signal,
             undefined,
             {} as any
           );
@@ -320,14 +322,14 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("throws when scheduler port is not configured", async () => {
-      const { dispatcher, continueTool, run } = setup();
+      const { dispatcher, continueTool, run, ac } = setup();
 
       // Begin iteration without schedulerPort
-      dispatcher.beginIteration(run.id, { incrementTurns: false });
+      dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
 
       await assert.rejects(
         async () => {
-          await continueTool.execute("call-c7", {}, undefined, undefined, {} as any);
+          await continueTool.execute("call-c7", {}, ac.signal, undefined, {} as any);
         },
         (err: any) => {
           assert(err instanceof WorkflowRunError);
@@ -356,9 +358,9 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
 
   describe("workflow_block", () => {
     it("moves run to blocked, records reason, cancels scheduled wakeup, and persists", async () => {
-      const { session, registry, dispatcher, schedulerPort, blockTool, continueTool, run } = setup();
+      const { session, registry, dispatcher, schedulerPort, blockTool, continueTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       const result = await blockTool.execute(
         "call-b1",
@@ -367,7 +369,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           requiresHuman: true,
           data: { blockedStep: "DEPLOY" },
         },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -398,7 +400,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
       // A blocked run cannot continue scheduling
       await assert.rejects(
         async () => {
-          await continueTool.execute("call-c-blocked", {}, undefined, undefined, {} as any);
+          await continueTool.execute("call-c-blocked", {}, ac.signal, undefined, {} as any);
         },
         (err: any) => {
           assert(err instanceof WorkflowInvalidTransitionError);
@@ -429,9 +431,9 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
 
   describe("workflow_complete", () => {
     it("enters verification phase when definition specifies completion.verify: true", async () => {
-      const { registry, dispatcher, schedulerPort, completeTool, run } = setup();
+      const { registry, dispatcher, schedulerPort, completeTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       // First call to complete when verify is true
       const result = await completeTool.execute(
@@ -440,7 +442,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           summary: "Implementation finished, ready for verification",
           evidence: [{ type: "commit", description: "git commit abc1234" }],
         },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -461,7 +463,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           summary: "Verification passed with all checks green",
           evidence: [{ type: "test", description: "suite passed 100%" }],
         },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -479,9 +481,9 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("enforces requireEvidence: true from completion policy", async () => {
-      const { dispatcher, schedulerPort, completeTool, run } = setup();
+      const { dispatcher, schedulerPort, completeTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       // Omit evidence when policy requires it
       await assert.rejects(
@@ -489,7 +491,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           await completeTool.execute(
             "call-comp3",
             { summary: "Finished without evidence" },
-            undefined,
+            ac.signal,
             undefined,
             {} as any
           );
@@ -503,22 +505,22 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
     });
 
     it("rejects completion of an already completed run", async () => {
-      const { registry, dispatcher, schedulerPort, completeTool, run } = setup();
+      const { registry, dispatcher, schedulerPort, completeTool, run, ac } = setup();
 
-      dispatcher.beginIteration(run.id, { schedulerPort, incrementTurns: false });
+      dispatcher.beginIteration(run.id, { schedulerPort, signal: ac.signal, incrementTurns: false });
 
       // First complete verification
       await completeTool.execute(
         "call-comp4",
         { summary: "Verify", evidence: [{ type: "t", description: "d" }] },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
       await completeTool.execute(
         "call-comp5",
         { summary: "Done", evidence: [{ type: "t", description: "d" }] },
-        undefined,
+        ac.signal,
         undefined,
         {} as any
       );
@@ -529,7 +531,7 @@ describe("Workflow Model-Callable Lifecycle Tools", () => {
           await completeTool.execute(
             "call-comp6",
             { summary: "Again", evidence: [{ type: "t", description: "d" }] },
-            undefined,
+            ac.signal,
             undefined,
             {} as any
           );

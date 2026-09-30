@@ -211,32 +211,12 @@ export class WorkflowDispatcher {
   }
 
   /**
-   * Asserts that an iteration is currently active and matches the given token, generation, and signal.
-   *
-   * PRODUCTION-FAITHFUL SIGNAL IDENTITY:
-   * When Pi dispatches an agent turn with a turn-scoped AbortSignal, the dispatcher binds that
-   * signal to the IterationBinding. Any tool invocation passing a different turn's AbortSignal is
-   * detected and rejected with WorkflowStaleIterationError—even if the tool execution starts after
-   * a subsequent run's binding was established.
-   *
-   * LIMITATION NOTE:
-   * Pi's ExtensionToolContext does not natively pass workflow-specific invocation tokens or run IDs
-   * to custom tool execute() functions. If a dispatched turn does not provide an AbortSignal
-   * (or if signal is undefined), a tool call from an earlier turn that only starts executing after
-   * a subsequent run has bound cannot be distinguished by signal from the active run. Therefore,
-   * callers in production should always supply turn-scoped AbortSignals to beginIteration().
+   * Asserts that an iteration is currently active and matches the given token and generation.
+   * Used by trusted internal or programmatic callers.
    */
-  assertActiveBinding(token?: string, generation?: number, signal?: AbortSignal): IterationBinding {
+  assertActiveBinding(token?: string, generation?: number): IterationBinding {
     if (!this.activeBinding) {
-      throw new WorkflowIterationError("Cannot execute workflow tool: no workflow iteration is currently active.");
-    }
-
-    // Signal identity check: detects cross-turn invocation even if started after replacement
-    if (this.activeBinding.signal && signal && this.activeBinding.signal !== signal) {
-      throw new WorkflowStaleIterationError(
-        `Stale workflow iteration call: tool call signal does not match the active iteration signal for run "${this.activeBinding.runId}". The invocation originated from a different turn.`,
-        { runId: this.activeBinding.runId, currentGeneration: this.activeBinding.generation }
-      );
+      throw new WorkflowIterationError("Cannot execute workflow operation: no workflow iteration is currently active.");
     }
 
     if (token !== undefined && this.activeBinding.token !== token) {
@@ -253,8 +233,67 @@ export class WorkflowDispatcher {
       );
     }
 
-    if (this.activeBinding.signal?.aborted || signal?.aborted) {
+    if (this.activeBinding.signal?.aborted) {
       throw new WorkflowIterationError("Workflow iteration was aborted.", this.activeBinding.runId);
+    }
+
+    return this.activeBinding;
+  }
+
+  /**
+   * Asserts that an iteration is currently active and strictly validates turn-scoped AbortSignal
+   * identity for model-facing tool calls.
+   *
+   * To prevent stale or late asynchronous tool invocations from mutating a different run,
+   * model-facing tools FAIL CLOSED unless BOTH:
+   * 1. A turn-bound AbortSignal was provided when the iteration was dispatched (binding.signal);
+   * 2. The tool invocation was passed an AbortSignal by the host environment (signal);
+   * 3. The invocation signal is strictly identical (===) to the turn-bound signal.
+   *
+   * If either signal is absent, or if they differ, the tool call fails closed immediately.
+   */
+  assertToolBinding(signal: AbortSignal | undefined, token?: string, generation?: number): IterationBinding {
+    if (!this.activeBinding) {
+      throw new WorkflowIterationError("Cannot execute workflow tool: no workflow iteration is currently active.");
+    }
+
+    if (!this.activeBinding.signal) {
+      throw new WorkflowIterationError(
+        `Cannot execute workflow tool: active iteration for run "${this.activeBinding.runId}" was not bound with an AbortSignal. A turn-bound AbortSignal is required to enforce turn exclusivity.`,
+        this.activeBinding.runId
+      );
+    }
+
+    if (!signal) {
+      throw new WorkflowIterationError(
+        `Cannot execute workflow tool: tool invocation did not receive an AbortSignal. An AbortSignal is required to verify turn identity.`,
+        this.activeBinding.runId
+      );
+    }
+
+    if (this.activeBinding.signal !== signal) {
+      throw new WorkflowStaleIterationError(
+        `Stale workflow iteration call: tool call signal does not match the active iteration signal for run "${this.activeBinding.runId}". The invocation originated from a different turn.`,
+        { runId: this.activeBinding.runId, currentGeneration: this.activeBinding.generation }
+      );
+    }
+
+    if (this.activeBinding.signal.aborted || signal.aborted) {
+      throw new WorkflowIterationError("Workflow iteration was aborted.", this.activeBinding.runId);
+    }
+
+    if (token !== undefined && this.activeBinding.token !== token) {
+      throw new WorkflowStaleIterationError(
+        `Stale workflow iteration call: iteration token "${token}" is no longer active (current token: "${this.activeBinding.token}").`,
+        { runId: this.activeBinding.runId, token, currentGeneration: this.activeBinding.generation }
+      );
+    }
+
+    if (generation !== undefined && this.activeBinding.generation !== generation) {
+      throw new WorkflowStaleIterationError(
+        `Stale workflow iteration call: iteration generation ${generation} is no longer active (current generation: ${this.activeBinding.generation}).`,
+        { runId: this.activeBinding.runId, generation, currentGeneration: this.activeBinding.generation }
+      );
     }
 
     return this.activeBinding;

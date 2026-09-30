@@ -207,28 +207,50 @@ describe("Iteration Exclusivity, Stale Late Calls, and Lifecycle Boundaries", ()
     assert.deepEqual(currentB.data, { b: 2 });
   });
 
-  it("documents limitation: without host turn signal, tool execution starting after run B binding sees active run B", async () => {
+  it("regression: fails closed when tool execution is attempted without turn-bound signal or invocation signal", async () => {
     const { registry, dispatcher, transitionTool, runA, runB } = setup();
 
-    // In an environment where neither turn passes an AbortSignal and host provides no per-call identity:
-    dispatcher.beginIteration(runA.id, { incrementTurns: false });
-    // Run B replaces run A
-    dispatcher.beginIteration(runB.id, { incrementTurns: false });
+    const acA = new AbortController();
 
-    // A tool call starting NOW without any signal or token identity executes against the currently bound run (B)
-    const result = await transitionTool.execute(
-      "call-no-signal",
-      { toStep: "B_NEXT", data: { b: 99 } },
-      undefined,
-      undefined,
-      {} as any
+    // Case 1: Run bound WITHOUT a signal -> tool call fails closed
+    dispatcher.beginIteration(runA.id, { incrementTurns: false });
+    await assert.rejects(
+      async () => {
+        await transitionTool.execute(
+          "call-no-bound-sig",
+          { toStep: "A_NEXT" },
+          acA.signal,
+          undefined,
+          {} as any
+        );
+      },
+      (err: any) => {
+        assert(err instanceof WorkflowIterationError);
+        assert.match(err.message, /turn-bound AbortSignal is required/i);
+        return true;
+      }
     );
 
-    const details = result.details as any;
-    assert.equal(details.runId, runB.id);
-    assert.equal(details.toStep, "B_NEXT");
+    // Case 2: Run bound with signal, but tool invocation has NO signal -> tool call fails closed
+    dispatcher.beginIteration(runA.id, { signal: acA.signal, incrementTurns: false });
+    await assert.rejects(
+      async () => {
+        await transitionTool.execute(
+          "call-no-sig",
+          { toStep: "A_NEXT" },
+          undefined,
+          undefined,
+          {} as any
+        );
+      },
+      (err: any) => {
+        assert(err instanceof WorkflowIterationError);
+        assert.match(err.message, /tool invocation did not receive an AbortSignal/i);
+        return true;
+      }
+    );
 
-    // Run A was untouched
+    // Neither run A nor run B was mutated
     const currentA = registry.requireRun(runA.id);
     assert.equal(currentA.step, "A_START");
   });

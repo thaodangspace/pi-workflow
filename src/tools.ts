@@ -52,16 +52,13 @@ export function createWorkflowGetContextTool(
       "Inspect the current workflow execution context, including lifecycle state, active step, durable run data, remaining budget limits, definition metadata, and capability availability.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, signal) {
-      if (signal?.aborted) {
-        throw new WorkflowIterationError("Workflow iteration was aborted.");
-      }
-      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
+      const binding = dispatcher.assertToolBinding(signal);
       const token = binding.token;
       const generation = binding.generation;
 
       const context = dispatcher.getIterationContext(binding);
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       const summaryText = [
         `Workflow: ${context.workflow} (Run ID: ${context.runId})`,
@@ -103,10 +100,7 @@ export function createWorkflowTransitionTool(
       reason: Type.Optional(Type.String({ description: "Optional explanation or audit note for this transition" })),
     }),
     async execute(_toolCallId, params, signal) {
-      if (signal?.aborted) {
-        throw new WorkflowIterationError("Workflow iteration was aborted.");
-      }
-      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
+      const binding = dispatcher.assertToolBinding(signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -118,7 +112,7 @@ export function createWorkflowTransitionTool(
           : undefined;
 
       // Verify binding is still current before mutating
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       const run = registry.requireRun(binding.runId);
       if (run.lifecycle !== "active") {
@@ -136,7 +130,7 @@ export function createWorkflowTransitionTool(
       });
 
       // Verify binding is still current after mutating
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       return {
         content: [
@@ -178,10 +172,7 @@ export function createWorkflowContinueTool(
       reason: Type.Optional(Type.String({ description: "Optional reason for scheduling next wakeup" })),
     }),
     async execute(_toolCallId, params, signal) {
-      if (signal?.aborted) {
-        throw new WorkflowIterationError("Workflow iteration was aborted.");
-      }
-      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
+      const binding = dispatcher.assertToolBinding(signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -208,7 +199,7 @@ export function createWorkflowContinueTool(
         policy: run.snapshot.wakeups,
       });
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       await binding.schedulerPort.scheduleWakeup({
         runId: run.id,
@@ -216,7 +207,7 @@ export function createWorkflowContinueTool(
         reason: params.reason,
       });
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       const note = resolved.isClamped
         ? ` (clamped from ${formatDuration(resolved.originalDelayMs)} by policy bounds)`
@@ -266,10 +257,7 @@ export function createWorkflowBlockTool(
       ),
     }),
     async execute(_toolCallId, params, signal) {
-      if (signal?.aborted) {
-        throw new WorkflowIterationError("Workflow iteration was aborted.");
-      }
-      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
+      const binding = dispatcher.assertToolBinding(signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -286,7 +274,7 @@ export function createWorkflowBlockTool(
           ? validateRunData(params.data as Record<string, JsonValue>, { runId: binding.runId })
           : undefined;
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       const run = registry.requireRun(binding.runId);
       if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
@@ -308,7 +296,7 @@ export function createWorkflowBlockTool(
         await binding.schedulerPort.cancelWakeup(binding.runId);
       }
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       return {
         content: [
@@ -364,10 +352,7 @@ export function createWorkflowCompleteTool(
       ),
     }),
     async execute(_toolCallId, params, signal) {
-      if (signal?.aborted) {
-        throw new WorkflowIterationError("Workflow iteration was aborted.");
-      }
-      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
+      const binding = dispatcher.assertToolBinding(signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -384,7 +369,7 @@ export function createWorkflowCompleteTool(
           ? validateRunData(params.data as Record<string, JsonValue>, { runId: binding.runId })
           : undefined;
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       const run = registry.requireRun(binding.runId);
       if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
@@ -419,7 +404,7 @@ export function createWorkflowCompleteTool(
             reason: "Entering verification phase before final completion",
           });
 
-          dispatcher.assertActiveBinding(token, generation, signal);
+          dispatcher.assertToolBinding(signal, token, generation);
 
           const details: WorkflowCompleteDetails = {
             runId: updated.id,
@@ -453,7 +438,7 @@ export function createWorkflowCompleteTool(
         await binding.schedulerPort.cancelWakeup(binding.runId);
       }
 
-      dispatcher.assertActiveBinding(token, generation, signal);
+      dispatcher.assertToolBinding(signal, token, generation);
 
       const details: WorkflowCompleteDetails = {
         runId: updated.id,
