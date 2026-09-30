@@ -907,11 +907,14 @@ without creating any workflow resources:
 
 ```bash
 # `-e` / `--extension` is Pi's documented local extension flag.
-# Exits 0 after printing help; no session or workflow run is started.
-pi --extension ./src/index.ts --help
+# `--mode rpc` is headless and `--no-session` loads the extension without
+# starting a session; exits 0 with an empty stderr when the extension loads.
+PI_OFFLINE=1 pi --mode rpc --no-session --extension ./src/index.ts </dev/null >/dev/null
 ```
 
-A clean smoke-load produces no error output. If the extension throws during
-module evaluation or factory registration, Pi reports it as an extension error
-before printing help. Starting workflow resources requires an explicit run
-(e.g. `/workflow start` or `/goal`), not extension loading.
+A genuinely broken extension fails this load with a non-zero exit code and an
+error on stderr (Pi reports `Failed to load extension "<path>": …`). Note that
+`pi --extension ./src/index.ts --help` is **not** a valid smoke-load: `--help`
+short-circuits before extension load errors are surfaced, so even a throwing
+extension exits 0 with no error. Starting workflow resources requires an explicit
+run (e.g. `/workflow start` or `/goal`), not extension loading.
