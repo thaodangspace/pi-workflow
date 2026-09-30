@@ -6,10 +6,12 @@ import { randomUUID } from "node:crypto";
 import { WORKFLOW_RUN_ENTRY_TYPE, WORKFLOW_RUN_PERSISTENCE_VERSION } from "./constants.ts";
 import {
   validateBlockerInfo,
+  validateCompletionClaim,
   validateCompletionInfo,
   validateRunData,
   validateRunId,
   validateStepName,
+  validateVerificationFindings,
 } from "./data-bounds.ts";
 import { isWorkflowSnapshot } from "./snapshot.ts";
 import {
@@ -35,12 +37,15 @@ export const VALID_ACTIONS = new Set<WorkflowRunMutationAction>([
   "resume",
   "complete",
   "cancel",
+  "claim",
+  "verify",
 ]);
 
 export interface CreatePayload {
   snapshot: WorkflowSnapshotV1;
   initialStep?: string;
   initialData?: Record<string, unknown>;
+  budget?: Record<string, unknown>;
   loopTaskId?: string;
 }
 
@@ -283,6 +288,38 @@ function validatePayloadForAction(
         break;
       }
       case "cancel": {
+        if (p.data !== undefined) {
+          validateRunData(p.data, { runId });
+        }
+        break;
+      }
+      case "claim": {
+        if (typeof p.summary !== "string" || p.summary.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Claim mutation requires non-empty string "summary"`,
+            runId,
+            entryId,
+          };
+        }
+        validateCompletionClaim(p, { runId });
+        if (p.data !== undefined) {
+          validateRunData(p.data, { runId });
+        }
+        break;
+      }
+      case "verify": {
+        if (typeof p.decision !== "string" || p.decision.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Verify mutation requires string "decision"`,
+            runId,
+            entryId,
+          };
+        }
+        validateVerificationFindings(p, { runId });
         if (p.data !== undefined) {
           validateRunData(p.data, { runId });
         }

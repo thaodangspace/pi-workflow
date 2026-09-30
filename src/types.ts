@@ -37,8 +37,12 @@ export interface WorkflowBudgetPolicy {
   maxDurationMs?: number;
   /** Maximum implementation/retry attempts */
   maxAttempts?: number;
-  /** Optional monetary or cost limit */
+  /** Optional monetary or cost limit (unsupported in runtime) */
   maxCost?: number;
+  /** Optional token limit (unsupported in runtime) */
+  maxTokens?: number;
+  /** Action when hard budget is exhausted: "block" (default) or "cancel" */
+  onExhaustion?: "block" | "cancel";
 }
 
 export interface WorkflowWakeupPolicy {
@@ -73,6 +77,10 @@ export interface WorkflowCompletionPolicy {
   verifierPrompt?: string;
   /** Maximum allowed verification attempts */
   maxVerificationAttempts?: number;
+  /** Target step to return to when verification is rejected */
+  returnStep?: string;
+  /** Policy when verification retries are exhausted: "block" (default) or "fail" */
+  onRejectionExhausted?: "block" | "fail";
 }
 
 export type WorkflowScope = "project" | "user" | "explicit";
@@ -183,10 +191,14 @@ export type JsonValue =
 /** Generic workflow run execution lifecycle */
 export type WorkflowRunLifecycle =
   | "active"
+  | "verifying"
   | "paused"
   | "blocked"
   | "completed"
   | "cancelled";
+
+/** Blocker category determining autonomous polling behavior */
+export type BlockerCategory = "external-retryable" | "human-required" | "terminal";
 
 /** Structured evidence reference for workflow completion */
 export interface WorkflowEvidence {
@@ -206,10 +218,42 @@ export interface WorkflowEvidence {
 export interface WorkflowBlockerInfo {
   /** Concrete reason why the run is blocked */
   reason: string;
+  /** Blocker category / type */
+  category?: BlockerCategory;
   /** Whether human intervention/decision is required to unblock */
   requiresHuman?: boolean;
+  /** Optional conservative retry delay in ms for external-retryable blockers */
+  retryDelayMs?: number;
   /** Timestamp when blocked (Unix epoch ms) */
   blockedAt: number;
+}
+
+/** Explicit completion claim submitted by workflow */
+export interface WorkflowCompletionClaim {
+  /** Summary of completed work and deliverables */
+  summary: string;
+  /** Concrete verification or outcome evidence */
+  evidence: WorkflowEvidence[];
+  /** Timestamp when claim was submitted (Unix epoch ms) */
+  submittedAt: number;
+  /** Optional identifier for the completion claim */
+  claimId?: string;
+}
+
+/** Findings and decision from an authoritative verification iteration */
+export interface WorkflowVerificationFindings {
+  /** Verification decision */
+  decision: "accepted" | "rejected";
+  /** Evaluator feedback or explanation */
+  feedback?: string;
+  /** Timestamp when verified (Unix epoch ms) */
+  verifiedAt: number;
+  /** Verification attempt number (1-based) */
+  attempt: number;
+  /** Optional step to return to upon rejection */
+  returnStep?: string;
+  /** Optional structured checks evaluation */
+  checks?: Array<{ name: string; passed: boolean; message?: string }>;
 }
 
 /** Completion record for a successful workflow run */
@@ -236,8 +280,10 @@ export interface WorkflowRun {
   readonly definitionSource: string;
   /** Immutable definition snapshot */
   readonly snapshot: WorkflowSnapshotV1;
+  /** Optional run-level budget limits overriding snapshot budget */
+  readonly budget?: Readonly<WorkflowBudgetPolicy>;
 
-  /** Generic lifecycle status (active, paused, blocked, completed, cancelled) */
+  /** Generic lifecycle status (active, verifying, paused, blocked, completed, cancelled) */
   readonly lifecycle: WorkflowRunLifecycle;
   /** Current workflow-specific execution step (e.g., WAITING_CI, IMPLEMENTING) */
   readonly step: string;
@@ -264,6 +310,12 @@ export interface WorkflowRun {
 
   /** Details if the run is currently in "blocked" state */
   readonly blocker?: Readonly<WorkflowBlockerInfo>;
+  /** Explicit completion claim if submitted */
+  readonly completionClaim?: Readonly<WorkflowCompletionClaim>;
+  /** Authoritative verification findings if verification was performed */
+  readonly verificationFindings?: Readonly<WorkflowVerificationFindings>;
+  /** Number of verification attempts performed */
+  readonly verificationAttempts?: number;
   /** Details if the run has transitioned to "completed" state */
   readonly completion?: Readonly<WorkflowCompletionInfo>;
 }
@@ -277,7 +329,9 @@ export type WorkflowRunMutationAction =
   | "pause"
   | "resume"
   | "complete"
-  | "cancel";
+  | "cancel"
+  | "claim"
+  | "verify";
 
 /** Persisted CustomEntry data payload in Pi session */
 export interface WorkflowRunMutationEntryData {
@@ -326,6 +380,8 @@ export interface CreateRunOptions {
   initialStep?: string;
   /** Initial workflow data */
   initialData?: Record<string, JsonValue>;
+  /** Optional run-level budget override */
+  budget?: WorkflowBudgetPolicy;
   /** Linkage to scheduler task */
   loopTaskId?: string;
   /** Optional creation timestamp (Unix epoch ms) */
@@ -371,8 +427,12 @@ export interface TransitionStepOptions {
 export interface BlockRunOptions {
   /** Required explanation of the blocking condition */
   reason: string;
+  /** Blocker category / type */
+  category?: BlockerCategory;
   /** Whether human action/judgment is required to unblock */
   requiresHuman?: boolean;
+  /** Optional conservative retry delay in ms for external-retryable blocker */
+  retryDelayMs?: number;
   /** Optional data updates during blocking */
   data?: Record<string, JsonValue>;
   /** Timestamp when blocked (Unix epoch ms) */
@@ -399,6 +459,36 @@ export interface ResumeRunOptions {
   resumedAt?: number;
 }
 
+export interface ClaimCompletionOptions {
+  /** Summary of completion outcomes */
+  summary: string;
+  /** Concrete verification evidence */
+  evidence?: WorkflowEvidence[];
+  /** Optional final data updates */
+  data?: Record<string, JsonValue>;
+  /** Optional claim ID */
+  claimId?: string;
+  /** Timestamp when claim was submitted (Unix epoch ms) */
+  submittedAt?: number;
+}
+
+export interface VerifyCompletionOptions {
+  /** Verification decision */
+  decision: "accept" | "reject" | "accepted" | "rejected";
+  /** Evaluator feedback or explanation */
+  feedback?: string;
+  /** Optional synonym for feedback */
+  findings?: string;
+  /** Optional structured checks evaluation */
+  checks?: Array<{ name: string; passed: boolean; message?: string }>;
+  /** Optional step to return to upon rejection */
+  returnStep?: string;
+  /** Optional data updates */
+  data?: Record<string, JsonValue>;
+  /** Timestamp when verified (Unix epoch ms) */
+  verifiedAt?: number;
+}
+
 export interface CompleteRunOptions {
   /** Summary of completion outcomes */
   summary: string;
@@ -406,6 +496,8 @@ export interface CompleteRunOptions {
   evidence?: WorkflowEvidence[];
   /** Optional final data updates */
   data?: Record<string, JsonValue>;
+  /** Optional claim ID */
+  claimId?: string;
   /** Timestamp when completed (Unix epoch ms) */
   completedAt?: number;
 }
@@ -529,6 +621,48 @@ export class WorkflowCapabilityError extends WorkflowRunError {
   }
 }
 
+export class WorkflowBudgetError extends WorkflowRunError {
+  readonly dimension?: string;
+  constructor(message: string, runId?: string, dimension?: string) {
+    super(message, runId);
+    this.name = "WorkflowBudgetError";
+    this.dimension = dimension;
+  }
+}
+
+export class WorkflowUnsupportedBudgetError extends WorkflowBudgetError {
+  constructor(workflow: string, dimension: string, message?: string, runId?: string) {
+    super(
+      message ??
+        `Workflow "${workflow}" specifies budget dimension "${dimension}", which is unsupported because Pi runtime does not expose authoritative accounting data.`,
+      runId,
+      dimension
+    );
+    this.name = "WorkflowUnsupportedBudgetError";
+  }
+}
+
+export class WorkflowBudgetExhaustedError extends WorkflowBudgetError {
+  readonly limit?: number;
+  readonly actual?: number;
+  constructor(
+    message: string,
+    options?: { runId?: string; dimension?: string; limit?: number; actual?: number }
+  ) {
+    super(message, options?.runId, options?.dimension);
+    this.name = "WorkflowBudgetExhaustedError";
+    this.limit = options?.limit;
+    this.actual = options?.actual;
+  }
+}
+
+export class WorkflowVerificationError extends WorkflowRunError {
+  constructor(message: string, runId?: string) {
+    super(message, runId);
+    this.name = "WorkflowVerificationError";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Workflow Iteration Context & Dispatcher Types (Issue #3)
 // ---------------------------------------------------------------------------
@@ -600,6 +734,12 @@ export interface WorkflowIterationBudgetStatus {
   maxAttempts?: number;
   attemptsRemaining?: number;
   maxCost?: number;
+  costStatus?: "unavailable";
+  maxTokens?: number;
+  tokensStatus?: "unavailable";
+  isExhausted?: boolean;
+  exhaustedDimension?: "turns" | "duration" | "attempts";
+  exhaustionReason?: string;
 }
 
 /** Model-facing execution context snapshot */

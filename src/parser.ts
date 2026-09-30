@@ -361,6 +361,24 @@ export function parseWorkflowContent(
           budget.maxCost = rawBudget.maxCost;
         }
       }
+
+      if (rawBudget.maxTokens !== undefined || rawBudget.tokenBudget !== undefined) {
+        addError(
+          "budget.maxTokens",
+          `Field "budget.maxTokens" is not supported because Pi runtime does not expose authoritative token accounting data`
+        );
+      }
+
+      if (rawBudget.onExhaustion !== undefined) {
+        if (rawBudget.onExhaustion !== "block" && rawBudget.onExhaustion !== "cancel") {
+          addError(
+            "budget.onExhaustion",
+            `Field "budget.onExhaustion" must be "block" or "cancel" (got "${String(rawBudget.onExhaustion)}")`
+          );
+        } else {
+          budget.onExhaustion = rawBudget.onExhaustion;
+        }
+      }
     }
   }
 
@@ -502,6 +520,25 @@ export function parseWorkflowContent(
           );
         } else {
           completion.maxVerificationAttempts = rawCompletion.maxVerificationAttempts;
+        }
+      }
+
+      if (rawCompletion.returnStep !== undefined) {
+        if (typeof rawCompletion.returnStep !== "string" || rawCompletion.returnStep.trim() === "") {
+          addError("completion.returnStep", `Field "completion.returnStep" must be a non-empty string`);
+        } else {
+          completion.returnStep = rawCompletion.returnStep.trim();
+        }
+      }
+
+      if (rawCompletion.onRejectionExhausted !== undefined) {
+        if (rawCompletion.onRejectionExhausted !== "block" && rawCompletion.onRejectionExhausted !== "fail") {
+          addError(
+            "completion.onRejectionExhausted",
+            `Field "completion.onRejectionExhausted" must be "block" or "fail" (got "${String(rawCompletion.onRejectionExhausted)}")`
+          );
+        } else {
+          completion.onRejectionExhausted = rawCompletion.onRejectionExhausted;
         }
       }
     }

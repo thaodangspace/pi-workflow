@@ -82,3 +82,12 @@ export const MAX_STEP_NAME_LENGTH = 64;
 
 /** Maximum length for workflow run IDs */
 export const MAX_RUN_ID_LENGTH = 128;
+
+/** Maximum character length for verification findings */
+export const MAX_VERIFICATION_FINDINGS_LENGTH = 4096;
+
+/** Default maximum verification attempts before blocking */
+export const MAX_VERIFICATION_ATTEMPTS_DEFAULT = 3;
+
+/** Default conservative retry delay for external-retryable blockers (15 minutes) */
+export const DEFAULT_RETRYABLE_BLOCKER_DELAY_MS = 15 * 60 * 1000;

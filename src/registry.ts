@@ -8,11 +8,13 @@ import { validateRunId } from "./data-bounds.ts";
 import {
   applyBlockRun,
   applyCancelRun,
+  applyClaimCompletion,
   applyCompleteRun,
   applyPauseRun,
   applyResumeRun,
   applyRunUpdate,
   applyStepTransition,
+  applyVerifyRun,
   createWorkflowRun,
   isTerminalLifecycle,
 } from "./run.ts";
@@ -24,6 +26,7 @@ import { createWorkflowSnapshot, isWorkflowSnapshot } from "./snapshot.ts";
 import {
   type BlockRunOptions,
   type CancelRunOptions,
+  type ClaimCompletionOptions,
   type CompleteRunOptions,
   type CreateRunOptions,
   type PauseRunOptions,
@@ -31,6 +34,7 @@ import {
   type ResumeRunOptions,
   type TransitionStepOptions,
   type UpdateRunOptions,
+  type VerifyCompletionOptions,
   WorkflowConcurrencyError,
   type WorkflowDefinitionV1,
   WorkflowInvalidTransitionError,
@@ -155,6 +159,7 @@ export class WorkflowRunRegistry {
       snapshot,
       initialStep: options.initialStep,
       initialData: options.initialData,
+      budget: options.budget,
       loopTaskId: options.loopTaskId,
       createdAt: options.createdAt,
     });
@@ -164,6 +169,7 @@ export class WorkflowRunRegistry {
       snapshot: run.snapshot,
       initialStep: run.step,
       initialData: run.data,
+      budget: run.budget,
       loopTaskId: run.loopTaskId,
     }, { timestamp: run.createdAt });
 
@@ -222,7 +228,9 @@ export class WorkflowRunRegistry {
 
     const entryData = buildMutationEntryData("block", runId, updated.workflow, {
       reason: options.reason,
-      requiresHuman: options.requiresHuman,
+      category: updated.blocker?.category,
+      requiresHuman: updated.blocker?.requiresHuman,
+      retryDelayMs: updated.blocker?.retryDelayMs,
       data: options.data,
     }, { timestamp: updated.updatedAt });
 
@@ -259,6 +267,45 @@ export class WorkflowRunRegistry {
       step: options.step,
       data: options.data,
       reason: options.reason,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Submit an explicit completion claim for verification.
+   */
+  claimCompletion(runId: string, options: ClaimCompletionOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyClaimCompletion(current, options);
+
+    const entryData = buildMutationEntryData("claim", runId, updated.workflow, {
+      summary: options.summary,
+      evidence: options.evidence,
+      data: options.data,
+      claimId: options.claimId,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Authoritatively evaluate and record verification findings for a completion claim.
+   */
+  verifyRun(runId: string, options: VerifyCompletionOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyVerifyRun(current, options);
+
+    const entryData = buildMutationEntryData("verify", runId, updated.workflow, {
+      decision: options.decision,
+      feedback: options.feedback ?? options.findings,
+      checks: options.checks,
+      returnStep: options.returnStep,
+      data: options.data,
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
@@ -439,6 +486,7 @@ export class WorkflowRunRegistry {
             snapshot: p.snapshot,
             initialStep: p.initialStep,
             initialData: p.initialData,
+            budget: p.budget,
             loopTaskId: p.loopTaskId,
             createdAt: timestamp,
           });
@@ -488,9 +536,30 @@ export class WorkflowRunRegistry {
             case "block":
               updated = applyBlockRun(current, {
                 reason: p.reason,
+                category: p.category,
                 requiresHuman: p.requiresHuman,
+                retryDelayMs: p.retryDelayMs,
                 data: p.data,
                 blockedAt: timestamp,
+              });
+              break;
+            case "claim":
+              updated = applyClaimCompletion(current, {
+                summary: p.summary,
+                evidence: p.evidence,
+                data: p.data,
+                claimId: p.claimId,
+                submittedAt: timestamp,
+              });
+              break;
+            case "verify":
+              updated = applyVerifyRun(current, {
+                decision: p.decision,
+                feedback: p.feedback ?? p.findings,
+                checks: p.checks,
+                returnStep: p.returnStep,
+                data: p.data,
+                verifiedAt: timestamp,
               });
               break;
             case "pause":

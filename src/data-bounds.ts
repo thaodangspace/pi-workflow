@@ -12,13 +12,17 @@ import {
   MAX_RUN_DATA_BYTES,
   MAX_RUN_ID_LENGTH,
   MAX_STEP_NAME_LENGTH,
+  MAX_VERIFICATION_FINDINGS_LENGTH,
 } from "./constants.ts";
 import {
+  type BlockerCategory,
   type JsonValue,
   type WorkflowBlockerInfo,
+  type WorkflowCompletionClaim,
   type WorkflowCompletionInfo,
   WorkflowDataBoundsError,
   type WorkflowEvidence,
+  type WorkflowVerificationFindings,
 } from "./types.ts";
 
 export interface JsonValidationOptions {
@@ -296,27 +300,61 @@ export function validateBlockerInfo(
     );
   }
 
-  if (typeof blocker.reason !== "string" || blocker.reason.trim() === "") {
+  const b = blocker as Record<string, unknown>;
+
+  if (typeof b.reason !== "string" || b.reason.trim() === "") {
     throw new WorkflowDataBoundsError(
       `Blocker info requires non-empty string "reason"`,
       { runId, field: "blocker.reason" }
     );
   }
 
-  if (blocker.reason.length > MAX_BLOCKER_REASON_LENGTH) {
+  if (b.reason.length > MAX_BLOCKER_REASON_LENGTH) {
     throw new WorkflowDataBoundsError(
-      `Blocker reason length (${blocker.reason.length}) exceeds maximum allowed of ${MAX_BLOCKER_REASON_LENGTH}`,
-      { runId, field: "blocker.reason", limit: MAX_BLOCKER_REASON_LENGTH, actual: blocker.reason.length }
+      `Blocker reason length (${b.reason.length}) exceeds maximum allowed of ${MAX_BLOCKER_REASON_LENGTH}`,
+      { runId, field: "blocker.reason", limit: MAX_BLOCKER_REASON_LENGTH, actual: b.reason.length }
     );
   }
 
-  const blockedAt = typeof blocker.blockedAt === "number" && Number.isFinite(blocker.blockedAt) && blocker.blockedAt > 0
-    ? blocker.blockedAt
+  let category: BlockerCategory;
+  if (b.category !== undefined) {
+    if (
+      b.category !== "external-retryable" &&
+      b.category !== "human-required" &&
+      b.category !== "terminal"
+    ) {
+      throw new WorkflowDataBoundsError(
+        `Blocker category must be "external-retryable", "human-required", or "terminal" (got "${String(b.category)}")`,
+        { runId, field: "blocker.category" }
+      );
+    }
+    category = b.category as BlockerCategory;
+  } else {
+    category = b.requiresHuman ? "human-required" : "external-retryable";
+  }
+
+  const requiresHuman = category === "human-required" || category === "terminal" || Boolean(b.requiresHuman);
+
+  let retryDelayMs: number | undefined;
+  if (b.retryDelayMs !== undefined) {
+    if (typeof b.retryDelayMs !== "number" || !Number.isFinite(b.retryDelayMs) || b.retryDelayMs <= 0) {
+      throw new WorkflowDataBoundsError(
+        `Blocker retryDelayMs must be a positive finite number, got ${b.retryDelayMs}`,
+        { runId, field: "blocker.retryDelayMs" }
+      );
+    }
+    retryDelayMs = Math.round(b.retryDelayMs);
+  }
+
+  const blockedAt = typeof b.blockedAt === "number" && Number.isFinite(b.blockedAt) && b.blockedAt > 0
+    ? b.blockedAt
     : Date.now();
 
   return {
-    reason: blocker.reason.trim(),
-    requiresHuman: Boolean(blocker.requiresHuman),
+    reason: b.reason.trim(),
+    category,
+    requiresHuman,
+    ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     blockedAt,
   };
 }
@@ -360,6 +398,135 @@ export function validateCompletionInfo(
     summary: completion.summary.trim(),
     evidence,
     completedAt,
+  };
+}
+
+/**
+ * Validates completion claim information.
+ */
+export function validateCompletionClaim(
+  claim: unknown,
+  options: { runId?: string } = {}
+): WorkflowCompletionClaim {
+  const runId = options.runId;
+
+  if (!isPlainObject(claim)) {
+    throw new WorkflowDataBoundsError(`Completion claim must be an object`, { runId, field: "claim" });
+  }
+
+  const c = claim as Record<string, unknown>;
+
+  if (typeof c.summary !== "string" || c.summary.trim() === "") {
+    throw new WorkflowDataBoundsError(
+      `Completion claim requires non-empty string "summary"`,
+      { runId, field: "claim.summary" }
+    );
+  }
+
+  if (c.summary.length > MAX_COMPLETION_SUMMARY_LENGTH) {
+    throw new WorkflowDataBoundsError(
+      `Completion claim summary length (${c.summary.length}) exceeds maximum allowed of ${MAX_COMPLETION_SUMMARY_LENGTH}`,
+      { runId, field: "claim.summary", limit: MAX_COMPLETION_SUMMARY_LENGTH, actual: c.summary.length }
+    );
+  }
+
+  const evidence = validateEvidence(c.evidence, { runId });
+  const submittedAt =
+    typeof c.submittedAt === "number" && Number.isFinite(c.submittedAt) && c.submittedAt > 0
+      ? c.submittedAt
+      : Date.now();
+
+  const claimId = typeof c.claimId === "string" && c.claimId.trim() !== "" ? c.claimId.trim() : undefined;
+
+  return {
+    summary: c.summary.trim(),
+    evidence,
+    submittedAt,
+    ...(claimId ? { claimId } : {}),
+  };
+}
+
+/**
+ * Validates verification findings and decision.
+ */
+export function validateVerificationFindings(
+  findings: unknown,
+  options: { runId?: string } = {}
+): WorkflowVerificationFindings {
+  const runId = options.runId;
+
+  if (!isPlainObject(findings)) {
+    throw new WorkflowDataBoundsError(`Verification findings must be an object`, { runId, field: "findings" });
+  }
+
+  const f = findings as Record<string, unknown>;
+
+  if (f.decision !== "accept" && f.decision !== "accepted" && f.decision !== "reject" && f.decision !== "rejected") {
+    throw new WorkflowDataBoundsError(
+      `Verification decision must be "accept" or "reject" (got "${String(f.decision)}")`,
+      { runId, field: "findings.decision" }
+    );
+  }
+
+  const decision: "accepted" | "rejected" =
+    f.decision === "accept" || f.decision === "accepted" ? "accepted" : "rejected";
+
+  let feedback: string | undefined;
+  if (typeof f.feedback === "string" && f.feedback.trim() !== "") {
+    feedback = f.feedback.trim();
+  } else if (typeof f.findings === "string" && f.findings.trim() !== "") {
+    feedback = f.findings.trim();
+  }
+
+  if (feedback && feedback.length > MAX_VERIFICATION_FINDINGS_LENGTH) {
+    throw new WorkflowDataBoundsError(
+      `Verification feedback length (${feedback.length}) exceeds maximum allowed of ${MAX_VERIFICATION_FINDINGS_LENGTH}`,
+      { runId, field: "findings.feedback", limit: MAX_VERIFICATION_FINDINGS_LENGTH, actual: feedback.length }
+    );
+  }
+
+  const verifiedAt =
+    typeof f.verifiedAt === "number" && Number.isFinite(f.verifiedAt) && f.verifiedAt > 0
+      ? f.verifiedAt
+      : Date.now();
+
+  const attempt =
+    typeof f.attempt === "number" && Number.isInteger(f.attempt) && f.attempt >= 1
+      ? f.attempt
+      : 1;
+
+  let returnStep: string | undefined;
+  if (typeof f.returnStep === "string" && f.returnStep.trim() !== "") {
+    returnStep = validateStepName(f.returnStep, { runId });
+  }
+
+  let checks: Array<{ name: string; passed: boolean; message?: string }> | undefined;
+  if (f.checks !== undefined) {
+    if (!Array.isArray(f.checks)) {
+      throw new WorkflowDataBoundsError(`Verification checks must be an array`, { runId, field: "findings.checks" });
+    }
+    checks = f.checks.map((chk, i) => {
+      if (!isPlainObject(chk) || typeof chk.name !== "string" || typeof chk.passed !== "boolean") {
+        throw new WorkflowDataBoundsError(
+          `Verification check item at index ${i} must have string "name" and boolean "passed"`,
+          { runId, field: `findings.checks[${i}]` }
+        );
+      }
+      return {
+        name: chk.name.trim(),
+        passed: chk.passed,
+        ...(typeof chk.message === "string" ? { message: chk.message.trim() } : {}),
+      };
+    });
+  }
+
+  return {
+    decision,
+    ...(feedback ? { feedback } : {}),
+    verifiedAt,
+    attempt,
+    ...(returnStep ? { returnStep } : {}),
+    ...(checks ? { checks } : {}),
   };
 }
 
