@@ -37,6 +37,7 @@ import {
   type EffectCommitOptions,
   type EffectReconcileOptions,
   type JsonValue,
+  type MarkEffectAmbiguousOptions,
   type PauseRunOptions,
   type ResumeRunOptions,
   type TransitionStepOptions,
@@ -1121,10 +1122,69 @@ export function applyEffectCommit(current: WorkflowRun, options: EffectCommitOpt
 }
 
 /**
+ * Conservatively mark a started mutating effect ambiguous after a dispatch
+ * whose remote outcome is uncertain. This closes the same-session duplicate
+ * window: the seam refuses a second mutating call under the key and requires
+ * read-before-write reconciliation. Idempotent and replay-faithful.
+ */
+export function applyMarkEffectAmbiguous(
+  current: WorkflowRun,
+  options: MarkEffectAmbiguousOptions
+): WorkflowRun {
+  if (isTerminalLifecycle(current.lifecycle)) {
+    return current;
+  }
+
+  const key = validateEffectKey(options.key, { runId: current.id });
+  const existing = current.effects?.[key];
+  if (!existing || existing.status !== "started" || existing.ambiguous === true) {
+    return current;
+  }
+
+  const now = options.markedAt ?? Date.now();
+  const reason =
+    options.reason !== undefined
+      ? validateEffectNote(options.reason, { runId: current.id })
+      : `Effect "${key}" was left started after a failed mutation attempt; external reality must be inspected before retry.`;
+
+  const newEffects = {
+    ...(current.effects ?? {}),
+    [key]: Object.freeze({ ...existing, ambiguous: true }),
+  };
+
+  const eventId = options.eventId ?? `recov-${current.id}-${key}`;
+  const alreadyRecorded = getRecoveryProjection(current).entries.some((e) => e.eventId === eventId);
+  const recEvent: WorkflowRecoveryEvent = Object.freeze({
+    eventId,
+    type: "effect_ambiguous",
+    timestamp: now,
+    message: `Effect "${key}" (${existing.kind}) marked ambiguous after a failed mutation attempt: ${reason}`,
+    details: Object.freeze({ key, kind: existing.kind, reason, synthesized: false }),
+  });
+  const recoveryUpdate = alreadyRecorded ? undefined : appendRecoveryEventProjection(current, recEvent);
+
+  const newHistory = appendHistoryEntry(
+    current,
+    "recovery",
+    `Recovery event [effect_ambiguous]: ${recEvent.message}`,
+    { key, kind: existing.kind, reason },
+    now,
+    eventId
+  );
+
+  return Object.freeze({
+    ...current,
+    effects: Object.freeze(newEffects),
+    ...(recoveryUpdate ?? {}),
+    ...newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
  * Reconcile an interrupted or ambiguous effect checkpoint after inspecting external reality.
  */
-export function applyEffectReconcile(current: WorkflowRun, options: EffectReconcileOptions): WorkflowRun {
-  if (isTerminalLifecycle(current.lifecycle)) {
+export function applyEffectReconcile(current: WorkflowRun, options: EffectReconcileOptions): WorkflowRun {  if (isTerminalLifecycle(current.lifecycle)) {
     throw new WorkflowInvalidTransitionError(
       current.id,
       `Cannot reconcile effect on run "${current.id}" because it is in terminal state "${current.lifecycle}"`,

@@ -47,6 +47,7 @@ export const VALID_ACTIONS = new Set<WorkflowRunMutationAction>([
   "effect_begin",
   "effect_commit",
   "effect_reconcile",
+  "effect_ambiguous",
   "wakeup_scheduled",
   "recovery",
   "lease",
@@ -402,6 +403,22 @@ function validatePayloadForAction(
         if (p.resultSummary !== undefined) {
           validateEffectSummary(p.resultSummary, { runId, field: "resultSummary" });
         }
+        if (p.reason !== undefined && typeof p.reason === "string") {
+          validateEffectNote(p.reason, { runId });
+        }
+        break;
+      }
+      case "effect_ambiguous": {
+        if (typeof p.key !== "string" || p.key.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Effect ambiguous mutation requires non-empty string "key"`,
+            runId,
+            entryId,
+          };
+        }
+        validateEffectKey(p.key, { runId });
         if (p.reason !== undefined && typeof p.reason === "string") {
           validateEffectNote(p.reason, { runId });
         }

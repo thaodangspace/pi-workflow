@@ -335,18 +335,21 @@ export class FakeGitHubProvider {
     const issue = issueExists(this.reality, numField(record, "issue"));
     const claimToken = strField(record, "claimToken");
     this.reality.counters.claimAttempts += 1;
-    maybeFault(this.reality, "claimIssue", "after");
 
+    let result: JsonValue;
     if (issue.owner === undefined) {
       issue.owner = "main";
       issue.claimToken = claimToken;
       this.reality.counters.claimsGranted += 1;
-      return { issue: issue.number, claimed: true, claimToken };
+      result = { issue: issue.number, claimed: true, claimToken };
+    } else if (issue.claimToken === claimToken) {
+      result = { issue: issue.number, claimed: true, alreadyOwned: true, claimToken };
+    } else {
+      result = { issue: issue.number, claimed: false, owner: issue.owner };
     }
-    if (issue.claimToken === claimToken) {
-      return { issue: issue.number, claimed: true, alreadyOwned: true, claimToken };
-    }
-    return { issue: issue.number, claimed: false, owner: issue.owner };
+    // "after" faults fire only once the external state change has been applied.
+    maybeFault(this.reality, "claimIssue", "after");
+    return result;
   }
 
   private pushBranch(input: JsonValue): JsonValue {
@@ -355,7 +358,6 @@ export class FakeGitHubProvider {
     const headSha = strField(record, "headSha");
     const created = !this.reality.branches.has(head);
     this.reality.counters.pushAttempts += 1;
-    maybeFault(this.reality, "pushBranch", "after");
     this.reality.branches.set(head, headSha);
     // A push to an existing PR branch advances the PR head and re-runs CI.
     for (const pr of this.reality.pullRequests) {
@@ -364,6 +366,7 @@ export class FakeGitHubProvider {
         pr.ciStatus = "pending";
       }
     }
+    maybeFault(this.reality, "pushBranch", "after");
     return { branch: head, headSha, created };
   }
 
@@ -393,12 +396,12 @@ export class FakeGitHubProvider {
     const headSha = strField(record, "headSha");
     const title = strField(record, "title");
     this.reality.counters.prCreateAttempts += 1;
-    maybeFault(this.reality, "createPullRequest", "after");
 
     const existing = this.reality.pullRequests.find(
       (p) => p.issue === issue && p.head === head && p.base === base
     );
     if (existing) {
+      maybeFault(this.reality, "createPullRequest", "after");
       return { number: existing.number, head, base, alreadyExists: true, headSha: existing.headSha, ciStatus: existing.ciStatus };
     }
     const number = this.reality.nextPrNumber++;
@@ -414,6 +417,7 @@ export class FakeGitHubProvider {
     };
     this.reality.pullRequests.push(pr);
     this.reality.counters.prCreated += 1;
+    maybeFault(this.reality, "createPullRequest", "after");
     return { number, head, base, title, headSha, ciStatus: pr.ciStatus };
   }
 
@@ -454,9 +458,9 @@ export class FakeGitHubProvider {
     const pr = findPr(this.reality, numField(record, "pr"));
     const expectedHeadSha = strField(record, "expectedHeadSha");
     this.reality.counters.mergeAttempts += 1;
-    maybeFault(this.reality, "mergePullRequest", "after");
 
     if (pr.state === "merged") {
+      maybeFault(this.reality, "mergePullRequest", "after");
       return { prNumber: pr.number, merged: true, alreadyMerged: true, mergeSha: pr.mergeSha ?? null };
     }
     if (pr.headSha !== expectedHeadSha) {
@@ -467,6 +471,7 @@ export class FakeGitHubProvider {
     pr.state = "merged";
     pr.mergeSha = `merge-${pr.number}-${expectedHeadSha}`;
     this.reality.counters.mergesApplied += 1;
+    maybeFault(this.reality, "mergePullRequest", "after");
     return { prNumber: pr.number, merged: true, mergeSha: pr.mergeSha, headSha: pr.headSha };
   }
 
@@ -474,9 +479,9 @@ export class FakeGitHubProvider {
     const record = asRecord(input, "finalizeIssue");
     const issue = issueExists(this.reality, numField(record, "issue"));
     this.reality.counters.finalizeAttempts += 1;
-    maybeFault(this.reality, "finalizeIssue", "after");
     issue.state = "closed";
     this.reality.counters.finalizeApplied += 1;
+    maybeFault(this.reality, "finalizeIssue", "after");
     return { issue: issue.number, state: issue.state, finalized: true };
   }
 }
@@ -583,7 +588,6 @@ export class FakeWorkerRuntimeProvider {
     const branch = strField(record, "branch");
     const baseSha = strField(record, "baseSha");
     issueExists(this.reality, issue);
-    maybeFault(this.reality, "createIsolatedWorktree", "after");
     const id = `wt-${this.reality.nextWorktreeId++}`;
     const worktree: FakeWorktree = {
       id,
@@ -595,6 +599,7 @@ export class FakeWorkerRuntimeProvider {
       testsPassed: false,
     };
     this.reality.worktrees.set(id, worktree);
+    maybeFault(this.reality, "createIsolatedWorktree", "after");
     return { worktreeId: id, path: `/fake/worktrees/${id}`, branch, baseSha, created: true };
   }
 

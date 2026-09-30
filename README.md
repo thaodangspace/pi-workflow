@@ -851,7 +851,12 @@ remote transaction. If the process dies after the remote mutation but before
 the checkpoint commits, dedupe depends on provider-side idempotency or
 compare-and-set (a unique claim marker, PR lookup by deterministic head+base,
 push SHA verification, merge-state lookup). The reference workflow and fakes
-implement these; a real adapter must too.
+implement these; a real adapter must too. Because the remote outcome of a failed
+dispatch is unknowable, **any failure after the provider's `execute` begins** (a
+throw, or a result that fails bounded validation/projection) conservatively
+marks the mutating effect ambiguous, so a same-session retry is refused until
+external reality is inspected and reconciled. Pre-dispatch validation failures
+do not mark the effect.
 
 ### Trust boundary
 

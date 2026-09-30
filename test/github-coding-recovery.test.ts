@@ -479,4 +479,102 @@ describe("github-coding recovery and replay (Issue #12)", () => {
       }
     );
   });
+
+  it("marks a mutating effect ambiguous on an after-apply failure and refuses a same-session retry", async () => {
+    const h = setupRecovery();
+    h.github.addIssue({ number: 12, title: "Fix", state: "open" });
+    const key = "claim:acme/repo:12";
+    h.registry.beginEffect(h.runId, { key, kind: "github.issue.claim" });
+
+    // The fault fires only AFTER the external claim has been applied.
+    h.reality.faults.set("claimIssue", "after");
+
+    await assert.rejects(
+      async () =>
+        callTool(h.dispatcher, h.tools, h.runId, "workflow_provider_call", {
+          capability: "github",
+          operation: "claimIssue",
+          input: { issue: 12, claimToken: "t" },
+          effectKey: key,
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "execution_failed");
+        return true;
+      }
+    );
+
+    // The remote mutation happened; the durable effect is conservatively ambiguous.
+    assert.equal(h.reality.issues.get(12)!.claimToken, "t");
+    assert.equal(h.registry.requireRun(h.runId).effects![key].ambiguous, true);
+    assert.equal(h.reality.counters.claimAttempts, 1);
+
+    // Same-session retry under the same key is refused (no duplicate mutation).
+    await assert.rejects(
+      async () =>
+        callTool(h.dispatcher, h.tools, h.runId, "workflow_provider_call", {
+          capability: "github",
+          operation: "claimIssue",
+          input: { issue: 12, claimToken: "t" },
+          effectKey: key,
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "effect_ambiguous");
+        return true;
+      }
+    );
+    assert.equal(h.reality.counters.claimAttempts, 1, "no duplicate mutation on retry");
+
+    // Read external reality, then reconcile before the key is resolved.
+    const state = await callTool(h.dispatcher, h.tools, h.runId, "workflow_provider_call", {
+      capability: "github",
+      operation: "readClaimState",
+      input: { issue: 12 },
+    });
+    assert.equal(state.result.claimed, true);
+    await callTool(h.dispatcher, h.tools, h.runId, "workflow_effect_reconcile", {
+      key,
+      resolution: "committed",
+      reason: "observed the applied claim after the failed dispatch",
+    });
+    assert.equal(h.registry.requireRun(h.runId).effects![key].status, "committed");
+    assert.equal(h.reality.counters.claimAttempts, 1);
+  });
+
+  it("accepts and replays a persisted effect_ambiguous entry without duplicating events", async () => {
+    const h = setupRecovery();
+    h.github.addIssue({ number: 12, title: "Fix", state: "open" });
+    const key = "claim:acme/repo:12";
+    h.registry.beginEffect(h.runId, { key, kind: "github.issue.claim" });
+    // Simulate the seam conservatively marking the effect ambiguous after a
+    // dispatch whose outcome is uncertain.
+    h.registry.markEffectAmbiguous(h.runId, {
+      key,
+      reason: "provider threw after dispatch",
+    });
+    assert.equal(h.registry.requireRun(h.runId).effects![key].ambiguous, true);
+
+    // Reload: the durable effect_ambiguous entry must round-trip through replay.
+    const first = reload(h);
+    assert.equal(
+      first.registry.getDiagnostics().filter((d) => d.type === "error").length,
+      0,
+      "effect_ambiguous entry must be accepted on reconstruction"
+    );
+    const replayed = first.registry.requireRun(h.runId);
+    assert.equal(replayed.effects![key].status, "started");
+    assert.equal(replayed.effects![key].ambiguous, true);
+
+    const ambiguousEvents = (replayed.recoveryEvents ?? []).filter((e) => e.type === "effect_ambiguous");
+    assert.equal(ambiguousEvents.length, 1, "no duplicate synthesized + persisted ambiguity event");
+    assert.equal(ambiguousEvents[0].eventId, `recov-${h.runId}-${key}`);
+
+    // Replaying again is deterministic and byte-for-byte stable.
+    const second = reload(h);
+    const again = second.registry.requireRun(h.runId);
+    assert.deepEqual(again.effects, replayed.effects);
+    assert.deepEqual(again.recoveryEvents, replayed.recoveryEvents);
+    assert.deepEqual(again.history, replayed.history);
+  });
 });

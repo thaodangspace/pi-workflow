@@ -325,10 +325,26 @@ export async function dispatchProviderAction(
   };
 
   const startedAt = Date.now();
+
+  // Any failure after execute begins may leave a remote mutation applied, so a
+  // mutating effect is conservatively marked ambiguous before the error is
+  // surfaced. Pre-dispatch validation failures never reach here.
+  const markAmbiguousAfterDispatchFailure = (reason: string): void => {
+    if (!mutating || !effectKey) return;
+    try {
+      runRegistry.markEffectAmbiguous(run.id, { key: effectKey, reason });
+    } catch {
+      // Best-effort: the original dispatch failure is still surfaced.
+    }
+  };
+
   let rawResult: unknown;
   try {
     rawResult = await op.execute(input, context);
   } catch (err: unknown) {
+    markAmbiguousAfterDispatchFailure(
+      "Provider operation threw after dispatch; the remote outcome is uncertain."
+    );
     const rawMessage = err instanceof Error ? err.message : String(err);
     // Provider errors can carry credential-bearing internal prose; bound and
     // redact before it can reach the model.
@@ -339,11 +355,19 @@ export async function dispatchProviderAction(
     );
   }
 
-  const boundedRawResult = boundCallPayload(
-    rawResult === undefined ? null : rawResult,
-    run.id,
-    "provider.result"
-  );
+  let boundedRawResult: JsonValue;
+  try {
+    boundedRawResult = boundCallPayload(
+      rawResult === undefined ? null : rawResult,
+      run.id,
+      "provider.result"
+    );
+  } catch (err: unknown) {
+    markAmbiguousAfterDispatchFailure(
+      "Provider result could not be validated after dispatch; the remote outcome is uncertain."
+    );
+    throw err;
+  }
 
   // The raw result never leaves the seam: apply the provider's explicit,
   // model-safe projection, bound it, then recursively redact/bound it.
@@ -354,6 +378,9 @@ export async function dispatchProviderAction(
       fieldPath: "provider.projection",
     });
   } catch (err: unknown) {
+    markAmbiguousAfterDispatchFailure(
+      "Provider result projection failed after dispatch; the remote outcome is uncertain."
+    );
     if (err instanceof WorkflowDataBoundsError) throw err;
     const rawMessage = err instanceof Error ? err.message : String(err);
     const safeMessage = safeText(rawMessage);
@@ -371,7 +398,14 @@ export async function dispatchProviderAction(
   // replay cannot double-apply. If the process dies before this line, the
   // effect stays started and becomes ambiguous on reconstruction.
   if (mutating && effectKey) {
-    runRegistry.commitEffect(run.id, { key: effectKey, resultSummary });
+    try {
+      runRegistry.commitEffect(run.id, { key: effectKey, resultSummary });
+    } catch (err: unknown) {
+      markAmbiguousAfterDispatchFailure(
+        "Effect commit failed after a successful mutation; the remote outcome is uncertain."
+      );
+      throw err;
+    }
   }
 
   return {

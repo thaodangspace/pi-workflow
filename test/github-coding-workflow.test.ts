@@ -1016,6 +1016,46 @@ describe("workflow_provider_call seam (Issue #12)", () => {
     assert.equal(registry.requireRun(run.id).effects!.e3.status, "committed");
   });
 
+  it("marks a mutating effect ambiguous when result projection fails after execute", async () => {
+    const secretToken = `ghp_${"c".repeat(30)}`;
+    const { invoke, registry, run } = setupCustomProvider([
+      makeOperation({
+        name: "mutate",
+        mutating: true,
+        effectKind: "custom.mutate",
+        execute: () => ({ ok: true }),
+        projectResult: () => {
+          throw new Error(`projection failed for token=${secretToken}`);
+        },
+      }),
+    ]);
+    registry.beginEffect(run.id, { key: "e1", kind: "custom.mutate" });
+
+    // Raw validation/projection failure after execute must mark the effect
+    // ambiguous (the mutation may already be applied) and redact the error.
+    await assert.rejects(
+      async () => invoke({ capability: "custom", operation: "mutate", input: {}, effectKey: "e1" }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "execution_failed");
+        assert.ok(!err.message.includes("ghp_"));
+        assert.match(err.message, /\[redacted/);
+        return true;
+      }
+    );
+    assert.equal(registry.requireRun(run.id).effects!.e1.ambiguous, true);
+
+    // A same-session retry is refused until the effect is reconciled.
+    await assert.rejects(
+      async () => invoke({ capability: "custom", operation: "mutate", input: {}, effectKey: "e1" }),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowProviderCallError);
+        assert.equal((err as WorkflowProviderCallError).code, "effect_ambiguous");
+        return true;
+      }
+    );
+  });
+
   it("allows reads but refuses mutations while an effect is ambiguous after reload", async () => {
     const mutating = makeOperation({
       name: "mutate",

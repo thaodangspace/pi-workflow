@@ -534,6 +534,7 @@ export type WorkflowRunMutationAction =
   | "effect_begin"
   | "effect_commit"
   | "effect_reconcile"
+  | "effect_ambiguous"
   | "wakeup_scheduled"
   | "recovery"
   | "lease";
@@ -773,6 +774,25 @@ export interface EffectReconcileOptions {
   reason?: string;
   /** Optional reconciliation timestamp */
   reconciledAt?: number;
+  /**
+   * Optional deterministic id for the generated recovery event. Persisted so
+   * replay reproduces the same event id.
+   */
+  eventId?: string;
+}
+
+/**
+ * Options for conservatively marking a started mutating effect ambiguous after
+ * a dispatch whose outcome is uncertain (e.g. the provider threw after the
+ * remote side may have applied the mutation).
+ */
+export interface MarkEffectAmbiguousOptions {
+  /** Unique key identifying the effect within the run */
+  key: string;
+  /** Explanation of why the outcome is uncertain */
+  reason?: string;
+  /** Optional timestamp (Unix epoch ms) */
+  markedAt?: number;
   /**
    * Optional deterministic id for the generated recovery event. Persisted so
    * replay reproduces the same event id.
