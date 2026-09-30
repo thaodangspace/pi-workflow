@@ -14,6 +14,7 @@ import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { parseDuration } from "./duration.ts";
 import { extractWorkflowRunId } from "./prompt.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
+import { isTerminalLifecycle } from "./run.ts";
 import {
   type DispatchIterationOptions,
   type IterationBinding,
@@ -669,25 +670,70 @@ export class LoopSchedulerAdapter {
   /**
    * Cancels the scheduled task for a workflow run.
    * Implements WorkflowSchedulerPort.cancelWakeup.
-   * Returns true if task was found and stopped; false if unknown or service unavailable.
+   * Fails closed if the scheduler is unavailable or if stopping a live task fails.
+   * If the task is already confirmed absent from authoritative scheduler state (listTasks),
+   * clears stale linkage so pause/stop are not blocked forever.
+   * Maintains internal mappings on failure, and clears internal maps and durable linkage on success.
    */
   async cancelWakeup(runId: string): Promise<boolean> {
-    if (!this.service || !this.service.isAvailable()) {
-      return false;
-    }
+    const service = this.assertServiceAvailable(runId);
     const taskId = this.getLinkedTaskId(runId);
     if (!taskId) {
-      return false;
+      return true;
     }
 
+    let stopped: boolean;
+    try {
+      stopped = service.stopTask(taskId);
+    } catch (error) {
+      if (error instanceof LoopServiceUnavailableError) {
+        throw new WorkflowSchedulerUnavailableError(error.message, runId);
+      }
+      throw new WorkflowSchedulerError(
+        `Failed to stop scheduler task "${taskId}" for run "${runId}": ${error instanceof Error ? error.message : String(error)}`,
+        runId
+      );
+    }
+
+    if (!stopped) {
+      // Check authoritative scheduler tasks to verify whether task is already absent
+      let liveTasks: LoopTaskSummary[] = [];
+      try {
+        liveTasks = service.listTasks();
+      } catch (listErr) {
+        if (listErr instanceof LoopServiceUnavailableError) {
+          throw new WorkflowSchedulerUnavailableError(listErr.message, runId);
+        }
+        throw new WorkflowSchedulerError(
+          `Failed to verify scheduler task "${taskId}" status for run "${runId}": ${listErr instanceof Error ? listErr.message : String(listErr)}`,
+          runId
+        );
+      }
+
+      const taskStillPresent = liveTasks.some((t) => t.id === taskId);
+      if (taskStillPresent) {
+        // Task is still live in scheduler service, but stopTask failed to stop it. Fail closed!
+        throw new WorkflowSchedulerError(
+          `Failed to stop scheduler task "${taskId}" for run "${runId}": task is still active in scheduler service but could not be stopped.`,
+          runId
+        );
+      }
+      // If task is confirmed absent from scheduler, the linkage was stale.
+      // Clear the stale linkage below so pause and stop are not blocked forever.
+    }
+
+    // Success or stale linkage confirmed absent: delete in-memory maps and clear durable linkage in registry
     this.runToTaskMap.delete(runId);
     this.taskToRunMap.delete(taskId);
 
-    try {
-      return this.service.stopTask(taskId);
-    } catch {
-      return false;
+    if (this.registry.hasRun(runId)) {
+      const current = this.registry.getRun(runId);
+      if (current && !isTerminalLifecycle(current.lifecycle)) {
+        this.registry.updateRun(runId, { loopTaskId: null });
+      }
     }
+
+    return true;
   }
 
   /**

@@ -351,8 +351,8 @@ export interface UpdateRunOptions {
   turns?: number;
   /** Relative turns increment */
   incrementTurns?: number;
-  /** Update scheduler task linkage */
-  loopTaskId?: string;
+  /** Update scheduler task linkage (pass null or empty string to clear) */
+  loopTaskId?: string | null;
   /** Update timestamp (Unix epoch ms) */
   updatedAt?: number;
 }
@@ -508,6 +508,24 @@ export class WorkflowPersistenceError extends WorkflowRunError {
     super(message, options?.runId);
     this.name = "WorkflowPersistenceError";
     this.entryId = options?.entryId;
+  }
+}
+
+export class WorkflowCapabilityError extends WorkflowRunError {
+  readonly workflow: string;
+  readonly missingCapabilities: readonly string[];
+
+  constructor(workflow: string, missingCapabilities: string[], message?: string, runId?: string) {
+    super(
+      message ??
+        `Workflow "${workflow}" requires capabilities: [${missingCapabilities.join(
+          ", "
+        )}] which are not currently available.`,
+      runId
+    );
+    this.name = "WorkflowCapabilityError";
+    this.workflow = workflow;
+    this.missingCapabilities = Object.freeze([...missingCapabilities]);
   }
 }
 

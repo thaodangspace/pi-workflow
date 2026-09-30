@@ -12,6 +12,11 @@ import {
   LoopSchedulerAdapter,
   type LoopSchedulerAdapterOptions,
 } from "./scheduler-adapter.ts";
+import {
+  WorkflowCommandController,
+  type WorkflowCommandControllerOptions,
+  registerWorkflowCommand,
+} from "./commands.ts";
 import { createWorkflowTools } from "./tools.ts";
 import type { WorkflowSessionTarget } from "./types.ts";
 
@@ -57,6 +62,9 @@ export * from "./tools.ts";
 // Re-export scheduler adapter
 export * from "./scheduler-adapter.ts";
 
+// Re-export commands & lifecycle controller
+export * from "./commands.ts";
+
 /**
  * Factory to create a WorkflowRunRegistry.
  */
@@ -85,6 +93,15 @@ export function createLoopSchedulerAdapter(
 }
 
 /**
+ * Factory to create a WorkflowCommandController.
+ */
+export function createWorkflowCommandController(
+  options: WorkflowCommandControllerOptions
+): WorkflowCommandController {
+  return new WorkflowCommandController(options);
+}
+
+/**
  * Pi extension entrypoint.
  * Automatically synchronizes workflow runs with the active session branch across reloads and tree navigation,
  * discovers and bridges to pi-loop for workflow scheduling, registers model-facing workflow tools,
@@ -105,6 +122,15 @@ export default function workflowExtension(pi: ExtensionAPI): void {
       pi.registerTool(tool);
     }
   }
+
+  const controller = new WorkflowCommandController({
+    registry,
+    adapter,
+    dispatcher,
+    pi,
+  });
+
+  registerWorkflowCommand(pi, controller);
 
   pi.on("session_start", async (_event, ctx) => {
     dispatcher.clearActiveIteration("session_start");

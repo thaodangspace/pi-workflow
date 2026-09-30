@@ -389,6 +389,50 @@ registry.completeRun(run.id, {
 });
 ```
 
+---
+
+## Workflow Lifecycle Commands (`/workflow`)
+
+`pi-workflow` registers the `/workflow` slash command family in Pi for discovering workflow definitions and controlling workflow runs.
+The command surface exposes workflow concepts without exposing raw scheduler task IDs.
+
+### Command Reference
+
+| Command | Description |
+|---|---|
+| `/workflow list` | Show discovered workflow definitions with name, description, mode, required capabilities, and active run count. |
+| `/workflow start <name>` | Validate definition & capabilities, enforce concurrency, create durable run, attach scheduler state, and trigger the first iteration. |
+| `/workflow status` | Show active/nonterminal runs in deterministic order with concise fields (run ID, workflow, lifecycle, step, age, next wakeup, blocker/completion). |
+| `/workflow status <run-id>` | Show detailed execution state of a specific run (including turn counts, attempt counts, timestamps, data payload, blocker/completion details). |
+| `/workflow pause <run-id>` | Persist paused state and cancel/suspend future wakeups without deleting run history. Paused runs do not wake automatically. |
+| `/workflow resume <run-id>` | Revalidate required capabilities, transition to active, and restore exactly one scheduler task linkage. |
+| `/workflow stop <run-id>` | Cancel the run, stop its scheduler task, and retain durable history. Cancellation is isolated from other runs and the user's ordinary `/loop`. |
+| `/workflow reload` | Refresh discovered definitions from disk for future runs. Running runs remain unaffected with their immutable definition snapshots. |
+| `/workflow help` | Display command usage and available subcommands. |
+
+### UX & Operational Guarantees
+
+- **Disambiguation**: Definition names are strictly distinguished from run IDs (e.g. passing a run ID to `start` or a definition name to `stop`/`pause`/`resume` gives actionable guidance).
+- **Prefix Matching**: Unambiguous run ID prefixes (e.g. `/workflow status wfrun-example-m7`) resolve directly to the matching run. Ambiguous prefixes report all matches.
+- **Strict Argument Validation**: Subcommands reject unexpected extra arguments with usage instructions to prevent unintended executions.
+- **Next Wakeup Transparency**: If the scheduler cannot provide the next wakeup, `unknown` is reported rather than guessing. Paused or blocked runs explicitly show `none (paused)` or `none (blocked)`.
+- **Zero Transcript Spam**: Passive reconciliation (on session start or history navigation) is completely silent. Only explicit user command invocations output messages.
+- **Data Privacy in Status**: `/workflow status <run-id>` reports data key names but omits raw values to avoid leaking secrets, tokens, or credentials into transcripts or logs.
+- **Non-TUI Mode Fallbacks**: In headless, RPC, or print modes (`!ctx.hasUI` or `ctx.mode !== "tui"`), commands output sensible formatted plain text.
+
+### Definition Compatibility Policy on Resume
+
+- **Missing On-Disk Definition**: When a workflow definition file is removed or moved from disk, existing runs remain execution-safe because their frozen `WorkflowSnapshotV1` preserves the definition body, schema version, and policies. Resume revalidates the snapshot's requirements against available runtime capabilities.
+- **Present On-Disk Definition**: If an on-disk definition exists for the workflow, `resume` strictly checks:
+  1. **Mode Compatibility**: The on-disk definition's mode must match `run.snapshot.mode`. A run started as `self-paced` cannot resume if the definition was changed to `cron` or `fixed`.
+  2. **Schema Compatibility**: Schema version must match.
+  3. **New Requirements**: Any additional capabilities in the on-disk definition's `requires` list must also be satisfied.
+- **Rollback Guarantee**: If scheduling the next iteration in the scheduler fails during `resume`, the run is rolled back to its previous lifecycle (`paused` or `blocked`) rather than remaining in an un-scheduled active state.
+
+### Capability Detection Limitations
+
+Inspecting Pi tool names or namespaces (via `pi.getAllTools()`) is only a discovery heuristic. It confirms that a tool or namespace is registered in the Pi process, but does **not** prove that an external system dependency (such as an installed `tmux` binary or docker daemon) is functional, nor that remote credentials or service tokens (such as GitHub OAuth or API tokens) are authenticated. Deployments requiring strict verification should supply an explicit capability provider.
+
 
 ---
 
