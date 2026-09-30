@@ -534,6 +534,7 @@ export type WorkflowRunMutationAction =
   | "effect_begin"
   | "effect_commit"
   | "effect_reconcile"
+  | "effect_ambiguous"
   | "wakeup_scheduled"
   | "recovery"
   | "lease";
@@ -780,6 +781,25 @@ export interface EffectReconcileOptions {
   eventId?: string;
 }
 
+/**
+ * Options for conservatively marking a started mutating effect ambiguous after
+ * a dispatch whose outcome is uncertain (e.g. the provider threw after the
+ * remote side may have applied the mutation).
+ */
+export interface MarkEffectAmbiguousOptions {
+  /** Unique key identifying the effect within the run */
+  key: string;
+  /** Explanation of why the outcome is uncertain */
+  reason?: string;
+  /** Optional timestamp (Unix epoch ms) */
+  markedAt?: number;
+  /**
+   * Optional deterministic id for the generated recovery event. Persisted so
+   * replay reproduces the same event id.
+   */
+  eventId?: string;
+}
+
 export interface WorkflowRecoveryEventOptions {
   /** Type of recovery event */
   type: WorkflowRecoveryEventType;
@@ -1000,6 +1020,53 @@ export class WorkflowAmbiguousEffectError extends WorkflowEffectError {
     super(message, { runId: options?.runId, key: options?.key });
     this.name = "WorkflowAmbiguousEffectError";
     this.ambiguousKey = options?.ambiguousKey;
+  }
+}
+
+/** Machine-readable reason a model-callable provider action was refused/failed. */
+export type WorkflowProviderCallCode =
+  | "no_registry"
+  | "capability_invalid"
+  | "capability_not_declared"
+  | "capability_missing"
+  | "capability_unavailable"
+  | "capability_incompatible"
+  | "operations_unavailable"
+  | "operation_not_allowlisted"
+  | "input_invalid"
+  | "effect_required"
+  | "effect_unexpected"
+  | "effect_not_started"
+  | "effect_already_committed"
+  | "effect_kind_mismatch"
+  | "effect_ambiguous"
+  | "provider_degraded"
+  | "execution_failed";
+
+/**
+ * Raised when a model-callable provider action cannot be dispatched safely:
+ * absent/unhealthy/incompatible provider, operation not on the allowlist, or a
+ * mutating operation without a valid durable effect checkpoint.
+ */
+export class WorkflowProviderCallError extends WorkflowRunError {
+  readonly code: WorkflowProviderCallCode;
+  readonly capability?: string;
+  readonly operation?: string;
+
+  constructor(
+    message: string,
+    options: {
+      runId?: string;
+      code: WorkflowProviderCallCode;
+      capability?: string;
+      operation?: string;
+    }
+  ) {
+    super(message, options.runId);
+    this.name = "WorkflowProviderCallError";
+    this.code = options.code;
+    this.capability = options.capability;
+    this.operation = options.operation;
   }
 }
 

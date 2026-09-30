@@ -251,6 +251,7 @@ When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral i
 | `workflow_effect_begin` | Establishes an idempotent checkpoint before executing an external side effect (e.g. creating PR, issue, or deployment). | `{ key: string, kind: string, inputSummary?: object }` |
 | `workflow_effect_commit` | Confirms and commits an external side effect after observing its success, preventing accidental re-execution. | `{ key: string, resultSummary?: object }` |
 | `workflow_effect_reconcile` | Reconciles an interrupted or ambiguous effect checkpoint after inspecting external reality. | `{ key: string, resolution: "committed" \| "aborted" \| "retryable", reason: string, resultSummary?: object }` |
+| `workflow_provider_call` | Invokes an explicitly allowlisted operation on a **declared** capability provider (e.g. `github`, `worker-runtime`). Mutating operations require a started effect checkpoint and are committed on success; only the provider's model-safe projection is returned, never raw provider output or credentials. | `{ capability: string, operation: string, input?: object, effectKey?: string }` |
 
 ### Safety & Ownership Rules
 
@@ -764,6 +765,133 @@ installed, authenticated, or compatible.
 
 See [Capability Providers](docs/capability-providers.md) for the model, the
 minimal third-party provider example, and session-scope/lifecycle guarantees.
+
+---
+
+## Reference Workflow: `github-coding` (Issue #12)
+
+[`.pi/workflows/github-coding.md`](.pi/workflows/github-coding.md) is the
+end-to-end reference for the generic engine. It is a single self-paced run that
+claims ready GitHub issues **one at a time** and drives each through claim →
+isolated worker → independent verification → PR/CI → review/fix → merge →
+finalize, returning to `IDLE` for the next issue until the queue/batch ends.
+
+**`maxRuns` limits concurrent runs, not queue items.** `concurrency.maxRuns: 1`
+bounds how many runs of this workflow execute simultaneously. A single run may
+process many issues sequentially; only terminal runs release the slot.
+
+### Authoring model: three distinct layers
+
+- **Frontmatter** — the engine-enforced policy (`name`, `mode`, `concurrency`,
+  `budget`, `wakeups`, `requires`, `completion`). `github-coding` requires
+  `loop`, `github` v1 (`issues`, `pull-requests`, `ci`, `reviews`, `merge`,
+  `project-state`) and `worker-runtime` v1 (`isolated-worktree`, `spawn`,
+  `inspect`, `verify`), with `completion.verify: true`.
+- **Policy body (Markdown)** — guidance only. It names the workflow **data**
+  steps (`INITIAL → IDLE → CLAIMING → IMPLEMENTING →
+  VERIFYING_IMPLEMENTATION → OPENING_PR → WAITING_CI → REVIEWING →
+  FIXING_REVIEW → MERGING → FINALIZING → COMPLETED`, plus `BLOCKED`). The engine
+  never parses states from prose; `COMPLETED` here is workflow data, not the
+  engine lifecycle. The engine starts every run at `INITIAL`, so the policy
+  directs the first transition to `IDLE`.
+- **Durable run data** — current step, `turns`/`attempts`, and bounded
+  identifiers (`issue`, `worker`, `implementation`, `pr`, `review`,
+  `nextAction`, `implBudget`, `reviewBudget`). Never credentials, tokens, raw
+  payloads, or logs. Implementation/review sub-budgets live in run data because
+  there is deliberately **no** `budget.implementation` frontmatter field.
+
+### Required executable providers and the callable seam
+
+Declaring a capability is **not** callable by itself: `requires` only resolves
+provider metadata/health, and `registry.getProviderApi` is trusted-extension
+only. The model invokes provider domain logic through one generic tool:
+
+```text
+workflow_provider_call({ capability, operation, input?, effectKey? })
+```
+
+- A provider registers an explicit **operation allowlist** at registration time
+  (`operations`). Every operation supplies its own `validateInput` and a
+  model-safe `projectResult`; the seam returns **only** the bounded, redacted
+  projection and never the raw provider result, the trusted `api` handle, or
+  credentials. There is no arbitrary method/path dispatch.
+- Calls are bound to the active run + iteration turn. The seam refuses an
+  undeclared capability, a missing/unavailable/incompatible provider, an
+  off-allowlist operation, and a **degraded** provider for mutations.
+- This repository ships **only deterministic fakes**
+  (`test/fake-providers.ts`) for `github` and `worker-runtime`. **No real
+  GitHub/tmux adapter is included**, and default tests never run live
+  `gh`/`tmux`/push/merge. When an executable provider is absent, `/workflow
+  start` preflight and provider calls fail closed with a clear error.
+
+### Effect recipe for non-idempotent actions
+
+Stable keys are derived from the immutable target:
+
+```text
+claim:<repo>:<issue>        push:<issue>:<headSha>
+pr:<issue>:<headBranch>     merge:<pr>:<expectedHeadSha>
+finalize:<issue>:<pr>
+```
+
+1. `workflow_effect_begin({ key, kind })` records intent before the mutation. If
+   it reports `already_committed`, do not repeat the action.
+2. A mutating `workflow_provider_call` requires that the effect is `started`,
+   non-ambiguous, and of the matching `kind`. On success the seam commits it
+   with the projected result summary; a committed key is never reused for a new
+   revision (build a new key from the new head SHA instead).
+3. After a reload, an interrupted effect is **ambiguous**: inspect external
+   reality with read operations, then `workflow_effect_reconcile` with
+   `committed` (object exists), `aborted` (it does not), or `retryable` (proven
+   that no mutation happened). Reads are allowed during reconciliation;
+   mutations fail closed.
+
+**Limitations — no exactly-once guarantee.** A checkpoint alone is not an atomic
+remote transaction. If the process dies after the remote mutation but before
+the checkpoint commits, dedupe depends on provider-side idempotency or
+compare-and-set (a unique claim marker, PR lookup by deterministic head+base,
+push SHA verification, merge-state lookup). The reference workflow and fakes
+implement these; a real adapter must too. Because the remote outcome of a failed
+dispatch is unknowable, **any failure after the provider's `execute` begins** (a
+throw, or a result that fails bounded validation/projection) conservatively
+marks the mutating effect ambiguous, so a same-session retry is refused until
+external reality is inspected and reconciled. Pre-dispatch validation failures
+do not mark the effect.
+
+### Trust boundary
+
+- The main workflow owns **all** GitHub credentials and mutations. A worker
+  gets only an isolated worktree plus edit/test/commit permissions and cannot
+  claim, push, open PRs, or merge.
+- A worker's self-report is not evidence. Before advancing, independent
+  verification checks the authoritative commit/worktree (existence, expected
+  branch, tests) — not the worker's reported summary.
+
+### Recovery matrix (proven by `test/github-coding-recovery.test.ts`)
+
+- **Ambiguous claim**: matching claim marker → reconcile `committed`; a foreign
+  owner → `workflow_block`; provably unclaimed → clear for retry.
+- **PR already exists while `OPENING_PR`**: find by issue + head + base;
+  exactly one match → reconcile and skip creation; multiple matches → block.
+- **Worker exited with a valid commit**: inspect and independently verify, then
+  reconcile `committed` and resume — no respawn.
+- **PR already merged while `MERGING`**: observe merged state, reconcile
+  `committed`, finalize — no second merge.
+
+The tests assert no duplicate PR creation or merge attempt under a stable
+effect key, and distinguish a crash before vs after the external mutation.
+
+### Opt-in real-provider smoke (never in CI by default)
+
+Real adapters are an explicit, operator-enabled choice:
+
+1. Use a disposable test repository/issue and a disposable worktree.
+2. Scope GitHub credentials to the **main orchestrator only** and never expose
+   them to the worker.
+3. Require explicit confirmation before every irreversible mutation (push, PR,
+   merge, finalize), and tear down the repo/worktree afterwards.
+4. Keep the fakes as the default; ordinary `npm test` must never touch a live
+   remote, `gh`, `tmux`, or `git push`.
 
 ---
 

@@ -9,6 +9,7 @@
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { WorkflowCapabilityRegistry } from "./capabilities.ts";
 import {
   DEFAULT_RETRYABLE_BLOCKER_DELAY_MS,
   MAX_VERIFICATION_ATTEMPTS_DEFAULT,
@@ -24,6 +25,7 @@ import {
 import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { resolveWakeupDelay } from "./dispatcher.ts";
 import { formatDuration, parseDuration } from "./duration.ts";
+import { dispatchProviderAction } from "./provider-actions.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
 import { checkRunBudgetExhaustion, getAmbiguousEffects, hasAmbiguousEffects } from "./run.ts";
 import {
@@ -1032,11 +1034,86 @@ export function createWorkflowEffectReconcileTool(
 }
 
 /**
+ * Creates the workflow_provider_call tool.
+ *
+ * This is the single generic seam that lets the workflow model invoke an
+ * explicitly allowlisted operation on a declared capability provider. It
+ * exposes no provider handle or credential and performs no arbitrary
+ * method/path dispatch.
+ */
+export function createWorkflowProviderCallTool(
+  dispatcher: WorkflowDispatcher,
+  registry: WorkflowRunRegistry,
+  capabilityRegistry?: WorkflowCapabilityRegistry
+): ToolDefinition {
+  return defineTool({
+    name: "workflow_provider_call",
+    label: "Workflow Provider Call",
+    description:
+      "Invoke an explicitly allowlisted operation on a declared capability provider (e.g. github, worker-runtime). Mutating operations require a started effect checkpoint via workflow_effect_begin.",
+    parameters: Type.Object({
+      capability: Type.String({
+        description: "Declared capability name (e.g. 'github', 'worker-runtime')",
+      }),
+      operation: Type.String({
+        description: "Allowlisted provider operation name",
+      }),
+      input: Type.Optional(
+        Type.Record(Type.String(), Type.Unknown(), {
+          description: "Bounded JSON input for the operation",
+        })
+      ),
+      effectKey: Type.Optional(
+        Type.String({
+          description:
+            "Durable effect key from workflow_effect_begin; required for mutating operations",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const binding = dispatcher.assertToolBinding(signal);
+      const token = binding.token;
+      const generation = binding.generation;
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      const outcome = await dispatchProviderAction({
+        capabilityRegistry,
+        runRegistry: registry,
+        binding,
+        request: {
+          capability: params.capability,
+          operation: params.operation,
+          input: params.input,
+          effectKey: params.effectKey,
+        },
+      });
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      const effectNote = outcome.mutating
+        ? ` Mutation effect "${outcome.effectKey}" committed.`
+        : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Provider call "${outcome.capability}.${outcome.operation}" succeeded.${effectNote}`,
+          },
+        ],
+        details: outcome,
+      };
+    },
+  });
+}
+
+/**
  * Creates all model-callable workflow tools registered with the agent runtime.
  */
 export function createWorkflowTools(options: {
   dispatcher: WorkflowDispatcher;
   registry: WorkflowRunRegistry;
+  capabilityRegistry?: WorkflowCapabilityRegistry;
 }): ToolDefinition[] {
   return [
     createWorkflowGetContextTool(options.dispatcher, options.registry),
@@ -1048,5 +1125,6 @@ export function createWorkflowTools(options: {
     createWorkflowEffectBeginTool(options.dispatcher, options.registry),
     createWorkflowEffectCommitTool(options.dispatcher, options.registry),
     createWorkflowEffectReconcileTool(options.dispatcher, options.registry),
+    createWorkflowProviderCallTool(options.dispatcher, options.registry, options.capabilityRegistry),
   ];
 }

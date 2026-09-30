@@ -21,6 +21,7 @@ import {
   applyEffectBegin,
   applyEffectCommit,
   applyEffectReconcile,
+  applyMarkEffectAmbiguous,
   applyPauseRun,
   applyRecoveryEvent,
   applyReleaseLease,
@@ -49,6 +50,7 @@ import {
   type EffectBeginOptions,
   type EffectCommitOptions,
   type EffectReconcileOptions,
+  type MarkEffectAmbiguousOptions,
   type PauseRunOptions,
   type ReconstructOptions,
   type ResumeRunOptions,
@@ -486,6 +488,31 @@ export class WorkflowRunRegistry {
   }
 
   /**
+   * Conservatively mark a started mutating effect ambiguous after a dispatch
+   * whose remote outcome is uncertain. Persisted and replay-faithful so a
+   * same-session retry (as well as a reload) fails closed until reconciled.
+   */
+  markEffectAmbiguous(runId: string, options: MarkEffectAmbiguousOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const eventId = options.eventId ?? `recov-${runId}-${options.key}`;
+    const updated = applyMarkEffectAmbiguous(current, { ...options, eventId });
+
+    if (updated === current) {
+      return updated;
+    }
+
+    const entryData = buildMutationEntryData("effect_ambiguous", runId, updated.workflow, {
+      key: options.key,
+      reason: options.reason,
+      eventId,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.commitRun(runId, updated);
+    return updated;
+  }
+
+  /**
    * Record an authoritative recovery event on a run.
    */
   recordRecoveryEvent(runId: string, options: WorkflowRecoveryEventOptions): WorkflowRun {
@@ -905,6 +932,15 @@ export class WorkflowRunRegistry {
                 resultSummary: p.resultSummary,
                 reconciledAt: timestamp,
                 eventId: typeof p.eventId === "string" ? p.eventId : undefined,
+              });
+              break;
+            case "effect_ambiguous":
+              updated = applyMarkEffectAmbiguous(current, {
+                key: p.key,
+                reason: p.reason,
+                markedAt: timestamp,
+                eventId:
+                  typeof p.eventId === "string" ? p.eventId : `recov-${runId}-${p.key}`,
               });
               break;
             case "wakeup_scheduled":

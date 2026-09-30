@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { JsonValue } from "./types.ts";
 
 /** Version of the inter-extension capability registration protocol. */
 export const CAPABILITY_BUS_VERSION = 1 as const;
@@ -79,6 +80,80 @@ export interface CapabilityStatusSnapshot {
 }
 
 /**
+ * Narrow, model-safe execution context handed to a registered provider
+ * operation. It deliberately contains no credentials, provider handles, raw
+ * session objects, or arbitrary mutable state.
+ */
+export interface WorkflowProviderCallContext {
+  /** Logical capability name (e.g. "github", "worker-runtime"). */
+  readonly capability: string;
+  /** Allowlisted operation name. */
+  readonly operation: string;
+  /** Bound workflow run id. */
+  readonly runId: string;
+  /** Bound workflow name. */
+  readonly workflow: string;
+  /** Workflow-defined step at dispatch time. */
+  readonly step: string;
+  /** Ephemeral iteration token the call was bound to. */
+  readonly iterationToken: string;
+  /** Monotonic iteration generation the call was bound to. */
+  readonly generation: number;
+  /** Durable effect key authorizing a mutating operation (mutations only). */
+  readonly effectKey?: string;
+  /** Turn-bound abort signal; providers should stop work when aborted. */
+  readonly signal?: AbortSignal;
+  /** Dispatch timestamp (Unix epoch ms). */
+  readonly now: number;
+}
+
+/**
+ * A single allowlisted operation a provider exposes to the workflow model.
+ *
+ * Operations are the ONLY way the model can invoke provider domain logic:
+ * there is no arbitrary method/path dispatch. Each operation is validated at
+ * registration time and looked up by name; unknown operations are refused.
+ *
+ * A provider adapter may hold credentials and return rich internal objects.
+ * Those never cross the seam: every operation MUST supply its own input
+ * validator and an explicit, model-safe result projection, and the model only
+ * ever receives the projected fields.
+ */
+export interface WorkflowProviderOperation {
+  /** Stable, non-empty operation name (the allowlist key). */
+  readonly name: string;
+  /**
+   * True when the operation mutates external state. Mutating operations MUST
+   * be authorized by a durable, started (non-ambiguous) effect checkpoint
+   * before dispatch, and are committed by the seam after a successful call.
+   */
+  readonly mutating?: boolean;
+  /** Required effect kind for mutating operations (must match the checkpoint). */
+  readonly effectKind?: string;
+  /**
+   * REQUIRED provider-supplied semantic validator. Receives the structurally
+   * bounded JSON input and returns the normalized bounded JSON input, or throws
+   * for an invalid request. Structural JSON/bounds checks also always run in
+   * the seam, independently of this hook.
+   */
+  readonly validateInput: (input: unknown) => JsonValue;
+  /**
+   * REQUIRED explicit, model-safe projection of the raw provider result.
+   *
+   * The raw result is consumed only inside the seam (and the provider); the
+   * model and the durable effect summary receive ONLY what this function
+   * returns. Project only safe identifiers/status — never credentials, raw API
+   * objects, or unprojected provider output.
+   */
+  readonly projectResult: (result: JsonValue) => Record<string, JsonValue>;
+  /** Executes the operation. Must return JSON-safe data. */
+  readonly execute: (
+    input: JsonValue,
+    context: WorkflowProviderCallContext
+  ) => JsonValue | Promise<JsonValue>;
+}
+
+/**
  * Registration description supplied by a trusted extension.
  * The optional `api` is the narrow, extension-facing handle. It is frozen on
  * registration and never included in model-facing context.
@@ -98,6 +173,12 @@ export interface CapabilityProviderRegistration {
   getStatus?: () => CapabilityStatus | CapabilityStatusSnapshot;
   /** Optional owning session id for direct registrations (bus ads use the envelope). */
   sessionId?: string;
+  /**
+   * Explicit, allowlisted model-invokable operations. Operations are the only
+   * way a workflow can invoke provider domain logic; there is no arbitrary
+   * method/path dispatch. Empty/omitted means the provider is metadata-only.
+   */
+  operations?: readonly WorkflowProviderOperation[];
 }
 
 /** Handle returned to the registrar, enabling controlled disposal. */
@@ -107,6 +188,8 @@ export interface CapabilityProviderHandle {
   readonly version: number;
   readonly features: readonly string[];
   readonly sessionId?: string;
+  /** Allowlisted operation names registered for this provider. */
+  readonly operations: readonly string[];
   /** Trusted extension-facing API handle (frozen shallowly). */
   readonly api: unknown;
   dispose(): void;
@@ -197,6 +280,8 @@ interface InternalProvider {
   id: string;
   registration: CapabilityProviderRegistration;
   frozenApi: unknown;
+  /** Frozen allowlist of model-invokable operations, keyed by name. */
+  operations: Readonly<Record<string, WorkflowProviderOperation>>;
   source: "direct" | "bus";
   /** Session this provider is attributed to; undefined means process-scoped. */
   sessionId?: string;
@@ -346,6 +431,8 @@ export class WorkflowCapabilityRegistry {
       this.providers.delete(name);
     }
 
+    const operations = normalizeProviderOperations(name, registration.operations);
+
     const normalized: CapabilityProviderRegistration = {
       ...registration,
       name,
@@ -367,6 +454,7 @@ export class WorkflowCapabilityRegistry {
       version,
       features: Object.freeze([...features]),
       sessionId: providerSessionId,
+      operations: Object.freeze(Object.keys(operations)),
       api: normalized.api,
       dispose(): void {
         registry.unregister(name, id);
@@ -377,6 +465,7 @@ export class WorkflowCapabilityRegistry {
       id,
       registration: normalized,
       frozenApi: normalized.api,
+      operations,
       source,
       sessionId: providerSessionId,
       handle,
@@ -423,6 +512,21 @@ export class WorkflowCapabilityRegistry {
    */
   getProviderApi<T = unknown>(name: string): T | undefined {
     return this.providers.get(name)?.frozenApi as T | undefined;
+  }
+
+  /**
+   * Returns the frozen allowlist of model-invokable operations for a capability
+   * (keyed by operation name), or `undefined` when the provider is absent or
+   * exposes no operations.
+   *
+   * Operation contracts are intentionally separate from the trusted `api`
+   * handle and from capability metadata: the model never receives the handle,
+   * and the seam dispatches only through this explicit allowlist.
+   */
+  getProviderOperations(
+    name: string
+  ): Readonly<Record<string, WorkflowProviderOperation>> | undefined {
+    return this.providers.get(name)?.operations;
   }
 
   /**
@@ -726,6 +830,9 @@ function parseBusRegistration(data: unknown): CapabilityProviderRegistration | u
     version: version as number | undefined,
     features,
     api: raw.api,
+    operations: Array.isArray(raw.operations)
+      ? (raw.operations as WorkflowProviderOperation[])
+      : undefined,
     status: status as CapabilityStatus | undefined,
     reason: typeof raw.reason === "string" ? raw.reason : undefined,
     sessionId,
@@ -772,4 +879,83 @@ function freezeHandle(api: unknown): unknown {
     }
   }
   return api;
+}
+
+/**
+ * Validates and freezes a provider's operation allowlist at registration time.
+ * Mutating operations must declare a stable `effectKind` so the seam can bind
+ * them to the run's durable effect-checkpoint protocol.
+ */
+function normalizeProviderOperations(
+  providerName: string,
+  raw: readonly WorkflowProviderOperation[] | undefined
+): Readonly<Record<string, WorkflowProviderOperation>> {
+  const out: Record<string, WorkflowProviderOperation> = Object.create(null);
+  if (raw === undefined) {
+    return Object.freeze(out);
+  }
+  if (!Array.isArray(raw)) {
+    throw new WorkflowCapabilityRegistrationError(
+      `Capability provider "${providerName}" operations must be an array of operation contracts.`
+    );
+  }
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" operation entries must be objects.`
+      );
+    }
+    const opName = typeof entry.name === "string" ? entry.name.trim() : "";
+    if (!opName) {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" operation requires a non-empty "name".`
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(out, opName)) {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" declares duplicate operation "${opName}".`
+      );
+    }
+    if (typeof entry.execute !== "function") {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" operation "${opName}" requires an "execute" function.`
+      );
+    }
+    if (typeof entry.validateInput !== "function") {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" operation "${opName}" requires a "validateInput" function.`
+      );
+    }
+    if (typeof entry.projectResult !== "function") {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" operation "${opName}" requires a model-safe "projectResult" function.`
+      );
+    }
+    if (entry.mutating !== undefined && typeof entry.mutating !== "boolean") {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" operation "${opName}" mutating must be a boolean.`
+      );
+    }
+    const mutating = entry.mutating === true;
+    if (mutating) {
+      if (typeof entry.effectKind !== "string" || entry.effectKind.trim() === "") {
+        throw new WorkflowCapabilityRegistrationError(
+          `Capability provider "${providerName}" mutating operation "${opName}" requires a non-empty "effectKind".`
+        );
+      }
+    } else if (entry.effectKind !== undefined) {
+      throw new WorkflowCapabilityRegistrationError(
+        `Capability provider "${providerName}" read-only operation "${opName}" must not declare "effectKind".`
+      );
+    }
+    out[opName] = Object.freeze({
+      name: opName,
+      mutating,
+      ...(mutating ? { effectKind: (entry.effectKind as string).trim() } : {}),
+      validateInput: entry.validateInput,
+      projectResult: entry.projectResult,
+      execute: entry.execute,
+    });
+  }
+  return Object.freeze(out);
 }
