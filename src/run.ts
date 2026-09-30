@@ -150,7 +150,12 @@ export function applyRunUpdate(current: WorkflowRun, options: UpdateRunOptions):
     turns += options.incrementTurns;
   }
 
-  const loopTaskId = options.loopTaskId !== undefined ? options.loopTaskId : current.loopTaskId;
+  const loopTaskId =
+    options.loopTaskId === null || options.loopTaskId === ""
+      ? undefined
+      : options.loopTaskId !== undefined
+      ? options.loopTaskId
+      : current.loopTaskId;
 
   return Object.freeze({
     ...current,
