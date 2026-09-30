@@ -17,7 +17,8 @@ import {
   validateStepName,
   validateVerificationFindings,
 } from "./data-bounds.ts";
-import { MAX_EFFECTS_PER_RUN, MAX_VERIFICATION_ATTEMPTS_DEFAULT } from "./constants.ts";
+import { MAX_EFFECTS_PER_RUN, MAX_RUN_HISTORY_ENTRIES, MAX_RUN_RECOVERY_EVENTS, MAX_VERIFICATION_ATTEMPTS_DEFAULT } from "./constants.ts";
+import { type BoundedProjection, appendBounded } from "./bounded-history.ts";
 import { isWorkflowSnapshot, deepFreeze } from "./snapshot.ts";
 import {
   type AcquireLeaseOptions,
@@ -141,26 +142,126 @@ export function checkRunBudgetExhaustion(run: WorkflowRun, now: number = Date.no
   return { exhausted: false };
 }
 
+/** Source fields needed to derive a run's bounded history projection. */
+export interface HistoryProjectionSource {
+  readonly history?: ReadonlyArray<WorkflowRunHistoryEntry>;
+  readonly historyTotal?: number;
+  readonly historyDropped?: number;
+}
+
+/** Result of appending a history entry to a run's bounded projection. */
+export interface HistoryProjectionUpdate {
+  readonly history: ReadonlyArray<WorkflowRunHistoryEntry>;
+  readonly historyTotal: number;
+  readonly historyDropped: number;
+}
+
+/** Source fields needed to derive a run's bounded recovery-event projection. */
+export interface RecoveryProjectionSource {
+  readonly recoveryEvents?: ReadonlyArray<WorkflowRecoveryEvent>;
+  readonly recoveryEventsTotal?: number;
+  readonly recoveryEventsDropped?: number;
+}
+
+/** Result of appending a recovery event to a run's bounded projection. */
+export interface RecoveryProjectionUpdate {
+  readonly recoveryEvents: ReadonlyArray<WorkflowRecoveryEvent>;
+  readonly recoveryEventsTotal: number;
+  readonly recoveryEventsDropped: number;
+}
+
+/** Derive the bounded history projection from a run (or run-like) value. */
+export function getHistoryProjection(
+  source: HistoryProjectionSource
+): BoundedProjection<WorkflowRunHistoryEntry> {
+  const entries = source.history ?? [];
+  const total = source.historyTotal ?? entries.length;
+  return {
+    entries,
+    total,
+    dropped: source.historyDropped ?? Math.max(0, total - entries.length),
+  };
+}
+
+/** Derive the bounded recovery-event projection from a run (or run-like) value. */
+export function getRecoveryProjection(
+  source: RecoveryProjectionSource
+): BoundedProjection<WorkflowRecoveryEvent> {
+  const entries = source.recoveryEvents ?? [];
+  const total = source.recoveryEventsTotal ?? entries.length;
+  return {
+    entries,
+    total,
+    dropped: source.recoveryEventsDropped ?? Math.max(0, total - entries.length),
+  };
+}
+
 /**
- * Appends a history entry to the chronological audit history.
+ * Build and append a history entry onto an existing bounded projection.
+ *
+ * Auto-generated event IDs use the lifetime total (never the retained length),
+ * so they remain unique after truncation and stable across deterministic replay.
  */
-export function appendHistoryEntry(
-  history: ReadonlyArray<WorkflowRunHistoryEntry> | undefined,
+export function appendHistoryProjection(
+  projection: BoundedProjection<WorkflowRunHistoryEntry>,
   action: string,
   summary: string,
   details?: Record<string, JsonValue>,
   timestamp?: number,
   eventId?: string
-): ReadonlyArray<WorkflowRunHistoryEntry> {
-  const index = (history?.length ?? 0) + 1;
-  const entry: WorkflowRunHistoryEntry = {
+): BoundedProjection<WorkflowRunHistoryEntry> {
+  const index = projection.total + 1;
+  const entry: WorkflowRunHistoryEntry = Object.freeze({
     eventId: eventId ?? `${action}-${index}`,
     action,
     timestamp: timestamp ?? Date.now(),
     summary,
     ...(details ? { details: Object.freeze({ ...details }) } : {}),
+  });
+  return appendBounded(projection, entry, MAX_RUN_HISTORY_ENTRIES);
+}
+
+/**
+ * Appends a history entry to the run's bounded recent-history projection.
+ * Cost is O(MAX_RUN_HISTORY_ENTRIES), independent of the run's lifetime events.
+ */
+export function appendHistoryEntry(
+  current: HistoryProjectionSource,
+  action: string,
+  summary: string,
+  details?: Record<string, JsonValue>,
+  timestamp?: number,
+  eventId?: string
+): HistoryProjectionUpdate {
+  const next = appendHistoryProjection(
+    getHistoryProjection(current),
+    action,
+    summary,
+    details,
+    timestamp,
+    eventId
+  );
+  return { history: next.entries, historyTotal: next.total, historyDropped: next.dropped };
+}
+
+/**
+ * Appends a recovery event to the run's bounded recovery-event projection.
+ * Cost is O(MAX_RUN_RECOVERY_EVENTS), independent of lifetime event count.
+ */
+export function appendRecoveryEventProjection(
+  current: RecoveryProjectionSource,
+  event: WorkflowRecoveryEvent
+): RecoveryProjectionUpdate {
+  const next = appendBounded(
+    getRecoveryProjection(current),
+    Object.freeze(event),
+    MAX_RUN_RECOVERY_EVENTS
+  );
+  return {
+    recoveryEvents: next.entries,
+    recoveryEventsTotal: next.total,
+    recoveryEventsDropped: next.dropped,
   };
-  return Object.freeze([...(history ?? []), Object.freeze(entry)]);
 }
 
 /**
@@ -202,8 +303,8 @@ export function createWorkflowRun(params: CreateRunParams): WorkflowRun {
     ? params.snapshot
     : deepFreeze(params.snapshot);
 
-  const initialHistory = appendHistoryEntry(
-    undefined,
+  const historyUpdate = appendHistoryEntry(
+    { history: [], historyTotal: 0, historyDropped: 0 },
     "create",
     `Workflow run "${id}" created for "${params.snapshot.name}" at step "${step}".`,
     { step },
@@ -229,7 +330,9 @@ export function createWorkflowRun(params: CreateRunParams): WorkflowRun {
     data: Object.freeze({ ...data }),
     effects: Object.freeze({}),
     recoveryEvents: Object.freeze([]),
-    history: initialHistory,
+    recoveryEventsTotal: 0,
+    recoveryEventsDropped: 0,
+    ...historyUpdate,
   };
 
   return Object.freeze(run);
@@ -345,7 +448,7 @@ export function applyStepTransition(current: WorkflowRun, options: TransitionSte
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "transition",
     `Step transitioned from "${current.step}" to "${toStep}"${options.reason ? `: ${options.reason}` : ""}`,
     { fromStep: current.step, toStep, reason: (options.reason ?? "") as any },
@@ -356,7 +459,7 @@ export function applyStepTransition(current: WorkflowRun, options: TransitionSte
     ...current,
     step: toStep,
     data: mergedData,
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -396,7 +499,7 @@ export function applyBlockRun(current: WorkflowRun, options: BlockRunOptions): W
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "block",
     `Run blocked: ${options.reason}`,
     { reason: options.reason as any, category: (options.category ?? "human-required") as any },
@@ -408,7 +511,7 @@ export function applyBlockRun(current: WorkflowRun, options: BlockRunOptions): W
     lifecycle: "blocked",
     blocker: Object.freeze(blocker),
     data: mergedData,
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -438,7 +541,7 @@ export function applyPauseRun(current: WorkflowRun, options: PauseRunOptions = {
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "pause",
     `Run paused${options.reason ? `: ${options.reason}` : ""}`,
     { reason: (options.reason ?? "") as any },
@@ -449,7 +552,7 @@ export function applyPauseRun(current: WorkflowRun, options: PauseRunOptions = {
     ...current,
     lifecycle: "paused",
     data: mergedData,
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -496,7 +599,7 @@ export function applyClaimCompletion(current: WorkflowRun, options: ClaimComplet
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "claim",
     `Completion claimed: ${claim.summary}`,
     { summary: claim.summary as any, evidenceCount: claim.evidence.length as any },
@@ -514,7 +617,7 @@ export function applyClaimCompletion(current: WorkflowRun, options: ClaimComplet
       _pendingCompletionSummary: claim.summary,
       _preVerificationStep: current.step,
     }),
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -678,8 +781,8 @@ export function applyResumeRun(current: WorkflowRun, options: ResumeRunOptions =
     step,
     blocker: undefined, // Clear blocker upon resume
     data: mergedData,
-    history: appendHistoryEntry(
-      current.history,
+    ...appendHistoryEntry(
+      current,
       "resume",
       `Run resumed into step "${step}"${options.reason ? `: ${options.reason}` : ""}`,
       { step, reason: (options.reason ?? "") as any },
@@ -738,7 +841,7 @@ export function applyCompleteRun(current: WorkflowRun, options: CompleteRunOptio
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "complete",
     `Run completed: ${completion.summary}`,
     { summary: completion.summary as any, evidenceCount: completion.evidence.length as any },
@@ -751,7 +854,7 @@ export function applyCompleteRun(current: WorkflowRun, options: CompleteRunOptio
     completion: Object.freeze(completion),
     blocker: undefined,
     data: mergedData,
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
     completedAt: now,
   });
@@ -782,7 +885,7 @@ export function applyCancelRun(current: WorkflowRun, options: CancelRunOptions =
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "cancel",
     `Run cancelled${options.reason ? `: ${options.reason}` : ""}`,
     { reason: (options.reason ?? "") as any },
@@ -794,7 +897,7 @@ export function applyCancelRun(current: WorkflowRun, options: CancelRunOptions =
     lifecycle: "cancelled",
     blocker: undefined,
     data: mergedData,
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
     completedAt: now,
   });
@@ -882,7 +985,7 @@ export function applyEffectBegin(current: WorkflowRun, options: EffectBeginOptio
   };
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "effect_begin",
     `Started external effect checkpoint: "${key}" (${kind})`,
     { key, kind, inputSummary: inputSummary as any },
@@ -892,7 +995,7 @@ export function applyEffectBegin(current: WorkflowRun, options: EffectBeginOptio
   return Object.freeze({
     ...current,
     effects: Object.freeze(newEffects),
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -929,7 +1032,7 @@ export function applyEffectCommit(current: WorkflowRun, options: EffectCommitOpt
     ? validateEffectSummary(options.resultSummary, { runId: current.id, field: `effects.${key}.resultSummary` })
     : undefined;
 
-  const wasAmbiguous = existing.ambiguous === true;
+  const wasAmbiguous = existing.ambiguous === true || options.recovered === true;
 
   const committedEffect: WorkflowEffect = {
     ...existing,
@@ -944,20 +1047,20 @@ export function applyEffectCommit(current: WorkflowRun, options: EffectCommitOpt
     [key]: Object.freeze(committedEffect),
   };
 
-  let newRecoveryEvents = current.recoveryEvents ?? [];
+  let recoveryUpdate: RecoveryProjectionUpdate | undefined;
   if (wasAmbiguous) {
     const recEvent: WorkflowRecoveryEvent = {
-      eventId: `recov-${randomUUID().slice(0, 8)}`,
+      eventId: options.eventId ?? `recov-${randomUUID().slice(0, 8)}`,
       type: "effect_reconciled",
       timestamp: now,
       message: `Ambiguous effect "${key}" (${existing.kind}) confirmed and committed during recovery.`,
       details: Object.freeze({ key, kind: existing.kind, resultSummary: resultSummary as any }),
     };
-    newRecoveryEvents = Object.freeze([...newRecoveryEvents, Object.freeze(recEvent)]);
+    recoveryUpdate = appendRecoveryEventProjection(current, recEvent);
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "effect_commit",
     `Committed external effect checkpoint: "${key}" (${existing.kind})${wasAmbiguous ? " [recovered]" : ""}`,
     { key, kind: existing.kind, resultSummary: resultSummary as any, wasAmbiguous: wasAmbiguous as any },
@@ -967,8 +1070,8 @@ export function applyEffectCommit(current: WorkflowRun, options: EffectCommitOpt
   return Object.freeze({
     ...current,
     effects: Object.freeze(newEffects),
-    recoveryEvents: newRecoveryEvents,
-    history: newHistory,
+    ...(recoveryUpdate ?? {}),
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -1045,17 +1148,17 @@ export function applyEffectReconcile(current: WorkflowRun, options: EffectReconc
   };
 
   const recEvent: WorkflowRecoveryEvent = {
-    eventId: `recov-${randomUUID().slice(0, 8)}`,
+    eventId: options.eventId ?? `recov-${randomUUID().slice(0, 8)}`,
     type: eventType,
     timestamp: now,
     message: `Effect "${key}" (${existing.kind}) reconciled as "${resolution}": ${reason ?? "External reality verified."}`,
     details: Object.freeze({ key, kind: existing.kind, resolution, reason: (reason ?? "") as any }),
   };
 
-  const newRecoveryEvents = Object.freeze([...(current.recoveryEvents ?? []), Object.freeze(recEvent)]);
+  const recoveryUpdate = appendRecoveryEventProjection(current, recEvent);
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "effect_reconcile",
     `Reconciled effect "${key}" as "${resolution}"${reason ? `: ${reason}` : ""}`,
     { key, resolution, reason: (reason ?? "") as any },
@@ -1065,8 +1168,8 @@ export function applyEffectReconcile(current: WorkflowRun, options: EffectReconc
   return Object.freeze({
     ...current,
     effects: Object.freeze(newEffects),
-    recoveryEvents: newRecoveryEvents,
-    history: newHistory,
+    ...recoveryUpdate,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -1086,9 +1189,9 @@ export function applyRecoveryEvent(current: WorkflowRun, options: WorkflowRecove
     ...(options.details ? { details: Object.freeze({ ...options.details }) } : {}),
   };
 
-  const newRecoveryEvents = Object.freeze([...(current.recoveryEvents ?? []), Object.freeze(event)]);
+  const recoveryUpdate = appendRecoveryEventProjection(current, event);
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "recovery",
     `Recovery event [${options.type}]: ${options.message}`,
     options.details,
@@ -1097,8 +1200,8 @@ export function applyRecoveryEvent(current: WorkflowRun, options: WorkflowRecove
 
   return Object.freeze({
     ...current,
-    recoveryEvents: newRecoveryEvents,
-    history: newHistory,
+    ...recoveryUpdate,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -1129,7 +1232,7 @@ export function applyAcquireLease(current: WorkflowRun, options: AcquireLeaseOpt
   };
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "lease_acquire",
     `Acquired lease for owner "${ownerId}"`,
     { ownerId, expiresAt: (options.expiresAt ?? null) as any },
@@ -1139,7 +1242,7 @@ export function applyAcquireLease(current: WorkflowRun, options: AcquireLeaseOpt
   return Object.freeze({
     ...current,
     lease: Object.freeze(lease),
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -1147,14 +1250,14 @@ export function applyAcquireLease(current: WorkflowRun, options: AcquireLeaseOpt
 /**
  * Release an ownership lease on a workflow run.
  */
-export function applyReleaseLease(current: WorkflowRun, ownerId: string): WorkflowRun {
-  const now = Date.now();
+export function applyReleaseLease(current: WorkflowRun, ownerId: string, releasedAt?: number): WorkflowRun {
+  const now = releasedAt ?? Date.now();
   if (!current.lease || current.lease.ownerId !== ownerId) {
     return current;
   }
 
   const newHistory = appendHistoryEntry(
-    current.history,
+    current,
     "lease_release",
     `Released lease for owner "${ownerId}"`,
     { ownerId },
@@ -1164,7 +1267,7 @@ export function applyReleaseLease(current: WorkflowRun, ownerId: string): Workfl
   return Object.freeze({
     ...current,
     lease: undefined,
-    history: newHistory,
+    ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
