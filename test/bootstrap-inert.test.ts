@@ -106,7 +106,7 @@ describe("Extension bootstrap inertness (issue #11)", () => {
     }
     assert.equal(typeof unsubscribers[0], "function", "pi.on returns an unsubscribe function");
     assert.equal(handlers.size, unsubscribers.length);
-    assert.equal(registeredTools.length, 9);
+    assert.equal(registeredTools.length, 10);
     assert.ok(registeredCommands.includes("workflow"));
     assert.ok(registeredCommands.includes("goal"));
 

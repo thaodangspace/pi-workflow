@@ -1003,6 +1003,52 @@ export class WorkflowAmbiguousEffectError extends WorkflowEffectError {
   }
 }
 
+/** Machine-readable reason a model-callable provider action was refused/failed. */
+export type WorkflowProviderCallCode =
+  | "no_registry"
+  | "capability_invalid"
+  | "capability_not_declared"
+  | "capability_missing"
+  | "capability_unavailable"
+  | "capability_incompatible"
+  | "operations_unavailable"
+  | "operation_not_allowlisted"
+  | "effect_required"
+  | "effect_unexpected"
+  | "effect_not_started"
+  | "effect_already_committed"
+  | "effect_kind_mismatch"
+  | "effect_ambiguous"
+  | "provider_degraded"
+  | "execution_failed";
+
+/**
+ * Raised when a model-callable provider action cannot be dispatched safely:
+ * absent/unhealthy/incompatible provider, operation not on the allowlist, or a
+ * mutating operation without a valid durable effect checkpoint.
+ */
+export class WorkflowProviderCallError extends WorkflowRunError {
+  readonly code: WorkflowProviderCallCode;
+  readonly capability?: string;
+  readonly operation?: string;
+
+  constructor(
+    message: string,
+    options: {
+      runId?: string;
+      code: WorkflowProviderCallCode;
+      capability?: string;
+      operation?: string;
+    }
+  ) {
+    super(message, options.runId);
+    this.name = "WorkflowProviderCallError";
+    this.code = options.code;
+    this.capability = options.capability;
+    this.operation = options.operation;
+  }
+}
+
 export class WorkflowOwnershipError extends WorkflowRunError {
   readonly currentOwnerId?: string;
   readonly requestedOwnerId?: string;

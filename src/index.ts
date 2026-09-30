@@ -68,6 +68,9 @@ export * from "./dispatcher.ts";
 // Re-export tools
 export * from "./tools.ts";
 
+// Re-export the generic model-callable provider-action seam
+export * from "./provider-actions.ts";
+
 // Re-export scheduler adapter
 export * from "./scheduler-adapter.ts";
 
@@ -175,7 +178,7 @@ export default function workflowExtension(
     events: (pi as any).events,
     capabilityRegistry,
   });
-  const tools = createWorkflowTools({ dispatcher, registry });
+  const tools = createWorkflowTools({ dispatcher, registry, capabilityRegistry });
 
   if (typeof pi.registerTool === "function") {
     for (const tool of tools) {

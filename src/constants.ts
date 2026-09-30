@@ -56,6 +56,15 @@ export const WORKFLOW_RUN_PERSISTENCE_VERSION = 1;
 /** Maximum byte size per individual run data payload (64 KiB) */
 export const MAX_RUN_DATA_BYTES = 64 * 1024;
 
+/**
+ * Maximum serialized UTF-8 byte size of a single provider-call input or result
+ * payload. Keep provider traffic bounded independently of run-data limits.
+ */
+export const MAX_PROVIDER_CALL_BYTES = 64 * 1024;
+
+/** Maximum character length of a provider operation name. */
+export const MAX_PROVIDER_OPERATION_NAME_LENGTH = 64;
+
 /** Maximum cumulative byte size of data stored on a single run (256 KiB) */
 export const MAX_RUN_TOTAL_DATA_BYTES = 256 * 1024;
 

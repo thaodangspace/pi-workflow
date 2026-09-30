@@ -41,6 +41,18 @@ or any raw mutable internal state.
 Provider presence is explicit. A registered Pi tool, a namespace, or a binary
 on `PATH` is **not** treated as proof of a compatible, healthy provider.
 
+### Model-callable operations
+
+`api` is a **trusted-extension-only** handle and is never exposed to the model.
+To let a workflow invoke provider logic, a provider must additionally register
+an explicit, allowlisted `operations` array. Each operation declares a name, a
+`mutating` flag with a stable `effectKind`, a `validateInput` normalizer, and a
+model-safe `projectResult`. The model reaches them only through
+`workflow_provider_call({ capability, operation, input?, effectKey? })`. Raw
+provider output, `api` handles, and credentials never cross the seam, and
+mutating calls require a durable, started effect checkpoint. See the README
+section *Reference Workflow: `github-coding`*.
+
 ## Declaring requirements
 
 Legacy bare names keep working:

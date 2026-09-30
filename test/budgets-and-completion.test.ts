@@ -768,7 +768,7 @@ Body`,
       workflowExtension(pi);
 
       // Verify all tools registered in extension entrypoint
-      assert.equal(registeredTools.size, 9);
+      assert.equal(registeredTools.size, 10);
       assert(registeredTools.has("workflow_get_context"));
       assert(registeredTools.has("workflow_transition"));
       assert(registeredTools.has("workflow_continue"));
@@ -778,6 +778,7 @@ Body`,
       assert(registeredTools.has("workflow_effect_begin"));
       assert(registeredTools.has("workflow_effect_commit"));
       assert(registeredTools.has("workflow_effect_reconcile"));
+      assert(registeredTools.has("workflow_provider_call"));
 
       // Simulate session_start
       const sessionCtx: any = { sessionManager: session };
