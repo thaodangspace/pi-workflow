@@ -25,20 +25,44 @@ import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { resolveWakeupDelay } from "./dispatcher.ts";
 import { formatDuration, parseDuration } from "./duration.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
-import { checkRunBudgetExhaustion } from "./run.ts";
+import { checkRunBudgetExhaustion, getAmbiguousEffects, hasAmbiguousEffects } from "./run.ts";
 import {
   type BlockerCategory,
   type JsonValue,
   type WorkflowBlockerInfo,
   type WorkflowCompletionClaim,
   type WorkflowCompletionInfo,
+  type WorkflowEffect,
   type WorkflowVerificationFindings,
+  WorkflowAmbiguousEffectError,
   WorkflowBudgetExhaustedError,
+  WorkflowEffectAlreadyCommittedError,
+  WorkflowEffectError,
   WorkflowInvalidTransitionError,
   WorkflowIterationError,
   type WorkflowRunLifecycle,
   WorkflowRunError,
 } from "./types.ts";
+
+export interface WorkflowEffectBeginDetails {
+  status: "started" | "already_committed";
+  key: string;
+  kind?: string;
+  effect?: Readonly<WorkflowEffect>;
+}
+
+export interface WorkflowEffectCommitDetails {
+  status: "committed";
+  key: string;
+  effect?: Readonly<WorkflowEffect>;
+}
+
+export interface WorkflowEffectReconcileDetails {
+  status: "committed" | "aborted" | "retryable";
+  key: string;
+  reason: string;
+  effect?: Readonly<WorkflowEffect>;
+}
 
 export interface WorkflowCompleteDetails {
   runId: string;
@@ -145,6 +169,14 @@ export function createWorkflowTransitionTool(
           run.id,
           `Cannot transition step from lifecycle "${run.lifecycle}". Run must be "active" to advance steps.`,
           { fromLifecycle: run.lifecycle, action: "transition" }
+        );
+      }
+
+      if (hasAmbiguousEffects(run)) {
+        const ambiguous = getAmbiguousEffects(run);
+        throw new WorkflowAmbiguousEffectError(
+          `Cannot transition step while run "${run.id}" has ambiguous external effect "${ambiguous[0].key}" (${ambiguous[0].kind}). Reconcile pending effects first with workflow_effect_commit or workflow_effect_reconcile.`,
+          { runId: run.id, ambiguousKey: ambiguous[0].key }
         );
       }
 
@@ -460,6 +492,14 @@ export function createWorkflowCompleteTool(
           run.id,
           `Cannot complete a run that is already in terminal lifecycle "${run.lifecycle}".`,
           { fromLifecycle: run.lifecycle, toLifecycle: "completed", action: "complete" }
+        );
+      }
+
+      if (hasAmbiguousEffects(run)) {
+        const ambiguous = getAmbiguousEffects(run);
+        throw new WorkflowAmbiguousEffectError(
+          `Cannot complete workflow while run "${run.id}" has ambiguous external effect "${ambiguous[0].key}". Reconcile pending effects first.`,
+          { runId: run.id, ambiguousKey: ambiguous[0].key }
         );
       }
 
@@ -806,6 +846,192 @@ export function createWorkflowVerifyTool(
 }
 
 /**
+ * Creates the workflow_effect_begin tool.
+ */
+export function createWorkflowEffectBeginTool(
+  dispatcher: WorkflowDispatcher,
+  registry: WorkflowRunRegistry
+): ToolDefinition {
+  return defineTool({
+    name: "workflow_effect_begin",
+    label: "Workflow Effect Begin",
+    description:
+      "Record intent before performing an external side effect (e.g. creating a PR, issue, or deployment), establishing an idempotent checkpoint.",
+    parameters: Type.Object({
+      key: Type.String({ description: "Unique effect identifier within this workflow run (e.g. 'create-pr', 'post-slack-notice')" }),
+      kind: Type.String({ description: "Category or kind of external effect (e.g. 'github.pull_request.create')" }),
+      inputSummary: Type.Optional(
+        Type.Record(Type.String(), Type.Unknown(), {
+          description: "Bounded JSON-safe summary of effect inputs or intent",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const binding = dispatcher.assertToolBinding(signal);
+      const token = binding.token;
+      const generation = binding.generation;
+
+      const run = registry.requireRun(binding.runId);
+
+      // Check if key was already committed
+      const existing = run.effects?.[params.key];
+      if (existing && existing.status === "committed") {
+        const details: WorkflowEffectBeginDetails = {
+          status: "already_committed",
+          key: params.key,
+          kind: existing.kind,
+          effect: existing,
+        };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Effect "${params.key}" was already committed at ${new Date(existing.committedAt!).toISOString()}. Do NOT repeat the external side effect.`,
+            },
+          ],
+          details,
+        };
+      }
+
+      const updated = registry.beginEffect(binding.runId, {
+        key: params.key,
+        kind: params.kind,
+        inputSummary: params.inputSummary as any,
+        allowCommitted: true,
+      });
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      const details: WorkflowEffectBeginDetails = {
+        status: "started",
+        key: params.key,
+        kind: params.kind,
+        effect: updated.effects?.[params.key],
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Effect checkpoint started: "${params.key}" (${params.kind}). You may now perform the external side effect. Call workflow_effect_commit after observing success.`,
+          },
+        ],
+        details,
+      };
+    },
+  });
+}
+
+/**
+ * Creates the workflow_effect_commit tool.
+ */
+export function createWorkflowEffectCommitTool(
+  dispatcher: WorkflowDispatcher,
+  registry: WorkflowRunRegistry
+): ToolDefinition {
+  return defineTool({
+    name: "workflow_effect_commit",
+    label: "Workflow Effect Commit",
+    description:
+      "Confirm and commit an external side effect after observing its success, preventing accidental duplication.",
+    parameters: Type.Object({
+      key: Type.String({ description: "Unique effect identifier to commit" }),
+      resultSummary: Type.Optional(
+        Type.Record(Type.String(), Type.Unknown(), {
+          description: "Bounded JSON-safe summary of observed outcome or result (e.g. { prNumber: 123, url: '...' })",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const binding = dispatcher.assertToolBinding(signal);
+      const token = binding.token;
+      const generation = binding.generation;
+
+      const updated = registry.commitEffect(binding.runId, {
+        key: params.key,
+        resultSummary: params.resultSummary as any,
+      });
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      const details: WorkflowEffectCommitDetails = {
+        status: "committed",
+        key: params.key,
+        effect: updated.effects?.[params.key],
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Effect "${params.key}" committed successfully. External result confirmed.`,
+          },
+        ],
+        details,
+      };
+    },
+  });
+}
+
+/**
+ * Creates the workflow_effect_reconcile tool.
+ */
+export function createWorkflowEffectReconcileTool(
+  dispatcher: WorkflowDispatcher,
+  registry: WorkflowRunRegistry
+): ToolDefinition {
+  return defineTool({
+    name: "workflow_effect_reconcile",
+    label: "Workflow Effect Reconcile",
+    description:
+      "Reconcile an interrupted or ambiguous effect checkpoint after inspecting external reality.",
+    parameters: Type.Object({
+      key: Type.String({ description: "Unique effect identifier to reconcile" }),
+      resolution: Type.Union([Type.Literal("committed"), Type.Literal("aborted"), Type.Literal("retryable")], {
+        description: "Reconciliation outcome: 'committed' if external action was confirmed done, 'aborted' if abandoned, 'retryable' if cleared for retry",
+      }),
+      reason: Type.String({ description: "Explanation of external observation and resolution findings" }),
+      resultSummary: Type.Optional(
+        Type.Record(Type.String(), Type.Unknown(), {
+          description: "Optional observed result summary",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const binding = dispatcher.assertToolBinding(signal);
+      const token = binding.token;
+      const generation = binding.generation;
+
+      const updated = registry.reconcileEffect(binding.runId, {
+        key: params.key,
+        resolution: params.resolution,
+        reason: params.reason,
+        resultSummary: params.resultSummary as any,
+      });
+
+      dispatcher.assertToolBinding(signal, token, generation);
+
+      const details: WorkflowEffectReconcileDetails = {
+        status: params.resolution,
+        key: params.key,
+        reason: params.reason,
+        effect: updated.effects?.[params.key],
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Effect "${params.key}" reconciled as "${params.resolution}": ${params.reason}`,
+          },
+        ],
+        details,
+      };
+    },
+  });
+}
+
+/**
  * Creates all model-callable workflow tools registered with the agent runtime.
  */
 export function createWorkflowTools(options: {
@@ -819,5 +1045,8 @@ export function createWorkflowTools(options: {
     createWorkflowBlockTool(options.dispatcher, options.registry),
     createWorkflowCompleteTool(options.dispatcher, options.registry),
     createWorkflowVerifyTool(options.dispatcher, options.registry),
+    createWorkflowEffectBeginTool(options.dispatcher, options.registry),
+    createWorkflowEffectCommitTool(options.dispatcher, options.registry),
+    createWorkflowEffectReconcileTool(options.dispatcher, options.registry),
   ];
 }

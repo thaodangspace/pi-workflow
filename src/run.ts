@@ -7,18 +7,27 @@ import {
   validateBlockerInfo,
   validateCompletionClaim,
   validateCompletionInfo,
+  validateEffectKey,
+  validateEffectKind,
+  validateEffectNote,
+  validateEffectResolution,
+  validateEffectSummary,
   validateRunData,
   validateRunId,
   validateStepName,
   validateVerificationFindings,
 } from "./data-bounds.ts";
-import { MAX_VERIFICATION_ATTEMPTS_DEFAULT } from "./constants.ts";
+import { MAX_EFFECTS_PER_RUN, MAX_VERIFICATION_ATTEMPTS_DEFAULT } from "./constants.ts";
 import { isWorkflowSnapshot, deepFreeze } from "./snapshot.ts";
 import {
+  type AcquireLeaseOptions,
   type BlockRunOptions,
   type CancelRunOptions,
   type ClaimCompletionOptions,
   type CompleteRunOptions,
+  type EffectBeginOptions,
+  type EffectCommitOptions,
+  type EffectReconcileOptions,
   type JsonValue,
   type PauseRunOptions,
   type ResumeRunOptions,
@@ -28,7 +37,16 @@ import {
   type WorkflowBlockerInfo,
   type WorkflowBudgetPolicy,
   type WorkflowCompletionInfo,
+  type WorkflowEffect,
+  type WorkflowRecoveryEvent,
+  type WorkflowRecoveryEventOptions,
+  type WorkflowRunHistoryEntry,
+  type WorkflowRunLease,
+  WorkflowAmbiguousEffectError,
+  WorkflowEffectAlreadyCommittedError,
+  WorkflowEffectError,
   WorkflowInvalidTransitionError,
+  WorkflowOwnershipError,
   type WorkflowRun,
   WorkflowRunError,
   type WorkflowRunLifecycle,
@@ -124,6 +142,50 @@ export function checkRunBudgetExhaustion(run: WorkflowRun, now: number = Date.no
 }
 
 /**
+ * Appends a history entry to the chronological audit history.
+ */
+export function appendHistoryEntry(
+  history: ReadonlyArray<WorkflowRunHistoryEntry> | undefined,
+  action: string,
+  summary: string,
+  details?: Record<string, JsonValue>,
+  timestamp?: number,
+  eventId?: string
+): ReadonlyArray<WorkflowRunHistoryEntry> {
+  const index = (history?.length ?? 0) + 1;
+  const entry: WorkflowRunHistoryEntry = {
+    eventId: eventId ?? `${action}-${index}`,
+    action,
+    timestamp: timestamp ?? Date.now(),
+    summary,
+    ...(details ? { details: Object.freeze({ ...details }) } : {}),
+  };
+  return Object.freeze([...(history ?? []), Object.freeze(entry)]);
+}
+
+/**
+ * Returns any ambiguous uncommitted effects on the run.
+ */
+export function getAmbiguousEffects(run: WorkflowRun): WorkflowEffect[] {
+  if (!run.effects) return [];
+  return Object.values(run.effects).filter((e) => e.ambiguous === true);
+}
+
+/**
+ * Checks whether the run has any ambiguous uncommitted external effects.
+ */
+export function hasAmbiguousEffects(run: WorkflowRun): boolean {
+  return getAmbiguousEffects(run).length > 0;
+}
+
+/**
+ * Generates an idempotent claim token combining run ID and effect key.
+ */
+export function getEffectClaimToken(runId: string, effectKey: string): string {
+  return `${runId}:${effectKey}`;
+}
+
+/**
  * Creates an immutable, valid WorkflowRun instance initialized to "active" state.
  */
 export function createWorkflowRun(params: CreateRunParams): WorkflowRun {
@@ -139,6 +201,14 @@ export function createWorkflowRun(params: CreateRunParams): WorkflowRun {
   const frozenSnapshot = Object.isFrozen(params.snapshot)
     ? params.snapshot
     : deepFreeze(params.snapshot);
+
+  const initialHistory = appendHistoryEntry(
+    undefined,
+    "create",
+    `Workflow run "${id}" created for "${params.snapshot.name}" at step "${step}".`,
+    { step },
+    now
+  );
 
   const run: WorkflowRun = {
     id,
@@ -157,6 +227,9 @@ export function createWorkflowRun(params: CreateRunParams): WorkflowRun {
     turns: 0,
     verificationAttempts: 0,
     data: Object.freeze({ ...data }),
+    effects: Object.freeze({}),
+    recoveryEvents: Object.freeze([]),
+    history: initialHistory,
   };
 
   return Object.freeze(run);
@@ -250,6 +323,14 @@ export function applyStepTransition(current: WorkflowRun, options: TransitionSte
     );
   }
 
+  if (hasAmbiguousEffects(current)) {
+    const ambiguous = getAmbiguousEffects(current);
+    throw new WorkflowAmbiguousEffectError(
+      `Cannot transition step while run "${current.id}" has ambiguous external effect "${ambiguous[0].key}" (${ambiguous[0].kind}). Reconcile pending effects first.`,
+      { runId: current.id, ambiguousKey: ambiguous[0].key }
+    );
+  }
+
   const toStep = validateStepName(options.toStep, { runId: current.id });
   const now = options.updatedAt ?? Date.now();
 
@@ -263,10 +344,19 @@ export function applyStepTransition(current: WorkflowRun, options: TransitionSte
     validateRunData(mergedData, { runId: current.id });
   }
 
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "transition",
+    `Step transitioned from "${current.step}" to "${toStep}"${options.reason ? `: ${options.reason}` : ""}`,
+    { fromStep: current.step, toStep, reason: (options.reason ?? "") as any },
+    now
+  );
+
   return Object.freeze({
     ...current,
     step: toStep,
     data: mergedData,
+    history: newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -305,11 +395,20 @@ export function applyBlockRun(current: WorkflowRun, options: BlockRunOptions): W
     validateRunData(mergedData, { runId: current.id });
   }
 
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "block",
+    `Run blocked: ${options.reason}`,
+    { reason: options.reason as any, category: (options.category ?? "human-required") as any },
+    now
+  );
+
   return Object.freeze({
     ...current,
     lifecycle: "blocked",
     blocker: Object.freeze(blocker),
     data: mergedData,
+    history: newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -338,10 +437,19 @@ export function applyPauseRun(current: WorkflowRun, options: PauseRunOptions = {
     validateRunData(mergedData, { runId: current.id });
   }
 
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "pause",
+    `Run paused${options.reason ? `: ${options.reason}` : ""}`,
+    { reason: (options.reason ?? "") as any },
+    now
+  );
+
   return Object.freeze({
     ...current,
     lifecycle: "paused",
     data: mergedData,
+    history: newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -355,6 +463,14 @@ export function applyClaimCompletion(current: WorkflowRun, options: ClaimComplet
       current.id,
       `Cannot claim completion on run in lifecycle "${current.lifecycle}". Run must be "active" to submit a completion claim.`,
       { fromLifecycle: current.lifecycle, toLifecycle: "verifying", action: "claim" }
+    );
+  }
+
+  if (hasAmbiguousEffects(current)) {
+    const ambiguous = getAmbiguousEffects(current);
+    throw new WorkflowAmbiguousEffectError(
+      `Cannot claim completion while run "${current.id}" has ambiguous external effect "${ambiguous[0].key}" (${ambiguous[0].kind}). Reconcile pending effects first.`,
+      { runId: current.id, ambiguousKey: ambiguous[0].key }
     );
   }
 
@@ -379,6 +495,14 @@ export function applyClaimCompletion(current: WorkflowRun, options: ClaimComplet
     validateRunData(mergedData, { runId: current.id });
   }
 
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "claim",
+    `Completion claimed: ${claim.summary}`,
+    { summary: claim.summary as any, evidenceCount: claim.evidence.length as any },
+    now
+  );
+
   return Object.freeze({
     ...current,
     lifecycle: "verifying",
@@ -390,6 +514,7 @@ export function applyClaimCompletion(current: WorkflowRun, options: ClaimComplet
       _pendingCompletionSummary: claim.summary,
       _preVerificationStep: current.step,
     }),
+    history: newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -553,6 +678,13 @@ export function applyResumeRun(current: WorkflowRun, options: ResumeRunOptions =
     step,
     blocker: undefined, // Clear blocker upon resume
     data: mergedData,
+    history: appendHistoryEntry(
+      current.history,
+      "resume",
+      `Run resumed into step "${step}"${options.reason ? `: ${options.reason}` : ""}`,
+      { step, reason: (options.reason ?? "") as any },
+      now
+    ),
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -577,6 +709,14 @@ export function applyCompleteRun(current: WorkflowRun, options: CompleteRunOptio
     );
   }
 
+  if (hasAmbiguousEffects(current)) {
+    const ambiguous = getAmbiguousEffects(current);
+    throw new WorkflowAmbiguousEffectError(
+      `Cannot complete workflow while run "${current.id}" has ambiguous external effect "${ambiguous[0].key}" (${ambiguous[0].kind}). Reconcile pending effects first.`,
+      { runId: current.id, ambiguousKey: ambiguous[0].key }
+    );
+  }
+
   const now = options.completedAt ?? Date.now();
   const completion = validateCompletionInfo(
     {
@@ -597,12 +737,21 @@ export function applyCompleteRun(current: WorkflowRun, options: CompleteRunOptio
     validateRunData(mergedData, { runId: current.id });
   }
 
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "complete",
+    `Run completed: ${completion.summary}`,
+    { summary: completion.summary as any, evidenceCount: completion.evidence.length as any },
+    now
+  );
+
   return Object.freeze({
     ...current,
     lifecycle: "completed",
     completion: Object.freeze(completion),
     blocker: undefined,
     data: mergedData,
+    history: newHistory,
     updatedAt: Math.max(now, current.updatedAt),
     completedAt: now,
   });
@@ -632,12 +781,390 @@ export function applyCancelRun(current: WorkflowRun, options: CancelRunOptions =
     validateRunData(mergedData, { runId: current.id });
   }
 
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "cancel",
+    `Run cancelled${options.reason ? `: ${options.reason}` : ""}`,
+    { reason: (options.reason ?? "") as any },
+    now
+  );
+
   return Object.freeze({
     ...current,
     lifecycle: "cancelled",
     blocker: undefined,
     data: mergedData,
+    history: newHistory,
     updatedAt: Math.max(now, current.updatedAt),
     completedAt: now,
+  });
+}
+
+/**
+ * Begin an external effect checkpoint, recording intent before execution.
+ */
+export function applyEffectBegin(current: WorkflowRun, options: EffectBeginOptions): WorkflowRun {
+  if (isTerminalLifecycle(current.lifecycle)) {
+    throw new WorkflowInvalidTransitionError(
+      current.id,
+      `Cannot begin effect on run "${current.id}" because it is in terminal state "${current.lifecycle}"`,
+      { fromLifecycle: current.lifecycle, action: "effect_begin" }
+    );
+  }
+
+  if (current.lifecycle === "paused" || current.lifecycle === "blocked") {
+    throw new WorkflowInvalidTransitionError(
+      current.id,
+      `Cannot begin effect on run "${current.id}" because it is in "${current.lifecycle}" lifecycle.`,
+      { fromLifecycle: current.lifecycle, action: "effect_begin" }
+    );
+  }
+
+  const key = validateEffectKey(options.key, { runId: current.id });
+  const kind = validateEffectKind(options.kind, { runId: current.id });
+  const now = options.startedAt ?? Date.now();
+
+  // Check if run has other ambiguous uncommitted effects
+  const ambiguous = getAmbiguousEffects(current);
+  if (ambiguous.length > 0 && !ambiguous.some((e) => e.key === key)) {
+    throw new WorkflowAmbiguousEffectError(
+      `Cannot begin new effect "${key}": run "${current.id}" has ambiguous uncommitted effect "${ambiguous[0].key}" (${ambiguous[0].kind}). Reconcile pending effects first.`,
+      { runId: current.id, ambiguousKey: ambiguous[0].key, key }
+    );
+  }
+
+  const existing = current.effects?.[key];
+  if (existing) {
+    if (existing.status === "committed") {
+      if (options.allowCommitted) {
+        return current;
+      }
+      throw new WorkflowEffectAlreadyCommittedError(key, current.id, existing);
+    }
+    if (existing.status === "started") {
+      if (existing.ambiguous) {
+        throw new WorkflowAmbiguousEffectError(
+          `Effect "${key}" on run "${current.id}" is in ambiguous started state from an earlier session and must be reconciled before beginning again.`,
+          { runId: current.id, ambiguousKey: key, key }
+        );
+      }
+      throw new WorkflowEffectError(
+        `Effect "${key}" on run "${current.id}" has already been started and is not yet committed.`,
+        { runId: current.id, key, effectKind: existing.kind }
+      );
+    }
+    // Reconciled/aborted effects may be retried under the same key
+  }
+
+  const currentCount = Object.keys(current.effects ?? {}).length;
+  if (!existing && currentCount >= MAX_EFFECTS_PER_RUN) {
+    throw new WorkflowEffectError(
+      `Maximum effects limit of ${MAX_EFFECTS_PER_RUN} reached for run "${current.id}"`,
+      { runId: current.id, key }
+    );
+  }
+
+  const inputSummary = options.inputSummary !== undefined
+    ? validateEffectSummary(options.inputSummary, { runId: current.id, field: `effects.${key}.inputSummary` })
+    : undefined;
+
+  const effect: WorkflowEffect = {
+    key,
+    kind,
+    status: "started",
+    ...(inputSummary !== undefined ? { inputSummary: Object.freeze(inputSummary as any) } : {}),
+    startedAt: now,
+  };
+
+  const newEffects = {
+    ...(current.effects ?? {}),
+    [key]: Object.freeze(effect),
+  };
+
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "effect_begin",
+    `Started external effect checkpoint: "${key}" (${kind})`,
+    { key, kind, inputSummary: inputSummary as any },
+    now
+  );
+
+  return Object.freeze({
+    ...current,
+    effects: Object.freeze(newEffects),
+    history: newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
+ * Commit an external effect checkpoint, confirming observed execution.
+ */
+export function applyEffectCommit(current: WorkflowRun, options: EffectCommitOptions): WorkflowRun {
+  if (isTerminalLifecycle(current.lifecycle)) {
+    throw new WorkflowInvalidTransitionError(
+      current.id,
+      `Cannot commit effect on run "${current.id}" because it is in terminal state "${current.lifecycle}"`,
+      { fromLifecycle: current.lifecycle, action: "effect_commit" }
+    );
+  }
+
+  const key = validateEffectKey(options.key, { runId: current.id });
+  const now = options.committedAt ?? Date.now();
+
+  const existing = current.effects?.[key];
+  if (!existing) {
+    throw new WorkflowEffectError(
+      `Cannot commit effect "${key}": effect does not exist on run "${current.id}". Call workflow_effect_begin before workflow_effect_commit.`,
+      { runId: current.id, key }
+    );
+  }
+
+  if (existing.status === "committed") {
+    // Idempotent commit: effect already committed
+    return current;
+  }
+
+  const resultSummary = options.resultSummary !== undefined
+    ? validateEffectSummary(options.resultSummary, { runId: current.id, field: `effects.${key}.resultSummary` })
+    : undefined;
+
+  const wasAmbiguous = existing.ambiguous === true;
+
+  const committedEffect: WorkflowEffect = {
+    ...existing,
+    status: "committed",
+    ...(resultSummary !== undefined ? { resultSummary: Object.freeze(resultSummary as any) } : {}),
+    committedAt: now,
+    ambiguous: false,
+  };
+
+  const newEffects = {
+    ...(current.effects ?? {}),
+    [key]: Object.freeze(committedEffect),
+  };
+
+  let newRecoveryEvents = current.recoveryEvents ?? [];
+  if (wasAmbiguous) {
+    const recEvent: WorkflowRecoveryEvent = {
+      eventId: `recov-${randomUUID().slice(0, 8)}`,
+      type: "effect_reconciled",
+      timestamp: now,
+      message: `Ambiguous effect "${key}" (${existing.kind}) confirmed and committed during recovery.`,
+      details: Object.freeze({ key, kind: existing.kind, resultSummary: resultSummary as any }),
+    };
+    newRecoveryEvents = Object.freeze([...newRecoveryEvents, Object.freeze(recEvent)]);
+  }
+
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "effect_commit",
+    `Committed external effect checkpoint: "${key}" (${existing.kind})${wasAmbiguous ? " [recovered]" : ""}`,
+    { key, kind: existing.kind, resultSummary: resultSummary as any, wasAmbiguous: wasAmbiguous as any },
+    now
+  );
+
+  return Object.freeze({
+    ...current,
+    effects: Object.freeze(newEffects),
+    recoveryEvents: newRecoveryEvents,
+    history: newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
+ * Reconcile an interrupted or ambiguous effect checkpoint after inspecting external reality.
+ */
+export function applyEffectReconcile(current: WorkflowRun, options: EffectReconcileOptions): WorkflowRun {
+  if (isTerminalLifecycle(current.lifecycle)) {
+    throw new WorkflowInvalidTransitionError(
+      current.id,
+      `Cannot reconcile effect on run "${current.id}" because it is in terminal state "${current.lifecycle}"`,
+      { fromLifecycle: current.lifecycle, action: "effect_reconcile" }
+    );
+  }
+
+  const key = validateEffectKey(options.key, { runId: current.id });
+  const resolution = validateEffectResolution(options.resolution, { runId: current.id });
+  const now = options.reconciledAt ?? Date.now();
+  const reason = options.reason !== undefined ? validateEffectNote(options.reason, { runId: current.id }) : undefined;
+
+  const existing = current.effects?.[key];
+  if (!existing) {
+    throw new WorkflowEffectError(
+      `Cannot reconcile effect "${key}": effect does not exist on run "${current.id}".`,
+      { runId: current.id, key }
+    );
+  }
+
+  const resultSummary = options.resultSummary !== undefined
+    ? validateEffectSummary(options.resultSummary, { runId: current.id, field: `effects.${key}.resultSummary` })
+    : undefined;
+
+  let updatedEffect: WorkflowEffect;
+  let eventType: "effect_reconciled" | "effect_aborted";
+
+  if (resolution === "committed") {
+    updatedEffect = {
+      ...existing,
+      status: "committed",
+      ...(resultSummary !== undefined ? { resultSummary: Object.freeze(resultSummary as any) } : {}),
+      committedAt: now,
+      reconciledAt: now,
+      ...(reason ? { recoveryNote: reason } : {}),
+      ambiguous: false,
+    };
+    eventType = "effect_reconciled";
+  } else if (resolution === "aborted") {
+    updatedEffect = {
+      ...existing,
+      status: "reconciled",
+      ...(resultSummary !== undefined ? { resultSummary: Object.freeze(resultSummary as any) } : {}),
+      reconciledAt: now,
+      ...(reason ? { recoveryNote: reason } : {}),
+      ambiguous: false,
+    };
+    eventType = "effect_aborted";
+  } else {
+    // resolution === "retryable"
+    updatedEffect = {
+      ...existing,
+      status: "reconciled",
+      ...(resultSummary !== undefined ? { resultSummary: Object.freeze(resultSummary as any) } : {}),
+      reconciledAt: now,
+      recoveryNote: reason ?? "Cleared for retry",
+      ambiguous: false,
+    };
+    eventType = "effect_reconciled";
+  }
+
+  const newEffects = {
+    ...(current.effects ?? {}),
+    [key]: Object.freeze(updatedEffect),
+  };
+
+  const recEvent: WorkflowRecoveryEvent = {
+    eventId: `recov-${randomUUID().slice(0, 8)}`,
+    type: eventType,
+    timestamp: now,
+    message: `Effect "${key}" (${existing.kind}) reconciled as "${resolution}": ${reason ?? "External reality verified."}`,
+    details: Object.freeze({ key, kind: existing.kind, resolution, reason: (reason ?? "") as any }),
+  };
+
+  const newRecoveryEvents = Object.freeze([...(current.recoveryEvents ?? []), Object.freeze(recEvent)]);
+
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "effect_reconcile",
+    `Reconciled effect "${key}" as "${resolution}"${reason ? `: ${reason}` : ""}`,
+    { key, resolution, reason: (reason ?? "") as any },
+    now
+  );
+
+  return Object.freeze({
+    ...current,
+    effects: Object.freeze(newEffects),
+    recoveryEvents: newRecoveryEvents,
+    history: newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
+ * Record an authoritative recovery event on the run.
+ */
+export function applyRecoveryEvent(current: WorkflowRun, options: WorkflowRecoveryEventOptions): WorkflowRun {
+  const now = options.timestamp ?? Date.now();
+  const eventId = options.eventId ?? `recov-${randomUUID().slice(0, 8)}`;
+
+  const event: WorkflowRecoveryEvent = {
+    eventId,
+    type: options.type,
+    timestamp: now,
+    message: options.message,
+    ...(options.details ? { details: Object.freeze({ ...options.details }) } : {}),
+  };
+
+  const newRecoveryEvents = Object.freeze([...(current.recoveryEvents ?? []), Object.freeze(event)]);
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "recovery",
+    `Recovery event [${options.type}]: ${options.message}`,
+    options.details,
+    now
+  );
+
+  return Object.freeze({
+    ...current,
+    recoveryEvents: newRecoveryEvents,
+    history: newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
+ * Acquire or refresh an ownership lease on a workflow run.
+ */
+export function applyAcquireLease(current: WorkflowRun, options: AcquireLeaseOptions): WorkflowRun {
+  const now = options.now ?? Date.now();
+  const ownerId = options.ownerId.trim();
+
+  if (current.lease && current.lease.ownerId !== ownerId) {
+    if (current.lease.expiresAt === undefined || current.lease.expiresAt > now) {
+      throw new WorkflowOwnershipError(
+        `Run "${current.id}" is already leased by owner "${current.lease.ownerId}" until ${
+          current.lease.expiresAt ? new Date(current.lease.expiresAt).toISOString() : "explicit release"
+        }.`,
+        { runId: current.id, currentOwnerId: current.lease.ownerId, requestedOwnerId: ownerId }
+      );
+    }
+  }
+
+  const lease: WorkflowRunLease = {
+    ownerId,
+    acquiredAt: now,
+    expiresAt: options.expiresAt,
+    leaseToken: options.leaseToken,
+  };
+
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "lease_acquire",
+    `Acquired lease for owner "${ownerId}"`,
+    { ownerId, expiresAt: (options.expiresAt ?? null) as any },
+    now
+  );
+
+  return Object.freeze({
+    ...current,
+    lease: Object.freeze(lease),
+    history: newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
+ * Release an ownership lease on a workflow run.
+ */
+export function applyReleaseLease(current: WorkflowRun, ownerId: string): WorkflowRun {
+  const now = Date.now();
+  if (!current.lease || current.lease.ownerId !== ownerId) {
+    return current;
+  }
+
+  const newHistory = appendHistoryEntry(
+    current.history,
+    "lease_release",
+    `Released lease for owner "${ownerId}"`,
+    { ownerId },
+    now
+  );
+
+  return Object.freeze({
+    ...current,
+    lease: undefined,
+    history: newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
   });
 }

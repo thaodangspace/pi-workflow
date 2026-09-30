@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { formatDuration, parseDuration } from "./duration.ts";
 import { buildIterationPrompt } from "./prompt.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
-import { checkRunBudgetExhaustion } from "./run.ts";
+import { checkRunBudgetExhaustion, getAmbiguousEffects, hasAmbiguousEffects } from "./run.ts";
 import {
   type DispatchIterationOptions,
   type IterationBinding,
@@ -425,6 +425,9 @@ export class WorkflowDispatcher {
             verify: snapshot.completion.verify,
           }
         : undefined,
+      effects: run.effects,
+      ambiguousEffects: getAmbiguousEffects(run),
+      inReconciliation: hasAmbiguousEffects(run),
     };
   }
 

@@ -8,6 +8,11 @@ import {
   validateBlockerInfo,
   validateCompletionClaim,
   validateCompletionInfo,
+  validateEffectKey,
+  validateEffectKind,
+  validateEffectNote,
+  validateEffectResolution,
+  validateEffectSummary,
   validateRunData,
   validateRunId,
   validateStepName,
@@ -39,6 +44,11 @@ export const VALID_ACTIONS = new Set<WorkflowRunMutationAction>([
   "cancel",
   "claim",
   "verify",
+  "effect_begin",
+  "effect_commit",
+  "effect_reconcile",
+  "recovery",
+  "lease",
 ]);
 
 export interface CreatePayload {
@@ -322,6 +332,101 @@ function validatePayloadForAction(
         validateVerificationFindings(p, { runId });
         if (p.data !== undefined) {
           validateRunData(p.data, { runId });
+        }
+        break;
+      }
+      case "effect_begin": {
+        if (typeof p.key !== "string" || p.key.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Effect begin mutation requires non-empty string "key"`,
+            runId,
+            entryId,
+          };
+        }
+        if (typeof p.kind !== "string" || p.kind.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Effect begin mutation requires non-empty string "kind"`,
+            runId,
+            entryId,
+          };
+        }
+        validateEffectKey(p.key, { runId });
+        validateEffectKind(p.kind, { runId });
+        if (p.inputSummary !== undefined) {
+          validateEffectSummary(p.inputSummary, { runId, field: "inputSummary" });
+        }
+        break;
+      }
+      case "effect_commit": {
+        if (typeof p.key !== "string" || p.key.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Effect commit mutation requires non-empty string "key"`,
+            runId,
+            entryId,
+          };
+        }
+        validateEffectKey(p.key, { runId });
+        if (p.resultSummary !== undefined) {
+          validateEffectSummary(p.resultSummary, { runId, field: "resultSummary" });
+        }
+        break;
+      }
+      case "effect_reconcile": {
+        if (typeof p.key !== "string" || p.key.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Effect reconcile mutation requires non-empty string "key"`,
+            runId,
+            entryId,
+          };
+        }
+        if (typeof p.resolution !== "string" || p.resolution.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Effect reconcile mutation requires string "resolution"`,
+            runId,
+            entryId,
+          };
+        }
+        validateEffectKey(p.key, { runId });
+        validateEffectResolution(p.resolution, { runId });
+        if (p.resultSummary !== undefined) {
+          validateEffectSummary(p.resultSummary, { runId, field: "resultSummary" });
+        }
+        if (p.reason !== undefined && typeof p.reason === "string") {
+          validateEffectNote(p.reason, { runId });
+        }
+        break;
+      }
+      case "recovery": {
+        if (typeof p.message !== "string" || p.message.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Recovery mutation requires non-empty string "message"`,
+            runId,
+            entryId,
+          };
+        }
+        break;
+      }
+      case "lease": {
+        if (typeof p.ownerId !== "string" || p.ownerId.trim() === "") {
+          return {
+            type: "error",
+            code: "INVALID_PAYLOAD",
+            message: `Lease mutation requires non-empty string "ownerId"`,
+            runId,
+            entryId,
+          };
         }
         break;
       }

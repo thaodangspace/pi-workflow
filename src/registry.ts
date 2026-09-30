@@ -3,14 +3,21 @@
  * Manages run lifecycles, concurrency policies, JSON bounds, and append-only session persistence.
  */
 
+import { randomUUID } from "node:crypto";
 import { WORKFLOW_RUN_ENTRY_TYPE } from "./constants.ts";
 import { validateRunId } from "./data-bounds.ts";
 import {
+  applyAcquireLease,
   applyBlockRun,
   applyCancelRun,
   applyClaimCompletion,
   applyCompleteRun,
+  applyEffectBegin,
+  applyEffectCommit,
+  applyEffectReconcile,
   applyPauseRun,
+  applyRecoveryEvent,
+  applyReleaseLease,
   applyResumeRun,
   applyRunUpdate,
   applyStepTransition,
@@ -24,11 +31,15 @@ import {
 } from "./session-entries.ts";
 import { createWorkflowSnapshot, isWorkflowSnapshot } from "./snapshot.ts";
 import {
+  type AcquireLeaseOptions,
   type BlockRunOptions,
   type CancelRunOptions,
   type ClaimCompletionOptions,
   type CompleteRunOptions,
   type CreateRunOptions,
+  type EffectBeginOptions,
+  type EffectCommitOptions,
+  type EffectReconcileOptions,
   type PauseRunOptions,
   type ReconstructOptions,
   type ResumeRunOptions,
@@ -39,9 +50,12 @@ import {
   type WorkflowDefinitionV1,
   WorkflowInvalidTransitionError,
   WorkflowPersistenceError,
+  type WorkflowRecoveryEvent,
+  type WorkflowRecoveryEventOptions,
   type WorkflowRun,
   WorkflowRunError,
   type WorkflowRunDiagnostic,
+  type WorkflowRunHistoryEntry,
   type WorkflowRunLifecycle,
   WorkflowRunNotFoundError,
   type WorkflowSessionTarget,
@@ -349,6 +363,139 @@ export class WorkflowRunRegistry {
   }
 
   /**
+   * Begin an external effect checkpoint on an active run.
+   */
+  beginEffect(runId: string, options: EffectBeginOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyEffectBegin(current, options);
+
+    if (updated === current) {
+      return updated;
+    }
+
+    const entryData = buildMutationEntryData("effect_begin", runId, updated.workflow, {
+      key: options.key,
+      kind: options.kind,
+      inputSummary: options.inputSummary,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Commit an external effect checkpoint after observed execution.
+   */
+  commitEffect(runId: string, options: EffectCommitOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyEffectCommit(current, options);
+
+    if (updated === current) {
+      return updated;
+    }
+
+    const entryData = buildMutationEntryData("effect_commit", runId, updated.workflow, {
+      key: options.key,
+      resultSummary: options.resultSummary,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Reconcile an interrupted or ambiguous effect checkpoint.
+   */
+  reconcileEffect(runId: string, options: EffectReconcileOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyEffectReconcile(current, options);
+
+    const entryData = buildMutationEntryData("effect_reconcile", runId, updated.workflow, {
+      key: options.key,
+      resolution: options.resolution,
+      reason: options.reason,
+      resultSummary: options.resultSummary,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Record an authoritative recovery event on a run.
+   */
+  recordRecoveryEvent(runId: string, options: WorkflowRecoveryEventOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyRecoveryEvent(current, options);
+
+    const entryData = buildMutationEntryData("recovery", runId, updated.workflow, {
+      type: options.type,
+      message: options.message,
+      details: options.details,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Acquire or renew an ownership lease on a run.
+   */
+  acquireLease(runId: string, options: AcquireLeaseOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyAcquireLease(current, options);
+
+    const entryData = buildMutationEntryData("lease", runId, updated.workflow, {
+      ownerId: options.ownerId,
+      expiresAt: options.expiresAt,
+      leaseToken: options.leaseToken,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Release an ownership lease on a run.
+   */
+  releaseLease(runId: string, ownerId: string): WorkflowRun {
+    const current = this.requireRun(runId);
+    const updated = applyReleaseLease(current, ownerId);
+
+    if (updated === current) {
+      return updated;
+    }
+
+    const entryData = buildMutationEntryData("update", runId, updated.workflow, {
+      lease: null,
+    }, { timestamp: updated.updatedAt });
+
+    this.persistEntry(entryData);
+    this.runs.set(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Get chronological history of mutations and lifecycle actions for a run.
+   */
+  getRunHistory(runId: string): ReadonlyArray<WorkflowRunHistoryEntry> {
+    return this.requireRun(runId).history ?? [];
+  }
+
+  /**
+   * Get chronological recovery events for a run.
+   */
+  getRunRecoveryEvents(runId: string): ReadonlyArray<WorkflowRecoveryEvent> {
+    return this.requireRun(runId).recoveryEvents ?? [];
+  }
+
+
+  /**
    * Lookup a run by ID.
    */
   getRun(runId: string): WorkflowRun | undefined {
@@ -592,6 +739,47 @@ export class WorkflowRunRegistry {
                 cancelledAt: timestamp,
               });
               break;
+            case "effect_begin":
+              updated = applyEffectBegin(current, {
+                key: p.key,
+                kind: p.kind,
+                inputSummary: p.inputSummary,
+                startedAt: timestamp,
+                allowCommitted: true,
+              });
+              break;
+            case "effect_commit":
+              updated = applyEffectCommit(current, {
+                key: p.key,
+                resultSummary: p.resultSummary,
+                committedAt: timestamp,
+              });
+              break;
+            case "effect_reconcile":
+              updated = applyEffectReconcile(current, {
+                key: p.key,
+                resolution: p.resolution,
+                reason: p.reason,
+                resultSummary: p.resultSummary,
+                reconciledAt: timestamp,
+              });
+              break;
+            case "recovery":
+              updated = applyRecoveryEvent(current, {
+                type: p.type,
+                message: p.message,
+                details: p.details,
+                timestamp,
+              });
+              break;
+            case "lease":
+              updated = applyAcquireLease(current, {
+                ownerId: p.ownerId,
+                expiresAt: p.expiresAt,
+                leaseToken: p.leaseToken,
+                now: timestamp,
+              });
+              break;
             default:
               continue;
           }
@@ -610,6 +798,47 @@ export class WorkflowRunRegistry {
         });
         if (options.strict) {
           throw err;
+        }
+      }
+    }
+
+    // Post-replay reconciliation pass:
+    // Identify any uncommitted effects that were in "started" state when session reloaded.
+    // In accordance with recovery model: started effects after interruption are ambiguous, never auto-retried.
+    for (const [runId, run] of newRuns.entries()) {
+      if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+        if (run.effects) {
+          let hasAmbiguous = false;
+          const updatedEffects = { ...run.effects };
+          let updatedRecovery = run.recoveryEvents ? [...run.recoveryEvents] : [];
+
+          for (const [key, effect] of Object.entries(run.effects)) {
+            if (effect.status === "started" && !effect.ambiguous) {
+              hasAmbiguous = true;
+              updatedEffects[key] = Object.freeze({
+                ...effect,
+                ambiguous: true,
+              });
+              const eventId = `recov-${runId}-${key}`;
+              const recEvent: WorkflowRecoveryEvent = Object.freeze({
+                eventId,
+                type: "effect_ambiguous",
+                timestamp: effect.startedAt,
+                message: `Effect "${effect.key}" (${effect.kind}) was in started state when session reloaded. State is ambiguous; reconciliation required before new side effects.`,
+                details: Object.freeze({ key: effect.key, kind: effect.kind }),
+              });
+              updatedRecovery.push(recEvent);
+            }
+          }
+
+          if (hasAmbiguous) {
+            const updatedRun: WorkflowRun = Object.freeze({
+              ...run,
+              effects: Object.freeze(updatedEffects),
+              recoveryEvents: Object.freeze(updatedRecovery),
+            });
+            newRuns.set(runId, updatedRun);
+          }
         }
       }
     }

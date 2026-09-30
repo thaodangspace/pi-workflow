@@ -8,6 +8,10 @@ import {
   MAX_DATA_DEPTH,
   MAX_DATA_KEY_LENGTH,
   MAX_DATA_STRING_LENGTH,
+  MAX_EFFECT_KEY_LENGTH,
+  MAX_EFFECT_KIND_LENGTH,
+  MAX_EFFECT_NOTE_LENGTH,
+  MAX_EFFECTS_PER_RUN,
   MAX_EVIDENCE_ITEMS,
   MAX_RUN_DATA_BYTES,
   MAX_RUN_ID_LENGTH,
@@ -582,6 +586,131 @@ export function validateRunId(id: string): string {
     throw new WorkflowDataBoundsError(
       `Run ID "${trimmed}" contains invalid characters. Must start with alphanumeric and only contain [a-zA-Z0-9._-]`,
       { field: "id" }
+    );
+  }
+
+  return trimmed;
+}
+
+/**
+ * Validates an effect key.
+ */
+export function validateEffectKey(key: string, options: { runId?: string } = {}): string {
+  const runId = options.runId;
+
+  if (typeof key !== "string" || key.trim() === "") {
+    throw new WorkflowDataBoundsError(
+      `Effect key must be a non-empty string`,
+      { runId, field: "effect.key" }
+    );
+  }
+
+  const trimmed = key.trim();
+  if (trimmed.length > MAX_EFFECT_KEY_LENGTH) {
+    throw new WorkflowDataBoundsError(
+      `Effect key length (${trimmed.length}) exceeds maximum allowed of ${MAX_EFFECT_KEY_LENGTH}`,
+      { runId, field: "effect.key", limit: MAX_EFFECT_KEY_LENGTH, actual: trimmed.length }
+    );
+  }
+
+  if (/[\x00-\x1f\x7f]/.test(trimmed)) {
+    throw new WorkflowDataBoundsError(
+      `Effect key contains invalid control characters`,
+      { runId, field: "effect.key" }
+    );
+  }
+
+  return trimmed;
+}
+
+/**
+ * Validates an effect kind.
+ */
+export function validateEffectKind(kind: string, options: { runId?: string } = {}): string {
+  const runId = options.runId;
+
+  if (typeof kind !== "string" || kind.trim() === "") {
+    throw new WorkflowDataBoundsError(
+      `Effect kind must be a non-empty string`,
+      { runId, field: "effect.kind" }
+    );
+  }
+
+  const trimmed = kind.trim();
+  if (trimmed.length > MAX_EFFECT_KIND_LENGTH) {
+    throw new WorkflowDataBoundsError(
+      `Effect kind length (${trimmed.length}) exceeds maximum allowed of ${MAX_EFFECT_KIND_LENGTH}`,
+      { runId, field: "effect.kind", limit: MAX_EFFECT_KIND_LENGTH, actual: trimmed.length }
+    );
+  }
+
+  if (/[\x00-\x1f\x7f]/.test(trimmed)) {
+    throw new WorkflowDataBoundsError(
+      `Effect kind contains invalid control characters`,
+      { runId, field: "effect.kind" }
+    );
+  }
+
+  return trimmed;
+}
+
+/**
+ * Validates an effect input or result summary JSON payload.
+ */
+export function validateEffectSummary(
+  summary: unknown,
+  options: { runId?: string; field?: string } = {}
+): JsonValue {
+  const runId = options.runId;
+  const field = options.field ?? "effect.summary";
+
+  if (summary === undefined || summary === null) {
+    return null;
+  }
+
+  return validateJsonValue(summary, {
+    maxDepth: MAX_DATA_DEPTH,
+    maxStringLength: MAX_DATA_STRING_LENGTH,
+    maxKeyLength: MAX_DATA_KEY_LENGTH,
+    runId,
+    fieldPath: field,
+  });
+}
+
+/**
+ * Validates an effect reconciliation resolution decision.
+ */
+export function validateEffectResolution(
+  resolution: string,
+  options: { runId?: string } = {}
+): "committed" | "aborted" | "retryable" {
+  const runId = options.runId;
+
+  if (resolution !== "committed" && resolution !== "aborted" && resolution !== "retryable") {
+    throw new WorkflowDataBoundsError(
+      `Effect resolution must be "committed", "aborted", or "retryable" (got "${String(resolution)}")`,
+      { runId, field: "effect.resolution" }
+    );
+  }
+
+  return resolution;
+}
+
+/**
+ * Validates an effect recovery note or reason string.
+ */
+export function validateEffectNote(note: string, options: { runId?: string } = {}): string {
+  const runId = options.runId;
+
+  if (typeof note !== "string") {
+    throw new WorkflowDataBoundsError(`Effect note must be a string`, { runId, field: "effect.note" });
+  }
+
+  const trimmed = note.trim();
+  if (trimmed.length > MAX_EFFECT_NOTE_LENGTH) {
+    throw new WorkflowDataBoundsError(
+      `Effect note length (${trimmed.length}) exceeds maximum allowed of ${MAX_EFFECT_NOTE_LENGTH}`,
+      { runId, field: "effect.note", limit: MAX_EFFECT_NOTE_LENGTH, actual: trimmed.length }
     );
   }
 

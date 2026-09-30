@@ -266,6 +266,82 @@ export interface WorkflowCompletionInfo {
   completedAt: number;
 }
 
+/** Status of an external effect checkpoint */
+export type WorkflowEffectStatus = "started" | "committed" | "reconciled";
+
+/**
+ * Durable record of an external side effect checkpoint.
+ */
+export interface WorkflowEffect {
+  /** Unique effect key within the workflow run */
+  readonly key: string;
+  /** Category or kind of side effect (e.g. github.pull_request.create) */
+  readonly kind: string;
+  /** Status of effect checkpoint */
+  readonly status: WorkflowEffectStatus;
+  /** Bounded JSON-safe summary of effect inputs/intent */
+  readonly inputSummary?: Readonly<Record<string, JsonValue>> | JsonValue;
+  /** Bounded JSON-safe summary of observed outcome/result */
+  readonly resultSummary?: Readonly<Record<string, JsonValue>> | JsonValue;
+  /** Timestamp when effect was begun (epoch ms) */
+  readonly startedAt: number;
+  /** Timestamp when effect was committed (epoch ms) */
+  readonly committedAt?: number;
+  /** Timestamp when effect was reconciled (epoch ms) */
+  readonly reconciledAt?: number;
+  /** Explanation of reconciliation observation or decision */
+  readonly recoveryNote?: string;
+  /** Whether the effect is ambiguous (started before interruption, uncommitted upon recovery) */
+  readonly ambiguous?: boolean;
+}
+
+/** Types of recovery events recorded in durable run history */
+export type WorkflowRecoveryEventType =
+  | "effect_ambiguous"
+  | "effect_reconciled"
+  | "effect_aborted"
+  | "scheduler_reconnected"
+  | "scheduler_recreated"
+  | "scheduler_cleaned"
+  | "scheduler_ambiguous"
+  | "run_reconciled";
+
+/**
+ * Durable record of a recovery or reconciliation event in run history.
+ */
+export interface WorkflowRecoveryEvent {
+  readonly eventId: string;
+  readonly type: WorkflowRecoveryEventType;
+  readonly timestamp: number;
+  readonly message: string;
+  readonly details?: Readonly<Record<string, JsonValue>>;
+}
+
+/**
+ * Chronological history entry for auditability of run mutations and events.
+ */
+export interface WorkflowRunHistoryEntry {
+  readonly eventId: string;
+  readonly action: string;
+  readonly timestamp: number;
+  readonly summary: string;
+  readonly details?: Readonly<Record<string, JsonValue>>;
+}
+
+/**
+ * Ownership lease metadata preventing duplicate workflow runners on the same run.
+ */
+export interface WorkflowRunLease {
+  /** Unique owner / runner instance identifier */
+  readonly ownerId: string;
+  /** Timestamp when lease was acquired (epoch ms) */
+  readonly acquiredAt: number;
+  /** Optional expiry timestamp (epoch ms) */
+  readonly expiresAt?: number;
+  /** Optional lease token / nonce */
+  readonly leaseToken?: string;
+}
+
 /**
  * Concrete, durable workflow execution record.
  */
@@ -318,6 +394,15 @@ export interface WorkflowRun {
   readonly verificationAttempts?: number;
   /** Details if the run has transitioned to "completed" state */
   readonly completion?: Readonly<WorkflowCompletionInfo>;
+
+  /** Recorded external effect checkpoints keyed by effect key */
+  readonly effects?: Readonly<Record<string, WorkflowEffect>>;
+  /** Chronological record of recovery and reconciliation events */
+  readonly recoveryEvents?: ReadonlyArray<WorkflowRecoveryEvent>;
+  /** Audit history of lifecycle mutations and actions */
+  readonly history?: ReadonlyArray<WorkflowRunHistoryEntry>;
+  /** Active ownership lease if claimed */
+  readonly lease?: Readonly<WorkflowRunLease>;
 }
 
 /** Mutation actions for append-only session entries */
@@ -331,7 +416,12 @@ export type WorkflowRunMutationAction =
   | "complete"
   | "cancel"
   | "claim"
-  | "verify";
+  | "verify"
+  | "effect_begin"
+  | "effect_commit"
+  | "effect_reconcile"
+  | "recovery"
+  | "lease";
 
 /** Persisted CustomEntry data payload in Pi session */
 export interface WorkflowRunMutationEntryData {
@@ -511,6 +601,65 @@ export interface CancelRunOptions {
   cancelledAt?: number;
 }
 
+export interface EffectBeginOptions {
+  /** Unique key identifying the effect within the run */
+  key: string;
+  /** Category or kind of side effect (e.g. github.pull_request.create) */
+  kind: string;
+  /** Bounded JSON-safe summary of effect inputs/intent */
+  inputSummary?: Record<string, JsonValue> | JsonValue;
+  /** Optional start timestamp */
+  startedAt?: number;
+  /** Whether to return the existing record if already committed instead of throwing */
+  allowCommitted?: boolean;
+}
+
+export interface EffectCommitOptions {
+  /** Unique key identifying the effect within the run */
+  key: string;
+  /** Bounded JSON-safe summary of observed outcome/result */
+  resultSummary?: Record<string, JsonValue> | JsonValue;
+  /** Optional commit timestamp */
+  committedAt?: number;
+}
+
+export interface EffectReconcileOptions {
+  /** Unique key identifying the effect within the run */
+  key: string;
+  /** Reconciliation outcome */
+  resolution: "committed" | "aborted" | "retryable";
+  /** Bounded JSON-safe summary of observed outcome/result */
+  resultSummary?: Record<string, JsonValue> | JsonValue;
+  /** Explanation of external observation and resolution */
+  reason?: string;
+  /** Optional reconciliation timestamp */
+  reconciledAt?: number;
+}
+
+export interface WorkflowRecoveryEventOptions {
+  /** Type of recovery event */
+  type: WorkflowRecoveryEventType;
+  /** Human-readable description of the recovery event */
+  message: string;
+  /** Optional JSON-safe structured metadata */
+  details?: Record<string, JsonValue>;
+  /** Optional timestamp */
+  timestamp?: number;
+  /** Optional event identifier */
+  eventId?: string;
+}
+
+export interface AcquireLeaseOptions {
+  /** Owner / runner instance identifier */
+  ownerId: string;
+  /** Optional expiration timestamp (epoch ms) */
+  expiresAt?: number;
+  /** Optional lease token / nonce */
+  leaseToken?: string;
+  /** Optional current timestamp */
+  now?: number;
+}
+
 export interface ReconstructOptions {
   /** If true, throws on first malformed entry rather than collecting diagnostics */
   strict?: boolean;
@@ -663,6 +812,56 @@ export class WorkflowVerificationError extends WorkflowRunError {
   }
 }
 
+export class WorkflowEffectError extends WorkflowRunError {
+  readonly key?: string;
+  readonly effectKind?: string;
+
+  constructor(message: string, options?: { runId?: string; key?: string; effectKind?: string }) {
+    super(message, options?.runId);
+    this.name = "WorkflowEffectError";
+    this.key = options?.key;
+    this.effectKind = options?.effectKind;
+  }
+}
+
+export class WorkflowEffectAlreadyCommittedError extends WorkflowEffectError {
+  readonly effect?: WorkflowEffect;
+
+  constructor(key: string, runId?: string, effect?: WorkflowEffect) {
+    super(
+      `Effect "${key}" on run "${runId ?? "unknown"}" was already committed and cannot be executed again under the same key.`,
+      { runId, key, effectKind: effect?.kind }
+    );
+    this.name = "WorkflowEffectAlreadyCommittedError";
+    this.effect = effect;
+  }
+}
+
+export class WorkflowAmbiguousEffectError extends WorkflowEffectError {
+  readonly ambiguousKey?: string;
+
+  constructor(message: string, options?: { runId?: string; ambiguousKey?: string; key?: string }) {
+    super(message, { runId: options?.runId, key: options?.key });
+    this.name = "WorkflowAmbiguousEffectError";
+    this.ambiguousKey = options?.ambiguousKey;
+  }
+}
+
+export class WorkflowOwnershipError extends WorkflowRunError {
+  readonly currentOwnerId?: string;
+  readonly requestedOwnerId?: string;
+
+  constructor(
+    message: string,
+    options?: { runId?: string; currentOwnerId?: string; requestedOwnerId?: string }
+  ) {
+    super(message, options?.runId);
+    this.name = "WorkflowOwnershipError";
+    this.currentOwnerId = options?.currentOwnerId;
+    this.requestedOwnerId = options?.requestedOwnerId;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Workflow Iteration Context & Dispatcher Types (Issue #3)
 // ---------------------------------------------------------------------------
@@ -775,6 +974,12 @@ export interface WorkflowIterationContext {
     requireEvidence?: boolean;
     verify?: boolean;
   };
+  /** Recorded external effect checkpoints */
+  effects?: Readonly<Record<string, WorkflowEffect>>;
+  /** Interrupted uncommitted effects requiring recovery reconciliation */
+  ambiguousEffects?: ReadonlyArray<WorkflowEffect>;
+  /** Whether the run is currently in recovery reconciliation mode */
+  inReconciliation?: boolean;
 }
 
 /** Options for resolving a wakeup delay */

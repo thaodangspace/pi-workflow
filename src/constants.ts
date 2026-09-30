@@ -91,3 +91,15 @@ export const MAX_VERIFICATION_ATTEMPTS_DEFAULT = 3;
 
 /** Default conservative retry delay for external-retryable blockers (15 minutes) */
 export const DEFAULT_RETRYABLE_BLOCKER_DELAY_MS = 15 * 60 * 1000;
+
+/** Maximum character length for an effect key */
+export const MAX_EFFECT_KEY_LENGTH = 128;
+
+/** Maximum character length for an effect kind */
+export const MAX_EFFECT_KIND_LENGTH = 128;
+
+/** Maximum character length for an effect recovery note or reason */
+export const MAX_EFFECT_NOTE_LENGTH = 4096;
+
+/** Maximum number of effects stored on a single run */
+export const MAX_EFFECTS_PER_RUN = 1000;

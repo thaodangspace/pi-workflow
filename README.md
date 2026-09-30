@@ -242,6 +242,9 @@ When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral i
 | `workflow_block` | Moves run to `blocked` lifecycle with reason, records `requiresHuman` flag, and cancels pending wakeups. | `{ reason: string, requiresHuman?: boolean, data?: object }` |
 | `workflow_complete` | Submits completion summary and evidence. Triggers verification gate (`VERIFYING` step) if policy specifies `verify: true`. During verification, accepts or rejects claim. | `{ summary?: string, decision?: "accept" \| "reject", findings?: string, checks?: object[], returnStep?: string, evidence?: object[], data?: object }` |
 | `workflow_verify` | Evaluates a completion claim during verification, accepting to complete or rejecting with findings to return for rework or block. | `{ decision: "accept" \| "reject", findings?: string, checks?: object[], returnStep?: string, data?: object }` |
+| `workflow_effect_begin` | Establishes an idempotent checkpoint before executing an external side effect (e.g. creating PR, issue, or deployment). | `{ key: string, kind: string, inputSummary?: object }` |
+| `workflow_effect_commit` | Confirms and commits an external side effect after observing its success, preventing accidental re-execution. | `{ key: string, resultSummary?: object }` |
+| `workflow_effect_reconcile` | Reconciles an interrupted or ambiguous effect checkpoint after inspecting external reality. | `{ key: string, resolution: "committed" \| "aborted" \| "retryable", reason: string, resultSummary?: object }` |
 
 ### Safety & Ownership Rules
 
@@ -364,6 +367,77 @@ When a session restarts or navigates history (`session_tree`):
 
 - If `pi-loop` is unavailable or times out during discovery, workflow scheduling fails clearly with `WorkflowSchedulerUnavailableError`. Pi does not crash, and no local fallback timers are spawned.
 - If the bound session generation is invalidated, calls fail closed with `WorkflowSchedulerUnavailableError`.
+
+---
+
+## Crash-Safe Recovery, Reconciliation, and Effect Checkpoints
+
+Long-running agent workflows must assume the host process, machine, or session can crash or reload between durable state transitions and external side effects. `pi-workflow` implements a multi-layer crash-safe recovery and idempotency architecture:
+
+### 1. Recovery Model & State Distinction
+
+On session startup or history reconstruction (`session_start`, `session_tree`), the engine distinguishes four distinct layers:
+1. **Durable Workflow State**: Reconstructed strictly from append-only custom entries on the active session branch (`WorkflowRunRegistry.reconstructFromSession()`).
+2. **Authoritative Scheduler State**: Linked task status queried from the `pi-loop` service (`LoopSchedulerAdapter.reconcile()`).
+3. **Declared External-Effect Intent**: Checkpoints established before attempting real-world side effects (`workflow_effect_begin`).
+4. **Observed/Confirmed External Reality**: Confirmed results observed after the side effect (`workflow_effect_commit` or `workflow_effect_reconcile`).
+
+Recovery always prefers **observed external reality** over stale assumptions and **fails closed** when ownership or state is ambiguous.
+
+### 2. Idempotent Effect Checkpoints
+
+Workflows record external side effects (such as creating GitHub pull requests, posting Slack notifications, or provisioning cloud infrastructure) using an explicit begin-commit lifecycle:
+
+```text
+workflow_effect_begin({
+  key: "create-pr",
+  kind: "github.pull_request.create",
+  inputSummary: { title: "feat: auth", head: "feature", base: "main" }
+})
+
+// <perform external side effect>
+
+workflow_effect_commit({
+  key: "create-pr",
+  resultSummary: { prNumber: 42, url: "https://github.com/org/repo/pull/42" }
+})
+```
+
+- **Per-Run Key Uniqueness**: Effect keys are unique within a logical run.
+- **Durable Pre-Intent**: `workflow_effect_begin` is persisted to session storage before the side effect executes.
+- **Durable Confirmation**: `workflow_effect_commit` is persisted after the side effect succeeds.
+- **Duplicate Prevention**: A committed effect cannot be repeated under the same key. Replaying `begin` returns the committed record with `{ status: "already_committed" }` and blocks duplicate execution.
+- **Ambiguous Interruption Detection**: An effect left in `started` state after a session reload or crash is marked **ambiguous**, never automatically retried.
+
+### 3. Recovery Prompt & Reconciliation Pass
+
+When a run resumes with an ambiguous effect:
+- The engine dispatches a specialized **Recovery & Reconciliation Prompt** rather than an ordinary step prompt.
+- Standard step transitions (`workflow_transition`) and completion (`workflow_complete`) fail closed with `WorkflowAmbiguousEffectError`.
+- The prompt instructs the agent to inspect the external system first:
+  1. If the external resource exists in reality: confirm and commit it using `workflow_effect_commit({ key, resultSummary })`.
+  2. If the external resource was not created or failed: reconcile or clear it using `workflow_effect_reconcile({ key, resolution: "aborted" | "retryable", reason })`.
+  3. If external reality cannot be verified: block execution using `workflow_block({ reason, category: "human-required", requiresHuman: true })`.
+
+### 4. Deterministic Scheduler Reconciliation
+
+During `adapter.reconcile()`:
+- **Terminal Task Cleanup**: Completed or cancelled runs cannot retain live scheduler tasks; any remaining tasks are deleted.
+- **Orphan Pruning**: Tasks in `pi-loop` belonging to missing or deleted workflow runs are safely pruned, while ordinary non-workflow tasks (e.g. user `/loop`) are strictly preserved.
+- **Missing Task Recreation**: Active runs with missing scheduler tasks (e.g. ephemeral self-paced tasks dropped across reload) are recreated according to policy (`recreateMissing: true`). When recreation is disabled, runs are blocked with `human-required`.
+- **Ambiguous Mapping Detection**: If multiple scheduler tasks map to the same run ID, or a task maps to the wrong run, the engine fails closed: conflicting tasks are stopped, and the run is blocked with a human-required blocker to prevent duplicate execution.
+
+### 5. Work Ownership & Lease Metadata
+
+Durable lease metadata (`run.lease`) records owner identity and expiration timestamps. Duplicate workflow instances cannot both believe they own the same logical run:
+- Acquiring an active lease by another owner fails closed with `WorkflowOwnershipError`.
+- Generic claim tokens (`getEffectClaimToken(runId, effectKey)`) provide stable identifiers for external resource tagging and branching.
+
+### 6. Durable History & Visibility
+
+All recovery events (such as `effect_ambiguous`, `effect_reconciled`, `scheduler_reconnected`, `scheduler_recreated`, `scheduler_cleaned`, `scheduler_ambiguous`) are recorded in chronological run history:
+- Accessible programmatically via `registry.getRunHistory(runId)` and `registry.getRunRecoveryEvents(runId)`.
+- Visible to operators in `/workflow status <run-id>` with explicit warnings when reconciliation is required.
 
 
 ### Deterministic Prompt Construction

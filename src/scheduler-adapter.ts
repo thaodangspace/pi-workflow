@@ -855,10 +855,107 @@ export class LoopSchedulerAdapter {
     const taskMap = new Map(tasks.map((t) => [t.id, t]));
     const claimedTaskIds = new Set<string>();
 
-    // 1. Reconcile nonterminal runs from registry
+    // Index tasks by prompt runId to detect ambiguous / duplicate mappings
+    const tasksByRunId = new Map<string, LoopTaskSummary[]>();
+    for (const task of tasks) {
+      const promptRunId = extractWorkflowRunId(task.prompt);
+      if (promptRunId) {
+        const list = tasksByRunId.get(promptRunId) ?? [];
+        list.push(task);
+        tasksByRunId.set(promptRunId, list);
+      }
+    }
+
+    // 1. Reconcile terminal runs: terminal runs must NOT retain live scheduler tasks
+    const allRuns = this.registry.listRuns();
+    for (const run of allRuns) {
+      if (isTerminalLifecycle(run.lifecycle)) {
+        const taskList = tasksByRunId.get(run.id) ?? [];
+        const existingTaskId = run.loopTaskId;
+        if (existingTaskId && taskMap.has(existingTaskId) && !taskList.some((t) => t.id === existingTaskId)) {
+          taskList.push(taskMap.get(existingTaskId)!);
+        }
+
+        for (const t of taskList) {
+          let stopped = false;
+          try {
+            stopped = this.service.deleteTask(t.id);
+          } catch (err) {
+            result.diagnostics.push({
+              type: "warning",
+              code: "terminal-task-stop-failed",
+              message: `Failed to stop task "${t.id}" for terminal run "${run.id}": ${err instanceof Error ? err.message : String(err)}`,
+            });
+          }
+          this.runToTaskMap.delete(run.id);
+          this.taskToRunMap.delete(t.id);
+          claimedTaskIds.add(t.id);
+          result.orphans.push({ taskId: t.id, runId: run.id, stopped });
+        }
+      }
+    }
+
+    // 2. Reconcile nonterminal runs from registry
     const nonterminalRuns = this.registry.getNonterminalRuns();
     for (const run of nonterminalRuns) {
       const existingTaskId = run.loopTaskId;
+      const matchingTasks = tasksByRunId.get(run.id) ?? [];
+
+      // Check for ambiguous mapping: multiple tasks claiming the same run ID
+      if (matchingTasks.length > 1) {
+        const reason = `Ambiguous scheduler task mapping: multiple live tasks [${matchingTasks.map((t) => t.id).join(", ")}] found for run "${run.id}". Blocked to prevent duplicate execution.`;
+        if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+          this.registry.blockRun(run.id, {
+            reason,
+            category: "human-required",
+            requiresHuman: true,
+          });
+          result.blocked.push({ runId: run.id, reason });
+        }
+        for (const t of matchingTasks) {
+          try {
+            this.service.deleteTask(t.id);
+          } catch {
+            // ignore
+          }
+          claimedTaskIds.add(t.id);
+        }
+        this.runToTaskMap.delete(run.id);
+        if (existingTaskId) this.taskToRunMap.delete(existingTaskId);
+        try {
+          this.registry.recordRecoveryEvent(run.id, {
+            type: "scheduler_ambiguous",
+            message: reason,
+            details: { taskIds: matchingTasks.map((t) => t.id) as any },
+          });
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+
+      // Check for mismatched linkage: run.loopTaskId points to a task belonging to a different run
+      if (existingTaskId && taskMap.has(existingTaskId)) {
+        const declaredRunId = extractWorkflowRunId(taskMap.get(existingTaskId)!.prompt);
+        if (declaredRunId && declaredRunId !== run.id) {
+          const reason = `Ambiguous scheduler task mapping: task "${existingTaskId}" belongs to run "${declaredRunId}", but run "${run.id}" links to it.`;
+          if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+            this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
+            result.blocked.push({ runId: run.id, reason });
+          }
+          this.runToTaskMap.delete(run.id);
+          this.taskToRunMap.delete(existingTaskId);
+          try {
+            this.registry.recordRecoveryEvent(run.id, {
+              type: "scheduler_ambiguous",
+              message: reason,
+            });
+          } catch {
+            // ignore
+          }
+          continue;
+        }
+      }
 
       // Check hard budget exhaustion
       const exhaustion = checkRunBudgetExhaustion(run);
@@ -946,6 +1043,15 @@ export class LoopSchedulerAdapter {
               oldTaskId: existingTaskId,
               newTaskId: newTask.id,
             });
+            try {
+              this.registry.recordRecoveryEvent(run.id, {
+                type: "scheduler_recreated",
+                message: `Recreated missing scheduler task for active run "${run.id}".`,
+                details: { oldTaskId: (existingTaskId ?? null) as any, newTaskId: newTask.id as any },
+              });
+            } catch {
+              // ignore
+            }
           } catch (err) {
             const reason = `Failed to recreate missing scheduler task: ${err instanceof Error ? err.message : String(err)}`;
             this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
@@ -970,6 +1076,7 @@ export class LoopSchedulerAdapter {
         }
       }
     }
+
 
     // 2. Identify orphan workflow tasks in pi-loop
     for (const task of tasks) {
