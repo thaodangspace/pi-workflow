@@ -171,6 +171,68 @@ describe("Iteration Exclusivity, Stale Late Calls, and Lifecycle Boundaries", ()
     assert.deepEqual(currentB.data, { b: 2 });
   });
 
+  it("prevents tool call from turn A starting after run B is bound from mutating run B when turn signal is provided", async () => {
+    const { registry, dispatcher, transitionTool, runA, runB } = setup();
+
+    const acA = new AbortController();
+    const acB = new AbortController();
+
+    // 1. Iteration A starts with turn A signal
+    dispatcher.beginIteration(runA.id, { signal: acA.signal, incrementTurns: false });
+
+    // 2. Before tool executes, Iteration B binds with turn B signal
+    dispatcher.beginIteration(runB.id, { signal: acB.signal, incrementTurns: false });
+
+    // 3. Tool call that originated in turn A now enters execute() passing turn A's signal
+    await assert.rejects(
+      async () => {
+        await transitionTool.execute(
+          "call-late-start",
+          { toStep: "MUTATE_STEP", data: { from: "turnA" } },
+          acA.signal,
+          undefined,
+          {} as any
+        );
+      },
+      (err: any) => {
+        assert(err instanceof WorkflowStaleIterationError);
+        assert.match(err.message, /tool call signal does not match the active iteration signal/i);
+        return true;
+      }
+    );
+
+    // 4. Verify run B was NOT mutated by the late call from turn A
+    const currentB = registry.requireRun(runB.id);
+    assert.equal(currentB.step, "B_START");
+    assert.deepEqual(currentB.data, { b: 2 });
+  });
+
+  it("documents limitation: without host turn signal, tool execution starting after run B binding sees active run B", async () => {
+    const { registry, dispatcher, transitionTool, runA, runB } = setup();
+
+    // In an environment where neither turn passes an AbortSignal and host provides no per-call identity:
+    dispatcher.beginIteration(runA.id, { incrementTurns: false });
+    // Run B replaces run A
+    dispatcher.beginIteration(runB.id, { incrementTurns: false });
+
+    // A tool call starting NOW without any signal or token identity executes against the currently bound run (B)
+    const result = await transitionTool.execute(
+      "call-no-signal",
+      { toStep: "B_NEXT", data: { b: 99 } },
+      undefined,
+      undefined,
+      {} as any
+    );
+
+    const details = result.details as any;
+    assert.equal(details.runId, runB.id);
+    assert.equal(details.toStep, "B_NEXT");
+
+    // Run A was untouched
+    const currentA = registry.requireRun(runA.id);
+    assert.equal(currentA.step, "A_START");
+  });
+
   it("clears active iteration and invalidates in-flight calls on session lifecycle events", async () => {
     const handlers = new Map<string, Function>();
     const fakePi: any = {

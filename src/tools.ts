@@ -55,13 +55,13 @@ export function createWorkflowGetContextTool(
       if (signal?.aborted) {
         throw new WorkflowIterationError("Workflow iteration was aborted.");
       }
-      const binding = dispatcher.assertActiveBinding();
+      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
       const token = binding.token;
       const generation = binding.generation;
 
       const context = dispatcher.getIterationContext(binding);
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       const summaryText = [
         `Workflow: ${context.workflow} (Run ID: ${context.runId})`,
@@ -106,7 +106,7 @@ export function createWorkflowTransitionTool(
       if (signal?.aborted) {
         throw new WorkflowIterationError("Workflow iteration was aborted.");
       }
-      const binding = dispatcher.assertActiveBinding();
+      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -118,7 +118,7 @@ export function createWorkflowTransitionTool(
           : undefined;
 
       // Verify binding is still current before mutating
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       const run = registry.requireRun(binding.runId);
       if (run.lifecycle !== "active") {
@@ -136,7 +136,7 @@ export function createWorkflowTransitionTool(
       });
 
       // Verify binding is still current after mutating
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       return {
         content: [
@@ -181,7 +181,7 @@ export function createWorkflowContinueTool(
       if (signal?.aborted) {
         throw new WorkflowIterationError("Workflow iteration was aborted.");
       }
-      const binding = dispatcher.assertActiveBinding();
+      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -208,7 +208,7 @@ export function createWorkflowContinueTool(
         policy: run.snapshot.wakeups,
       });
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       await binding.schedulerPort.scheduleWakeup({
         runId: run.id,
@@ -216,7 +216,7 @@ export function createWorkflowContinueTool(
         reason: params.reason,
       });
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       const note = resolved.isClamped
         ? ` (clamped from ${formatDuration(resolved.originalDelayMs)} by policy bounds)`
@@ -269,7 +269,7 @@ export function createWorkflowBlockTool(
       if (signal?.aborted) {
         throw new WorkflowIterationError("Workflow iteration was aborted.");
       }
-      const binding = dispatcher.assertActiveBinding();
+      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -286,7 +286,7 @@ export function createWorkflowBlockTool(
           ? validateRunData(params.data as Record<string, JsonValue>, { runId: binding.runId })
           : undefined;
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       const run = registry.requireRun(binding.runId);
       if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
@@ -308,7 +308,7 @@ export function createWorkflowBlockTool(
         await binding.schedulerPort.cancelWakeup(binding.runId);
       }
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       return {
         content: [
@@ -367,7 +367,7 @@ export function createWorkflowCompleteTool(
       if (signal?.aborted) {
         throw new WorkflowIterationError("Workflow iteration was aborted.");
       }
-      const binding = dispatcher.assertActiveBinding();
+      const binding = dispatcher.assertActiveBinding(undefined, undefined, signal);
       const token = binding.token;
       const generation = binding.generation;
 
@@ -384,7 +384,7 @@ export function createWorkflowCompleteTool(
           ? validateRunData(params.data as Record<string, JsonValue>, { runId: binding.runId })
           : undefined;
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       const run = registry.requireRun(binding.runId);
       if (run.lifecycle === "completed" || run.lifecycle === "cancelled") {
@@ -419,7 +419,7 @@ export function createWorkflowCompleteTool(
             reason: "Entering verification phase before final completion",
           });
 
-          dispatcher.assertActiveBinding(token, generation);
+          dispatcher.assertActiveBinding(token, generation, signal);
 
           const details: WorkflowCompleteDetails = {
             runId: updated.id,
@@ -453,7 +453,7 @@ export function createWorkflowCompleteTool(
         await binding.schedulerPort.cancelWakeup(binding.runId);
       }
 
-      dispatcher.assertActiveBinding(token, generation);
+      dispatcher.assertActiveBinding(token, generation, signal);
 
       const details: WorkflowCompleteDetails = {
         runId: updated.id,
