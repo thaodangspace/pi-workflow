@@ -134,3 +134,35 @@ export const MAX_RUN_RECOVERY_EVENTS = 200;
  * the entire lifetime session log is never scanned or materialized.
  */
 export const MAX_RUN_HISTORY_QUERY_LIMIT = MAX_RUN_HISTORY_ENTRIES;
+
+/**
+ * Maximum character length of a user-supplied blocker reason rendered in the
+ * compact TUI status line (issue #10). The full bounded value is still shown by
+ * `/workflow status <run-id>`.
+ */
+export const MAX_STATUS_BLOCKER_LENGTH = 120;
+
+/**
+ * Maximum character length of any single user-supplied diagnostic string
+ * (blocker reason, completion summary, verifier feedback, recovery note,
+ * objective) rendered by `/workflow status` (issue #10).
+ */
+export const MAX_DIAGNOSTIC_TEXT_LENGTH = 500;
+
+/**
+ * Maximum character length of the aggregate TUI workflow status line. It is a
+ * single line and must never wrap or flood the footer.
+ */
+export const MAX_STATUS_LINE_LENGTH = 200;
+
+/**
+ * Maximum number of recent recovery events rendered by `/workflow status`.
+ */
+export const MAX_RECOVERY_EVENTS_DISPLAYED = 5;
+
+/**
+ * Maximum character length of an object key rendered by safe diagnostics or
+ * retained in a sanitized history detail record (issue #10). Mirrors
+ * `MAX_DATA_KEY_LENGTH` so sanitized keys never grow beyond their source bound.
+ */
+export const MAX_DIAGNOSTIC_KEY_LENGTH = 128;

@@ -200,6 +200,29 @@ describe("Issue #6: Budgets, Completion Gates, and Blocked/Paused Semantics", ()
       assert.equal(blockedRun.lifecycle, "blocked");
       assert.match(blockedRun.blocker?.reason ?? "", /maximum attempts limit of 3 reached/);
     });
+
+    it("records budget exhaustion as an explicit block history fact identifying the exhausted dimension (issue #10)", () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+
+      const def = parseWorkflowContent(WORKFLOW_WITH_TURNS_BUDGET, { path: "/budget-history.md", scope: "project" });
+      const run = registry.createRun(def, { runId: "wfrun-budget-history" });
+      registry.updateRun(run.id, { turns: 2 }); // reach maxTurns: 2
+
+      assert.throws(
+        () => dispatcher.beginIteration(run.id),
+        (err: any) => err instanceof WorkflowBudgetExhaustedError
+      );
+
+      const history = registry.getRunHistory(run.id).entries;
+      const blockEntry = history.find((h) => h.action === "block" && /Budget exhausted/.test(h.summary));
+      assert.ok(blockEntry, "budget exhaustion must be recorded as an explicit block history fact");
+      assert.match(blockEntry!.summary, /maximum turns limit of 2 reached/);
+
+      // No invented warning threshold: the only budget fact is the authoritative exhaustion.
+      assert.equal(history.some((h) => h.action === "budget_warning"), false);
+    });
   });
 
   // =========================================================================

@@ -17,8 +17,15 @@ import {
   validateStepName,
   validateVerificationFindings,
 } from "./data-bounds.ts";
-import { MAX_EFFECTS_PER_RUN, MAX_RUN_HISTORY_ENTRIES, MAX_RUN_RECOVERY_EVENTS, MAX_VERIFICATION_ATTEMPTS_DEFAULT } from "./constants.ts";
+import {
+  MAX_DIAGNOSTIC_TEXT_LENGTH,
+  MAX_EFFECTS_PER_RUN,
+  MAX_RUN_HISTORY_ENTRIES,
+  MAX_RUN_RECOVERY_EVENTS,
+  MAX_VERIFICATION_ATTEMPTS_DEFAULT,
+} from "./constants.ts";
 import { type BoundedProjection, appendBounded } from "./bounded-history.ts";
+import { sanitizeDiagnosticText, sanitizeHistoryDetails } from "./sanitize.ts";
 import { isWorkflowSnapshot, deepFreeze } from "./snapshot.ts";
 import {
   type AcquireLeaseOptions,
@@ -35,6 +42,7 @@ import {
   type TransitionStepOptions,
   type UpdateRunOptions,
   type VerifyCompletionOptions,
+  type WakeupScheduledOptions,
   type WorkflowBlockerInfo,
   type WorkflowBudgetPolicy,
   type WorkflowCompletionInfo,
@@ -211,12 +219,18 @@ export function appendHistoryProjection(
   eventId?: string
 ): BoundedProjection<WorkflowRunHistoryEntry> {
   const index = projection.total + 1;
+  // Sanitize/bound at the projection boundary (not only at display) so the
+  // retained projection and every deterministic replay never store raw
+  // credential-shaped prose or unbounded free text in summaries/details.
+  // Effect/workflow state semantics are preserved: only this projection entry
+  // is transformed, never the authoritative `WorkflowEffect`/run fields.
+  const safeDetails = sanitizeHistoryDetails(details);
   const entry: WorkflowRunHistoryEntry = Object.freeze({
     eventId: eventId ?? `${action}-${index}`,
     action,
     timestamp: timestamp ?? Date.now(),
-    summary,
-    ...(details ? { details: Object.freeze({ ...details }) } : {}),
+    summary: sanitizeDiagnosticText(summary, MAX_DIAGNOSTIC_TEXT_LENGTH).text,
+    ...(safeDetails ? { details: Object.freeze(safeDetails) } : {}),
   });
   return appendBounded(projection, entry, MAX_RUN_HISTORY_ENTRIES);
 }
@@ -680,6 +694,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
       verificationFindings: Object.freeze(findings),
       verificationAttempts: attempt,
       data: mergedData,
+      ...appendHistoryEntry(
+        current,
+        "verify",
+        `Completion verified (accepted) on attempt ${attempt}; run completed`,
+        { decision: "accepted", attempt: attempt as any, outcome: "completed" as any },
+        now
+      ),
       updatedAt: Math.max(now, current.updatedAt),
       completedAt: now,
     });
@@ -697,6 +718,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
         verificationFindings: Object.freeze(findings),
         verificationAttempts: attempt,
         data: mergedData,
+        ...appendHistoryEntry(
+          current,
+          "verify",
+          `Verification rejected (attempt ${attempt}/${maxAttempts}); run cancelled after exhausting verification attempts`,
+          { decision: "rejected", attempt: attempt as any, outcome: "cancelled" as any },
+          now
+        ),
         updatedAt: Math.max(now, current.updatedAt),
         completedAt: now,
       });
@@ -719,6 +747,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
       verificationFindings: Object.freeze(findings),
       verificationAttempts: attempt,
       data: mergedData,
+      ...appendHistoryEntry(
+        current,
+        "verify",
+        `Verification rejected (attempt ${attempt}/${maxAttempts}); run blocked for human review`,
+        { decision: "rejected", attempt: attempt as any, outcome: "blocked" as any },
+        now
+      ),
       updatedAt: Math.max(now, current.updatedAt),
     });
   }
@@ -748,6 +783,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
     verificationFindings: Object.freeze(findings),
     verificationAttempts: attempt,
     data: Object.freeze(cleanedData),
+    ...appendHistoryEntry(
+      current,
+      "verify",
+      `Verification rejected (attempt ${attempt}/${maxAttempts}); returning to step "${returnStep}"`,
+      { decision: "rejected", attempt: attempt as any, outcome: "retry" as any, returnStep: returnStep as any },
+      now
+    ),
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
@@ -1171,6 +1213,34 @@ export function applyEffectReconcile(current: WorkflowRun, options: EffectReconc
     ...current,
     effects: Object.freeze(newEffects),
     ...recoveryUpdate,
+    ...newHistory,
+    updatedAt: Math.max(now, current.updatedAt),
+  });
+}
+
+/**
+ * Record a durable `wakeup_scheduled` history fact (issue #10).
+ *
+ * Audit-only: it does not change run state, only appends a bounded history entry
+ * carrying safe scalar scheduler metadata (the clamped delay). The arbitrary
+ * wakeup reason, task prompt and task ID are never recorded. Terminal runs are
+ * left untouched so replay stays consistent with the live path.
+ */
+export function applyWakeupScheduled(current: WorkflowRun, options: WakeupScheduledOptions): WorkflowRun {
+  if (isTerminalLifecycle(current.lifecycle)) {
+    return current;
+  }
+  const now = options.timestamp ?? Date.now();
+  const delayMs = Number.isFinite(options.delayMs) ? Math.max(0, Math.floor(options.delayMs)) : 0;
+  const newHistory = appendHistoryEntry(
+    current,
+    "wakeup_scheduled",
+    `Wakeup scheduled in ${delayMs}ms`,
+    { delayMs },
+    now
+  );
+  return Object.freeze({
+    ...current,
     ...newHistory,
     updatedAt: Math.max(now, current.updatedAt),
   });

@@ -28,6 +28,7 @@ import {
   applyRunUpdate,
   applyStepTransition,
   applyVerifyRun,
+  applyWakeupScheduled,
   createWorkflowRun,
   getHistoryProjection,
   getRecoveryProjection,
@@ -54,6 +55,7 @@ import {
   type TransitionStepOptions,
   type UpdateRunOptions,
   type VerifyCompletionOptions,
+  type WakeupScheduledOptions,
   WorkflowConcurrencyError,
   type WorkflowDefinitionV1,
   WorkflowInvalidTransitionError,
@@ -81,9 +83,48 @@ export class WorkflowRunRegistry {
   private runs = new Map<string, WorkflowRun>();
   private diagnostics: WorkflowRunDiagnostic[] = [];
   private sessionTarget?: WorkflowSessionTarget;
+  /**
+   * Post-commit mutation observers (issue #10). Listeners are notified only
+   * AFTER a run mutation has been persisted and committed to the in-memory map,
+   * so an observer can never observe a torn state. Observer errors are swallowed
+   * so a passive UI refresh can never break a durable mutation.
+   */
+  private mutationListeners = new Set<() => void>();
 
   constructor(sessionTarget?: WorkflowSessionTarget) {
     this.sessionTarget = sessionTarget;
+  }
+
+  /**
+   * Subscribe to post-commit registry mutations. Returns an idempotent
+   * unsubscribe function. No mutation replay/scan is performed for observers.
+   */
+  subscribeMutations(listener: () => void): () => void {
+    this.mutationListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.mutationListeners.delete(listener);
+    };
+  }
+
+  private notifyMutations(): void {
+    for (const listener of Array.from(this.mutationListeners)) {
+      try {
+        listener();
+      } catch {
+        // Passive observers must never break a durable mutation.
+      }
+    }
+  }
+
+  /**
+   * Commit a run into the authoritative map (post-persist) and notify observers.
+   */
+  private commitRun(runId: string, run: WorkflowRun): void {
+    this.runs.set(runId, run);
+    this.notifyMutations();
   }
 
   /**
@@ -197,7 +238,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: run.createdAt });
 
     this.persistEntry(entryData);
-    this.runs.set(run.id, run);
+    this.commitRun(run.id, run);
 
     return run;
   }
@@ -220,7 +261,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -238,7 +279,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -258,7 +299,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -275,7 +316,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -293,7 +334,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -312,7 +353,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -332,7 +373,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -350,7 +391,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -367,7 +408,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -389,7 +430,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -419,7 +460,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -440,7 +481,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -460,7 +501,32 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
+    return updated;
+  }
+
+  /**
+   * Record a durable, replay-equivalent `wakeup_scheduled` history fact.
+   *
+   * Audit-only: no run lifecycle transition. Terminal runs are not persisted so
+   * replay matches the live path. Only safe scalar metadata (the clamped delay)
+   * is stored; never the wakeup reason, task prompt or task ID.
+   */
+  recordWakeupScheduled(runId: string, options: WakeupScheduledOptions): WorkflowRun {
+    const current = this.requireRun(runId);
+    if (isTerminalLifecycle(current.lifecycle)) {
+      return current;
+    }
+    const updated = applyWakeupScheduled(current, options);
+    const entryData = buildMutationEntryData(
+      "wakeup_scheduled",
+      runId,
+      updated.workflow,
+      { delayMs: options.delayMs },
+      { timestamp: updated.updatedAt }
+    );
+    this.persistEntry(entryData);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -478,7 +544,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -499,7 +565,7 @@ export class WorkflowRunRegistry {
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
-    this.runs.set(runId, updated);
+    this.commitRun(runId, updated);
     return updated;
   }
 
@@ -841,6 +907,12 @@ export class WorkflowRunRegistry {
                 eventId: typeof p.eventId === "string" ? p.eventId : undefined,
               });
               break;
+            case "wakeup_scheduled":
+              updated = applyWakeupScheduled(current, {
+                delayMs: typeof p.delayMs === "number" ? p.delayMs : 0,
+                timestamp,
+              });
+              break;
             case "recovery":
               updated = applyRecoveryEvent(current, {
                 type: p.type,
@@ -948,6 +1020,9 @@ export class WorkflowRunRegistry {
 
     this.runs = newRuns;
     this.diagnostics = localDiagnostics;
+    // Post-commit notification: reconstruction replaced active-branch state.
+    // Observers repaint from the new authoritative map (idempotent).
+    this.notifyMutations();
 
     return {
       runs: Array.from(this.runs.values()),

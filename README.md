@@ -660,7 +660,8 @@ The command surface exposes workflow concepts without exposing raw scheduler tas
 | `/workflow list` | Show discovered workflow definitions with name, description, mode, required capabilities, and active run count. |
 | `/workflow start <name>` | Validate definition & capabilities, enforce concurrency, create durable run, attach scheduler state, and trigger the first iteration. |
 | `/workflow status` | Show active/nonterminal runs in deterministic order with concise fields (run ID, workflow, lifecycle, step, age, next wakeup, blocker/completion). |
-| `/workflow status <run-id>` | Show detailed execution state of a specific run (including turn counts, attempt counts, timestamps, data payload, blocker/completion details). |
+| `/workflow status <run-id>` | Show safe detailed execution state of a specific run (lifecycle, step, scheduler linkage, capabilities, budget utilization, blocker/completion, latest reconciliation). User/model prose is sanitized and bounded; raw data values and evidence locations are omitted. |
+| `/workflow history <run-id> [limit]` | Show a bounded, deterministic, oldest-first suffix of the run's recent durable event history (create, lifecycle/step, effects, budget exhaustion, block/pause/resume, completion submit/verify/reject, cancel, recovery), with retained/lifetime/dropped counts and a truncation notice. |
 | `/workflow pause <run-id>` | Persist paused state and cancel/suspend future wakeups without deleting run history. Paused runs do not wake automatically. |
 | `/workflow resume <run-id>` | Revalidate required capabilities, transition to active, and restore exactly one scheduler task linkage. |
 | `/workflow stop <run-id>` | Cancel the run, stop its scheduler task, and retain durable history. Cancellation is isolated from other runs and the user's ordinary `/loop`. |
@@ -674,8 +675,61 @@ The command surface exposes workflow concepts without exposing raw scheduler tas
 - **Strict Argument Validation**: Subcommands reject unexpected extra arguments with usage instructions to prevent unintended executions.
 - **Next Wakeup Transparency**: If the scheduler cannot provide the next wakeup, `unknown` is reported rather than guessing. Paused or blocked runs explicitly show `none (paused)` or `none (blocked)`.
 - **Zero Transcript Spam**: Passive reconciliation (on session start or history navigation) is completely silent. Only explicit user command invocations output messages.
-- **Data Privacy in Status**: `/workflow status <run-id>` reports data key names but omits raw values to avoid leaking secrets, tokens, or credentials into transcripts or logs.
-- **Non-TUI Mode Fallbacks**: In headless, RPC, or print modes (`!ctx.hasUI` or `ctx.mode !== "tui"`), commands output sensible formatted plain text.
+- **Data Privacy in Status**: `/workflow status <run-id>` reports data key names but omits raw values to avoid leaking secrets, tokens, or credentials into transcripts or logs. Free-text fields (blocker reason, summaries, verifier feedback, recovery notes, objective) are sanitized and bounded before display.
+- **Non-TUI Mode Fallbacks**: In headless, RPC, or print modes (`!ctx.hasUI` or `ctx.mode !== "tui"`), commands output sensible formatted plain text. The persistent status line is TUI-only (see below).
+
+### Observability, History, and the TUI Status Line (Issue #10)
+
+Issue #10 adds three read-only surfaces over the authoritative run registry and the scheduler projection. None of them parse the chat transcript, hold a mutable service/run handle, or poll on a timer.
+
+#### 1. Bounded run history: `/workflow history <run-id> [limit]`
+
+`/workflow history` renders the retained UTF-8 suffix of a run's bounded history projection (see [Bounded Recent-History Retention](#bounded-recent-history-retention)):
+
+- deterministic **oldest-first** ordering (unless the caller's limit selects the most recent window);
+- one line per event with ISO timestamp, action and a short, sanitized summary;
+- explicit `retained` / `lifetime` / `dropped` counts and a truncation notice when lifetime events exceeded the bounded projection;
+- `limit` is an optional positive integer, clamped to `MAX_RUN_HISTORY_QUERY_LIMIT` (= `MAX_RUN_HISTORY_ENTRIES`, 200). Output is capped irrespective of lifetime event count.
+
+High-value events recorded at the authoritative mutation boundary include run creation, step transitions, effect begin/commit/reconcile, **wakeup scheduling (`wakeup_scheduled`, carrying only the clamped delay)**, block/pause/resume, completion claim, **verification accept/reject (including the return-to-step, block and cancel outcomes)**, cancellation, lease lifecycle milestones, budget exhaustion (recorded as the resulting block/cancel fact that names the exhausted dimension) and recovery events. The durable append-only session log remains the source of truth; the projection is never rendered wholesale and never persisted as raw tool output, terminal captures, env values or provider credentials.
+
+**History is sanitized at the recording boundary, not only at display.** Summaries and detail values are normalized, bounded and credential-redacted by the same shared sanitizer when the projection entry is appended, so the retained `WorkflowRun.history` and every deterministic replay of it never store raw blocker/transition/completion/effect prose or arbitrary long payloads. This does not change authoritative state semantics: `run.blocker.reason`, `run.completion.summary`, effect `recoveryNote` and other run fields remain the durable, unmodified values; only the bounded history projection entry is transformed. Replay applies the identical deterministic transform, so live and reconstructed projections remain byte-for-byte equal.
+
+**Resolved decisions (documented rationale):**
+
+- *Wakeup scheduling is recorded as a bounded scalar fact and independently surfaced.* A successful wakeup appends a durable, replay-equivalent `wakeup_scheduled` history entry carrying only safe scalar metadata (the clamped `delayMs`) — never the wakeup `reason`, task prompt or task ID. pi-loop remains the timer owner and does not persist `nextFireAt`, so the authoritative *live* next-wakeup and linkage are additionally shown by `/workflow status` and the TUI line via the read-only scheduler projection, which is proven from the live task's prompt identity.
+- *There is no separate budget "warning" event.* The runtime exposes no authoritative warning threshold; the only authoritative budget transition is exhaustion, which is recorded through the resulting block/cancel fact with a summary that names the exhausted dimension. No synthetic warning is invented.
+- *Scheduler linkage ownership is proven from prompt identity.* A durable `loopTaskId` is reported as `linked` only when the live task's authoritative prompt identity belongs to that run; a link to a user `/loop` task or another run is reported `ambiguous` (never exposing the prompt or task ID), and a missing task as `stale`. This holds after restart/corruption when the ephemeral run↔task map is empty.
+
+#### 2. Safe diagnostics: `/workflow status` and `/workflow status <run-id>`
+
+`/workflow status` lists all nonterminal runs in deterministic `createdAt`/id order and derives counts from the registry plus the read-only scheduler projection:
+
+```
+◇ 2 workflows · 1 active · 1 blocked
+```
+
+`/workflow status <run-id>` exposes only safe, derived fields: run/workflow ID, durable kind (`workflow`/`goal`) and objective; definition source, schema version, short definition hash, mode and required capabilities; lifecycle/step and turn/attempt counters; configured budget limits with utilization/remaining duration; scheduler linkage health (`linked` / `absent` / `stale` / `ambiguous` / `unavailable` / `not-applicable`, plus next wakeup and lease expiry); capability availability (required/satisfied/missing/incompatible/degraded/optional-missing names); blocker category and sanitized reason; verification decision/attempt and sanitized feedback; sanitized completion summary with evidence **types and bounded descriptions (URL/path locations are omitted)**; sanitized effect and recovery summaries; and the latest reconciliation outcome.
+
+A command's structured `data` is this safe projection: it never contains the raw `WorkflowRun`, arbitrary data values, evidence locations, service handles, or lease owner handles.
+
+**Free-text safety policy.** Blocker reasons, completion summaries, verifier feedback, recovery notes, effect notes, goal objectives, definition source paths, workflow **data key names** and history detail **keys** are user/model/environment-controlled text. Truncation alone cannot make arbitrary prose secret-free, so every such value crosses one shared bounded sanitizer **both** when a history projection entry is recorded and when a value is displayed or embedded in a command's `data`. It (1) strips control characters and collapses line breaks for inline rendering, (2) replaces obvious credential shapes — private keys, `sk-…`/`ghp_…`/`xox…`/AWS keys, JWTs, URL `user:pass@` userinfo, `Authorization:` headers with an optional `Bearer`/`Basic`/`Token` scheme, and keyword/value pairs in both punctuation and natural-language form (`password=…`, `token:`, `bearer …`, `password is …`, `token is …`, `api key was …`) — with a `[redacted …]` marker, and (3) truncates to an explicit bounded length with a visible `…[+N chars]` omission marker. Detail records are recursively sanitized (keys included, with deterministic collision suffixes) and bounded in breadth/depth, and data-key lists are sanitized and de-duplicated. This is best-effort defense-in-depth, **not** a guarantee; the durable session log is the only complete record.
+
+#### 3. Persistent TUI status line
+
+In interactive TUI mode the extension paints exactly **one** aggregate line via Pi's dedicated keyed `ctx.ui.setStatus("workflow", line)` API, for example:
+
+```
+◇ 2 workflows · 1 active · 1 blocked · next 10:42
+```
+
+- it is derived from the authoritative run registry plus the read-only scheduler projection (unrelated user `/loop` tasks are never counted);
+- it is **cleared** (`setStatus("workflow", undefined)`) when no nonterminal workflows remain, on session-tree navigation to a branch with zero runs, and on `session_shutdown`;
+- it refreshes only from a post-commit registry mutation observer and a scheduler change hook (attach/detach/discovery, reconcile completion, task link/unlink, wakeup reschedule) — buffered into a single microtask so bursts coalesce; identical rendered text is deduplicated; **no polling, timers, transcript parsing, notifications or message sending** are used;
+- it uses the dedicated key `workflow` and never replaces the shared footer (`setFooter`), adds a widget per run, or touches pi-loop's independent `loop` status key, so both extensions coexist;
+- it only attaches when `ctx.mode === "tui"` **and** `ctx.ui.setStatus` is present. RPC mode reports `hasUI: true`, so mode — not `hasUI` — gates the paint; headless/RPC/print modes use the command surface only.
+
+> Pi compatibility note: the keyed `setStatus(key, text | undefined)` contract is present in the project's supported Pi peer range. Because status is an optional interactive surface, the extension **feature-detects** `ctx.ui.setStatus` at attach time rather than raising the minimum peer version; commands remain fully functional on older heads, and the peer range is unchanged.
 
 ### Definition Compatibility Policy on Resume
 

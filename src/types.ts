@@ -534,6 +534,7 @@ export type WorkflowRunMutationAction =
   | "effect_begin"
   | "effect_commit"
   | "effect_reconcile"
+  | "wakeup_scheduled"
   | "recovery"
   | "lease";
 
@@ -745,6 +746,20 @@ export interface EffectCommitOptions {
    * event. Persisted so replay reproduces the same event id.
    */
   eventId?: string;
+}
+
+/**
+ * Options for recording a durable `wakeup_scheduled` history fact.
+ *
+ * Only safe scalar scheduler metadata is recorded (the clamped delay actually
+ * scheduled). The arbitrary wakeup `reason`, task prompt and task ID are never
+ * persisted into the run history projection.
+ */
+export interface WakeupScheduledOptions {
+  /** Clamped delay in milliseconds that was actually scheduled. */
+  delayMs: number;
+  /** Optional deterministic timestamp (Unix epoch ms). */
+  timestamp?: number;
 }
 
 export interface EffectReconcileOptions {

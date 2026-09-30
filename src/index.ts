@@ -20,6 +20,7 @@ import {
 } from "./commands.ts";
 import { GoalCommandController, registerGoalCommand } from "./goal-commands.ts";
 import { createWorkflowTools } from "./tools.ts";
+import { WorkflowStatusController } from "./status-line.ts";
 import type { WorkflowSessionTarget } from "./types.ts";
 
 // Re-export constants
@@ -80,6 +81,10 @@ export * from "./commands.ts";
 // Re-export built-in goal definition factory and /goal facade
 export * from "./goal.ts";
 export * from "./goal-commands.ts";
+
+// Re-export observability projections and the TUI status controller
+export * from "./observability.ts";
+export * from "./status-line.ts";
 
 /**
  * Factory to create a WorkflowRunRegistry.
@@ -146,6 +151,8 @@ export interface WorkflowExtensionHandle {
   adapter: LoopSchedulerAdapter;
   controller: WorkflowCommandController;
   goalController: GoalCommandController;
+  /** Aggregate interactive status line controller (TUI only). */
+  statusLine: WorkflowStatusController;
 }
 
 /**
@@ -193,6 +200,21 @@ export default function workflowExtension(
 
   registerGoalCommand(pi, goalController);
 
+  // Issue #10: one aggregate interactive status line, refreshed from the
+  // authoritative registry + scheduler change streams. It is only attached in
+  // TUI mode; RPC (hasUI=true) and print modes rely on the command surface.
+  const statusLine = new WorkflowStatusController({ registry, adapter });
+
+  const syncStatusUI = (ctx: any): void => {
+    const ui = ctx?.ui;
+    if (ctx?.mode === "tui" && ui && typeof ui.setStatus === "function") {
+      statusLine.attach(ui);
+    } else {
+      statusLine.detach();
+    }
+    statusLine.refresh();
+  };
+
   const events = (pi as any).events;
   if (events && typeof capabilityRegistry.bindEventBus === "function") {
     capabilityRegistry.bindEventBus(events);
@@ -224,6 +246,10 @@ export default function workflowExtension(
       getBranch: (fromId?: string) => ctx.sessionManager.getBranch(fromId),
     });
     registry.refresh();
+
+    // Paint the reconstructed state immediately (before scheduler discovery),
+    // so the status line is correct even if discovery/reconciliation fails.
+    syncStatusUI(ctx);
 
     // Fail closed when the concrete session identity is missing or invalid:
     // end any session-scoped scheduler state and skip discovery/reconciliation
@@ -261,12 +287,18 @@ export default function workflowExtension(
       if (adapter.isAvailable()) {
         await adapter.reconcile().catch(() => {});
       }
+      // Repaint once more after discovery/reconciliation (including failure),
+      // so scheduler linkage/next-wakeup is current.
+      statusLine.refresh();
     }
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     dispatcher.clearActiveIteration("session_tree");
     registry.refresh();
+    // Rebuild the aggregate status from the new active branch (including a
+    // branch with zero runs, which clears the dedicated key).
+    syncStatusUI(ctx);
     // Identity unknown: fail closed. Never reconcile against a service handle
     // that cannot be attributed to the concrete active session.
     const sessionId = resolveActiveSessionId(ctx);
@@ -284,6 +316,7 @@ export default function workflowExtension(
     if (adapter.isSessionActive() && adapter.isAvailable()) {
       await adapter.reconcile().catch(() => {});
     }
+    statusLine.refresh();
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -300,6 +333,9 @@ export default function workflowExtension(
 
   pi.on("session_shutdown", async () => {
     dispatcher.clearActiveIteration("session_shutdown");
+    // Release the status subscriptions and clear the dedicated key before the
+    // scheduler session generation is invalidated.
+    statusLine.detach();
     // End the adapter session generation: detaches/invalidates the service
     // handle, clears ephemeral mappings and pending turn correlation, and
     // rotates ownership so stale handles cannot mutate a later session.
@@ -307,5 +343,5 @@ export default function workflowExtension(
     capabilityRegistry.dispose();
   });
 
-  return { registry, capabilityRegistry, dispatcher, adapter, controller, goalController };
+  return { registry, capabilityRegistry, dispatcher, adapter, controller, goalController, statusLine };
 }

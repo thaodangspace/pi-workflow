@@ -31,6 +31,7 @@ import {
   WorkflowCommandController,
 } from "../src/commands.ts";
 import { createGoalCommandController } from "../src/index.ts";
+import { MAX_RUN_HISTORY_ENTRIES } from "../src/constants.ts";
 import { WorkflowDispatcher } from "../src/dispatcher.ts";
 import workflowExtension from "../src/index.ts";
 import { WorkflowRunRegistry } from "../src/registry.ts";
@@ -1133,6 +1134,91 @@ describe("Workflow Lifecycle Commands & Run Controls (Issue #5)", () => {
       const namedRunId = (namedStart.data as any).runId as string;
       const namedDetail = await controller.executeStatusRun(namedRunId);
       assert.match(namedDetail.output, /Type:\s+workflow/);
+    });
+  });
+
+  // =========================================================================
+  // 15. Bounded run history command (Issue #10)
+  // =========================================================================
+  describe("/workflow history", () => {
+    it("shows a deterministic oldest-first bounded history without raw task ids or data values", async () => {
+      const started = await controller.execute("start example");
+      const runId = (started.data as any).runId as string;
+      registry.transitionStep(runId, { toStep: "STEP_A", reason: "progress made" });
+      registry.updateRun(runId, { data: { secretValue: "TOP-SECRET-VALUE" } });
+
+      const hist = await controller.execute(`history ${runId}`);
+      assert.equal(hist.ok, true, hist.output);
+      assert.match(hist.output, new RegExp(`Run History: ${runId}`));
+      assert.match(hist.output, /create/);
+      assert.match(hist.output, /transition/);
+
+      const entries = (hist.data as any).entries as Array<{ action: string; eventId: string }>;
+      assert.equal(entries[0].action, "create");
+      assert.ok(entries.some((e) => e.action === "transition"));
+
+      // Privacy: no raw scheduler task IDs, data values, or secrets.
+      assert.ok(!hist.output.includes("task-self-"));
+      assert.ok(!hist.output.includes("TOP-SECRET-VALUE"));
+      assert.ok(!JSON.stringify(hist.data).includes("TOP-SECRET-VALUE"));
+    });
+
+    it("bounds the output with limit and reports truncation over the lifetime window", async () => {
+      const started = await controller.execute("start example");
+      const runId = (started.data as any).runId as string;
+
+      const lifetime = MAX_RUN_HISTORY_ENTRIES + 20;
+      for (let i = 0; i < lifetime; i++) {
+        registry.transitionStep(runId, { toStep: `STEP_${i}` });
+      }
+
+      const full = (await controller.execute(`history ${runId}`)).data as any;
+      const hist = await controller.execute(`history ${runId} 5`);
+      assert.equal(hist.ok, true, hist.output);
+      const data = hist.data as any;
+      assert.equal(data.entries.length, 5);
+      assert.equal(data.limited, true);
+      assert.equal(data.truncated, true);
+      assert.equal(data.total, full.total);
+      assert.equal(data.dropped, full.dropped);
+      assert.match(hist.output, /5 shown/);
+      assert.match(hist.output, /Older events are not shown/);
+      // Newest retained events are the most recent transitions.
+      assert.match(data.entries[data.entries.length - 1].summary, new RegExp(`STEP_${lifetime - 1}\\b`));
+    });
+
+    it("rejects missing, ambiguous, definition, unknown and invalid-limit arguments", async () => {
+      const missing = await controller.execute("history");
+      assert.equal(missing.ok, false);
+      assert.match(missing.output, /Missing required argument/);
+
+      const asDefinition = await controller.execute("history example");
+      assert.equal(asDefinition.ok, false);
+      assert.match(asDefinition.output, /workflow definition name, not a run ID/);
+
+      const unknown = await controller.execute("history wfrun-does-not-exist");
+      assert.equal(unknown.ok, false);
+      assert.match(unknown.output, /not found/);
+
+      const started = await controller.execute("start example");
+      const runId = (started.data as any).runId as string;
+
+      const extra = await controller.execute(`history ${runId} 5 extra`);
+      assert.equal(extra.ok, false);
+      assert.match(extra.output, /Unexpected argument\(s\) for '\/workflow history'/);
+
+      const badLimit = await controller.execute(`history ${runId} abc`);
+      assert.equal(badLimit.ok, false);
+      assert.match(badLimit.output, /Invalid history limit/);
+    });
+
+    it("is offered in help and argument completions", async () => {
+      const help = await controller.execute("help");
+      assert.match(help.output, /\/workflow history <run-id>/);
+
+      const completions = await controller.getArgumentCompletions("hi");
+      assert.ok(completions);
+      assert.ok(completions!.some((c) => c.value.trim() === "history"));
     });
   });
 });

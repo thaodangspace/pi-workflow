@@ -1,9 +1,23 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { WorkflowDispatcher } from "../src/dispatcher.ts";
 import { parseWorkflowContent } from "../src/parser.ts";
 import { WorkflowRunRegistry } from "../src/registry.ts";
+import { LoopSchedulerAdapter } from "../src/scheduler-adapter.ts";
+import { WorkflowStatusController } from "../src/status-line.ts";
 import { WorkflowConcurrencyError } from "../src/types.ts";
 import { FakeSessionManager } from "./fake-session-manager.ts";
+
+class BranchStatusUI {
+  calls: Array<{ key: string; text: string | undefined }> = [];
+  setStatus(key: string, text: string | undefined): void {
+    this.calls.push({ key, text });
+  }
+  lastText(): string | undefined {
+    const calls = this.calls.filter((c) => c.key === "workflow");
+    return calls.length > 0 ? calls[calls.length - 1].text : undefined;
+  }
+}
 
 describe("Session Tree Branch Isolation & Reconstruction", () => {
   const sampleDoc = `---
@@ -115,5 +129,41 @@ concurrency:
     session.setLeafId(leafBranchB);
     registry.refresh();
     assert.equal(registry.requireRun("run-root").lifecycle, "paused");
+  });
+
+  it("repaints the aggregate status line per branch and clears on a branch with zero nonterminal runs (issue #10)", () => {
+    const session = new FakeSessionManager();
+    const registry = new WorkflowRunRegistry(session);
+    const adapter = new LoopSchedulerAdapter({
+      registry,
+      dispatcher: new WorkflowDispatcher(registry),
+    });
+    const ui = new BranchStatusUI();
+    const controller = new WorkflowStatusController({ registry, adapter });
+    controller.attach(ui);
+
+    const emptyLeaf = session.getLeafId(); // branch point with zero workflow runs
+    const def = parseWorkflowContent(sampleDoc, { path: "/test/branch.md", scope: "project" });
+    const run = registry.createRun(def, { runId: "run-status" });
+    const runLeaf = session.getLeafId();
+    controller.paintNow();
+    assert.match(ui.lastText() ?? "", /◇ 1 workflow · 1 active/);
+
+    // Switch to the empty branch: the dedicated key is cleared.
+    session.setLeafId(emptyLeaf);
+    registry.refresh();
+    controller.paintNow();
+    assert.equal(ui.lastText(), undefined);
+
+    // Back to the run branch: the line is restored.
+    session.setLeafId(runLeaf);
+    registry.refresh();
+    controller.paintNow();
+    assert.match(ui.lastText() ?? "", /◇ 1 workflow · 1 active/);
+
+    // Cancelling on this branch clears again.
+    registry.cancelRun(run.id, { reason: "done" });
+    controller.paintNow();
+    assert.equal(ui.lastText(), undefined);
   });
 });
