@@ -194,6 +194,8 @@ export class LoopSchedulerAdapter {
   private unsubscribeChange?: () => void;
   private discoveryTimeoutMs: number;
   private capabilityRegistry?: WorkflowCapabilityRegistry;
+  /** Post-change observers wired to the read-only scheduler projection (issue #10). */
+  private changeListeners = new Set<() => void>();
 
   /**
    * Effective per-instance ownership identity stamped into durable leases.
@@ -316,16 +318,21 @@ export class LoopSchedulerAdapter {
    */
   attachService(service: LoopServiceV1): void {
     this.service = service;
+    this.notifyChange();
   }
 
   /**
    * Detaches the current service instance, invalidating scheduler operations.
    */
   detachService(): void {
+    const hadService = this.service !== undefined;
     this.service = undefined;
     if (this.unsubscribeChange) {
       this.unsubscribeChange();
       this.unsubscribeChange = undefined;
+    }
+    if (hadService) {
+      this.notifyChange();
     }
   }
 
@@ -361,6 +368,7 @@ export class LoopSchedulerAdapter {
       // Same workflow session generation: rebuild branch-derived state only.
       this.clearEphemeralState();
       this.dispatcher.clearActiveIteration("session_refresh");
+      this.notifyChange();
       return;
     }
 
@@ -375,6 +383,7 @@ export class LoopSchedulerAdapter {
     if (!this.ownerExplicit) {
       this.ownerIdValue = `${next}:inst-${randomUUID().slice(0, 8)}`;
     }
+    this.notifyChange();
   }
 
   /**
@@ -395,6 +404,7 @@ export class LoopSchedulerAdapter {
     if (!this.ownerExplicit) {
       this.ownerIdValue = `default:inst-${randomUUID().slice(0, 8)}`;
     }
+    this.notifyChange();
   }
 
   /** True when bound to a concrete active workflow session generation. */
@@ -413,6 +423,35 @@ export class LoopSchedulerAdapter {
   /** Monotonic workflow-session generation counter (bumps on each boundary). */
   getSessionGeneration(): number {
     return this.sessionGeneration;
+  }
+
+  /**
+   * Subscribe to scheduler lifecycle/projection changes (issue #10).
+   *
+   * Fired after session begin/end, service attach/detach/discovery, reconcile
+   * completion (success or failure), and durable task link/unlink. Notification
+   * is synchronous with the change that caused it and carries no payload; the
+   * observer reads the public read-only projection itself. Listener errors are
+   * swallowed so a passive UI refresh can never break scheduling.
+   */
+  subscribeChanges(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const listener of Array.from(this.changeListeners)) {
+      try {
+        listener();
+      } catch {
+        // Passive observers must never break scheduling.
+      }
+    }
   }
 
   /**
@@ -463,6 +502,9 @@ export class LoopSchedulerAdapter {
         if (this.service) {
           this.service = undefined;
         }
+        this.notifyChange();
+      } else {
+        this.notifyChange();
       }
     });
   }
@@ -724,6 +766,7 @@ export class LoopSchedulerAdapter {
     this.runToTaskMap.set(run.id, task.id);
     this.taskToRunMap.set(task.id, run.id);
     this.registry.updateRun(run.id, { loopTaskId: task.id });
+    this.notifyChange();
 
     return task;
   }
@@ -829,7 +872,11 @@ export class LoopSchedulerAdapter {
     }
 
     try {
-      return service.scheduleTaskWakeup(taskId, delayMs, reason);
+      const decision = service.scheduleTaskWakeup(taskId, delayMs, reason);
+      // Next-wakeup is authoritative scheduler state, not a registry mutation:
+      // notify observers so a passive status line reflects the new fire time.
+      this.notifyChange();
+      return decision;
     } catch (error) {
       if (error instanceof LoopServiceUnavailableError) {
         throw new WorkflowSchedulerUnavailableError(error.message, runId);
@@ -957,6 +1004,9 @@ export class LoopSchedulerAdapter {
         this.registry.updateRun(runId, { loopTaskId: null });
       }
     }
+    // Linkage change is authoritative scheduler state; notify even when the run
+    // was terminal and no registry mutation occurred.
+    this.notifyChange();
   }
 
   /**
@@ -998,6 +1048,7 @@ export class LoopSchedulerAdapter {
         code: "scheduler-unavailable",
         message: "Cannot reconcile workflow scheduler tasks: pi-loop service is unavailable.",
       });
+      this.notifyChange();
       return result;
     }
 
@@ -1010,6 +1061,7 @@ export class LoopSchedulerAdapter {
         code: "list-tasks-failed",
         message: `Failed to list tasks from pi-loop service: ${error instanceof Error ? error.message : String(error)}`,
       });
+      this.notifyChange();
       return result;
     }
 
@@ -1479,6 +1531,9 @@ export class LoopSchedulerAdapter {
       }
     }
 
+    // Reconcile may have recreated/cleaned tasks and mutated runs; notify once
+    // after the authoritative pass so observers repaint from final state.
+    this.notifyChange();
     return result;
   }
 

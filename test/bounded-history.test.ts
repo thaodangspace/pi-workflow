@@ -35,6 +35,20 @@ concurrency:
 # Bounded History Policy
 `;
 
+const VERIFY_WORKFLOW_YAML = `---
+name: verify-history-workflow
+description: Verification history workflow.
+mode: self-paced
+concurrency:
+  maxRuns: 5
+completion:
+  verify: true
+  maxVerificationAttempts: 2
+  onRejectionExhausted: block
+---
+# Verify History Policy
+`;
+
 function parseDef() {
   return parseWorkflowContent(WORKFLOW_YAML, { path: "/bounded.md", scope: "project" });
 }
@@ -379,6 +393,43 @@ describe("Bounded run history (issue #24)", () => {
   });
 
   describe("branch isolation", () => {
+    it("records verification accept/reject outcomes and replays them deterministically (issue #10)", () => {
+      const session = new FakeSessionManager();
+      const live = new WorkflowRunRegistry(session);
+      const def = parseWorkflowContent(VERIFY_WORKFLOW_YAML, { path: "/verify.md", scope: "project" });
+
+      // Rejection path: two rejected attempts exhaust maxVerificationAttempts and block.
+      const rejected = live.createRun(def, { runId: "wfrun-verify-reject" });
+      live.claimCompletion(rejected.id, { summary: "first attempt" });
+      live.verifyRun(rejected.id, { decision: "reject", feedback: "not yet" });
+      live.claimCompletion(rejected.id, { summary: "second attempt" });
+      live.verifyRun(rejected.id, { decision: "reject", feedback: "still not" });
+
+      const rejectedRun = live.requireRun(rejected.id);
+      assert.equal(rejectedRun.lifecycle, "blocked");
+      const rejectActions = rejectedRun.history!.filter((h) => h.action === "verify");
+      assert.equal(rejectActions.length, 2);
+      assert.match(rejectActions[0].summary, /returning to step/);
+      assert.match(rejectActions[1].summary, /blocked for human review/);
+
+      // Accepted path: records the accepted verification and completes.
+      const accepted = live.createRun(def, { runId: "wfrun-verify-accept" });
+      live.claimCompletion(accepted.id, { summary: "done" });
+      live.verifyRun(accepted.id, { decision: "accept" });
+      const acceptedRun = live.requireRun(accepted.id);
+      assert.equal(acceptedRun.lifecycle, "completed");
+      assert.equal(
+        acceptedRun.history!.some((h) => h.action === "verify" && /accepted/.test(h.summary)),
+        true
+      );
+
+      // Replay reproduces the verification history byte-for-byte.
+      const replayed = new WorkflowRunRegistry();
+      replayed.reconstructFromSession(session);
+      assert.deepEqual(replayed.requireRun("wfrun-verify-reject").history, rejectedRun.history);
+      assert.deepEqual(replayed.requireRun("wfrun-verify-accept").history, acceptedRun.history);
+    });
+
     it("reconstructs only the active branch's bounded projection", () => {
       const session = new FakeSessionManager();
       const registry = new WorkflowRunRegistry(session);

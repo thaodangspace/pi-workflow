@@ -18,7 +18,17 @@ import {
 } from "./capabilities.ts";
 import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { loadWorkflows, type LoadWorkflowsOptions } from "./loader.ts";
+import {
+  buildHistoryData,
+  buildRunDiagnostic,
+  buildStatusProjection,
+  formatRunDiagnostic,
+  formatRunHistory,
+  formatStatusList,
+  type WorkflowRunDiagnosticView,
+} from "./observability.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
+import { MAX_RUN_HISTORY_QUERY_LIMIT } from "./constants.ts";
 import { isTerminalLifecycle } from "./run.ts";
 import { LOOP_SERVICE_VERSION } from "pi-loop/service";
 import type { LoopSchedulerAdapter } from "./scheduler-adapter.ts";
@@ -34,7 +44,6 @@ import {
   WorkflowUnsupportedBudgetError,
   WorkflowValidationError,
   isGoalKind,
-  workflowKindOf,
 } from "./types.ts";
 
 /**
@@ -113,97 +122,10 @@ export function buildCapabilityErrorMessage(
   return `Workflow "${workflowName}" requires capabilities that are not satisfied (${summary}). ${reasons}`;
 }
 
-/**
- * Format age from epoch milliseconds into human-readable duration string.
- */
-export function formatAge(epochMs: number, now: number = Date.now()): string {
-  const diffMs = Math.max(0, now - epochMs);
-  const seconds = Math.floor(diffMs / 1000);
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  const remSeconds = seconds % 60;
-  if (minutes < 60) {
-    return remSeconds > 0 ? `${minutes}m ${remSeconds}s` : `${minutes}m`;
-  }
-  const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
-  if (hours < 24) {
-    return remMinutes > 0 ? `${hours}h ${remMinutes}m` : `${hours}h`;
-  }
-  const days = Math.floor(hours / 24);
-  const remHours = hours % 24;
-  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
-}
-
-/**
- * Resolve next wakeup display string for a workflow run without exposing raw task IDs.
- * If the scheduler cannot supply next wakeup, reports "unknown" rather than inventing it.
- */
-export function formatNextWakeup(
-  run: WorkflowRun,
-  adapter: LoopSchedulerAdapter,
-  now: number = Date.now()
-): string {
-  if (run.lifecycle === "paused") {
-    return "none (paused)";
-  }
-  if (run.lifecycle === "blocked") {
-    return "none (blocked)";
-  }
-  if (isTerminalLifecycle(run.lifecycle)) {
-    return `none (${run.lifecycle})`;
-  }
-
-  const taskId = adapter.getLinkedTaskId(run.id);
-  if (!taskId || !adapter.isAvailable()) {
-    return "unknown";
-  }
-
-  const service = adapter.getService();
-  if (!service) {
-    return "unknown";
-  }
-
-  try {
-    const tasks = service.listTasks();
-    const task = tasks.find((t) => t.id === taskId);
-    if (!task || task.nextFireAt === undefined || task.nextFireAt === null) {
-      return "unknown";
-    }
-
-    if (task.nextFireAt <= now) {
-      return "due now";
-    }
-
-    const deltaMs = task.nextFireAt - now;
-    return `in ${formatAge(now - deltaMs, now)}`;
-  } catch {
-    return "unknown";
-  }
-}
-
-/**
- * Describes the verification state of a run without ever implying that an
- * unconfigured (or not-yet-performed) verification happened.
- */
-export function describeVerification(run: WorkflowRun): string {
-  const findings = run.verificationFindings;
-  if (findings) {
-    return findings.decision === "accepted"
-      ? `accepted by verifier (attempt ${findings.attempt})`
-      : `rejected by verifier (attempt ${findings.attempt})`;
-  }
-  const verifyConfigured = run.snapshot.completion?.verify === true;
-  if (!verifyConfigured) {
-    return run.lifecycle === "completed" ? "not configured (unverified completion)" : "not configured";
-  }
-  if (run.lifecycle === "verifying") {
-    return "pending (awaiting verifier decision)";
-  }
-  return "configured (awaiting completion claim)";
-}
+// Status/history formatting helpers live in `./observability.ts` so the
+// command surface and the interactive TUI status line share one deterministic,
+// sanitized implementation. Re-exported here to preserve the public surface.
+export { describeVerification, formatAge, formatNextWakeup } from "./observability.ts";
 
 /**
  * Parsed representation of a CLI invocation.
@@ -670,61 +592,12 @@ export class WorkflowCommandController {
    * blocker/completion summary when relevant.
    */
   async executeStatusList(): Promise<WorkflowCommandResult> {
-    const runs = this.registry.getNonterminalRuns();
-
-    // Sort deterministically: createdAt ascending, then ID ascending
-    runs.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-
-    if (runs.length === 0) {
-      const output =
-        "No active workflow runs found. Run '/workflow list' to see available workflows, or '/workflow start <name>' to start one.";
-      return { ok: true, action: "status", output, data: { count: 0, runs: [] } };
-    }
-
-    const lines: string[] = [`Active Workflow Runs (${runs.length}):`];
-    const dataRuns: unknown[] = [];
-    const now = Date.now();
-
-    for (const run of runs) {
-      const ageStr = formatAge(run.createdAt, now);
-      const wakeupStr = formatNextWakeup(run, this.adapter, now);
-
-      lines.push(`  • ${run.id}`);
-      lines.push(`    Workflow:    ${run.workflow}`);
-      lines.push(`    Type:        ${workflowKindOf(run)}`);
-      lines.push(`    Lifecycle:   ${run.lifecycle}`);
-      lines.push(`    Step:        ${run.step}`);
-      lines.push(`    Age:         ${ageStr}`);
-      lines.push(`    Next Wakeup: ${wakeupStr}`);
-
-      if (run.blocker) {
-        const humanReq = run.blocker.requiresHuman ? " (human action required)" : "";
-        lines.push(`    Blocker:     ${run.blocker.reason}${humanReq}`);
-      }
-
-      if (run.completion) {
-        lines.push(`    Completion:  ${run.completion.summary}`);
-      }
-
-      dataRuns.push({
-        id: run.id,
-        workflow: run.workflow,
-        type: workflowKindOf(run),
-        lifecycle: run.lifecycle,
-        step: run.step,
-        createdAt: run.createdAt,
-        age: ageStr,
-        nextWakeup: wakeupStr,
-        blocker: run.blocker,
-        completion: run.completion,
-      });
-    }
-
+    const projection = buildStatusProjection(this.registry, this.adapter);
     return {
       ok: true,
       action: "status",
-      output: lines.join("\n"),
-      data: { count: runs.length, runs: dataRuns },
+      output: formatStatusList(projection),
+      data: { count: projection.total, runs: projection.runs },
     };
   }
 
@@ -752,140 +625,61 @@ export class WorkflowCommandController {
       return { ok: false, action: "status", output: errorMsg, error: errorMsg };
     }
 
-    const run = target.run;
-    const now = Date.now();
-    const ageStr = formatAge(run.createdAt, now);
-    const wakeupStr = formatNextWakeup(run, this.adapter, now);
-    const requiresStr = run.snapshot.requires.length > 0 ? run.snapshot.requires.join(", ") : "none";
-
-    const lines: string[] = [
-      `Workflow Run: ${run.id}`,
-      `  Workflow:    ${run.workflow}`,
-      `  Type:        ${workflowKindOf(run)}`,
-      `  Lifecycle:   ${run.lifecycle}`,
-      `  Step:        ${run.step}`,
-      `  Age:         ${ageStr}`,
-      `  Turns:       ${run.turns}`,
-      `  Attempts:    ${run.attempts}`,
-      `  Next Wakeup: ${wakeupStr}`,
-      `  Created:     ${new Date(run.createdAt).toISOString()}`,
-      `  Updated:     ${new Date(run.updatedAt).toISOString()}`,
-    ];
-
-    if (run.objective !== undefined) {
-      lines.push(`  Objective:   ${run.objective}`);
-    }
-
-    if (run.startedAt) {
-      lines.push(`  Started:     ${new Date(run.startedAt).toISOString()}`);
-    }
-    if (run.completedAt) {
-      lines.push(`  Completed:   ${new Date(run.completedAt).toISOString()}`);
-    }
-
-    lines.push(`  Definition:`);
-    lines.push(`    Source:    ${run.definitionSource}`);
-    lines.push(`    Mode:      ${run.snapshot.mode}`);
-    lines.push(`    Requires:  ${requiresStr}`);
-
-    const effectiveBudget = run.budget ?? run.snapshot.budget;
-    if (effectiveBudget && Object.keys(effectiveBudget).length > 0) {
-      lines.push(`  Budget:`);
-      if (effectiveBudget.maxTurns !== undefined) {
-        lines.push(`    Max Turns:     ${effectiveBudget.maxTurns}`);
-      }
-      if (effectiveBudget.maxDuration !== undefined) {
-        lines.push(`    Max Duration:  ${effectiveBudget.maxDuration}`);
-      }
-      if (effectiveBudget.maxAttempts !== undefined) {
-        lines.push(`    Max Attempts:  ${effectiveBudget.maxAttempts}`);
-      }
-      if (effectiveBudget.onExhaustion !== undefined) {
-        lines.push(`    On Exhaustion: ${effectiveBudget.onExhaustion}`);
-      }
-    }
-
-    lines.push(`  Verification: ${describeVerification(run)}`);
-
-    const dataKeys = Object.keys(run.data);
-    if (dataKeys.length === 0) {
-      lines.push(`  Data:        (empty)`);
-    } else {
-      lines.push(`  Data Keys:   [${dataKeys.sort().join(", ")}] (values omitted to prevent secret exposure)`);
-    }
-
-    if (run.blocker) {
-      lines.push(`  Blocker:`);
-      lines.push(`    Reason:        ${run.blocker.reason}`);
-      if (run.blocker.category) {
-        lines.push(`    Category:      ${run.blocker.category}`);
-      }
-      lines.push(`    RequiresHuman: ${run.blocker.requiresHuman ?? false}`);
-      lines.push(`    BlockedAt:     ${new Date(run.blocker.blockedAt).toISOString()}`);
-    }
-
-    if (run.completionClaim) {
-      lines.push(`  Completion Claim:`);
-      lines.push(`    Summary:       ${run.completionClaim.summary}`);
-      lines.push(`    Evidence:      ${run.completionClaim.evidence.length} item(s)`);
-    }
-
-    if (run.verificationFindings) {
-      lines.push(`  Verification Findings:`);
-      lines.push(`    Decision:      ${run.verificationFindings.decision}`);
-      if (run.verificationFindings.feedback) {
-        lines.push(`    Feedback:      ${run.verificationFindings.feedback}`);
-      }
-      lines.push(`    Attempt:       ${run.verificationFindings.attempt}`);
-    }
-
-    if (run.completion) {
-      lines.push(`  Completion:`);
-      lines.push(`    Summary:       ${run.completion.summary}`);
-      if (run.completion.evidence && run.completion.evidence.length > 0) {
-        lines.push(`    Evidence (${run.completion.evidence.length}):`);
-        for (const ev of run.completion.evidence) {
-          const loc = ev.url || ev.path || "";
-          lines.push(`      • [${ev.type}] ${ev.description}${loc ? ` (${loc})` : ""}`);
-        }
-      }
-    }
-
-    if (run.effects && Object.keys(run.effects).length > 0) {
-      const effectKeys = Object.keys(run.effects).sort();
-      lines.push(`  Effects (${effectKeys.length}):`);
-      for (const key of effectKeys) {
-        const eff = run.effects[key];
-        const ambigStr = eff.ambiguous ? " [AMBIGUOUS - RECONCILIATION REQUIRED]" : "";
-        lines.push(`    • [${eff.status.toUpperCase()}] ${eff.key} (${eff.kind})${ambigStr}`);
-        if (eff.recoveryNote) {
-          lines.push(`      Note: ${eff.recoveryNote}`);
-        }
-      }
-    }
-
-    if (run.recoveryEvents && run.recoveryEvents.length > 0) {
-      lines.push(`  Recovery Events (${run.recoveryEvents.length}):`);
-      const recentEvents = run.recoveryEvents.slice(-5);
-      for (const rev of recentEvents) {
-        lines.push(`    • [${new Date(rev.timestamp).toISOString()}] ${rev.type}: ${rev.message}`);
-      }
-    }
-
-    if (run.lease) {
-      lines.push(`  Lease:`);
-      lines.push(`    Owner:     ${run.lease.ownerId}`);
-      lines.push(`    Acquired:  ${new Date(run.lease.acquiredAt).toISOString()}`);
-      if (run.lease.expiresAt) {
-        lines.push(`    Expires:   ${new Date(run.lease.expiresAt).toISOString()}`);
-      }
-    }
+    const diagnostic: WorkflowRunDiagnosticView = buildRunDiagnostic(target.run, this.adapter, {
+      capabilityRegistry: this.capabilityRegistry,
+    });
 
     return {
       ok: true,
       action: "status",
-      output: lines.join("\n"),
-      data: run,
+      output: formatRunDiagnostic(diagnostic),
+      data: diagnostic,
+    };
+  }
+
+  /**
+   * Execute `/workflow history <run-id> [limit]`: show a bounded, deterministic,
+   * sanitized view of a run's recent durable history projection.
+   *
+   * The retained suffix is oldest-first. The accessor never scans the lifetime
+   * session log, and the output is capped irrespective of lifetime event count.
+   */
+  async executeHistory(runTarget: string, rawLimit?: string): Promise<WorkflowCommandResult> {
+    await this.ensureDefinitionsLoaded();
+    const target = this.resolveRunTarget(runTarget);
+
+    if (target.kind === "ambiguous") {
+      const errorMsg = `Ambiguous run ID prefix "${runTarget}". Matches: [${target.ambiguousMatches!.join(", ")}].`;
+      return { ok: false, action: "history", output: errorMsg, error: errorMsg };
+    }
+
+    if (target.kind === "definition") {
+      const errorMsg =
+        `"${runTarget}" is a workflow definition name, not a run ID. ` +
+        `To start this workflow, use '/workflow start ${runTarget}'. To view active runs, use '/workflow status'.`;
+      return { ok: false, action: "history", output: errorMsg, error: errorMsg };
+    }
+
+    if (target.kind === "unknown" || !target.run) {
+      const errorMsg = `Workflow run "${runTarget}" not found. Run '/workflow status' to see active runs.`;
+      return { ok: false, action: "history", output: errorMsg, error: errorMsg };
+    }
+
+    let limit: number | undefined;
+    if (rawLimit !== undefined) {
+      if (!/^\d+$/.test(rawLimit)) {
+        const errorMsg = `Invalid history limit "${rawLimit}". Usage: /workflow history <run-id> [limit] (limit is a positive integer up to ${MAX_RUN_HISTORY_QUERY_LIMIT}).`;
+        return { ok: false, action: "history", output: errorMsg, error: errorMsg };
+      }
+      limit = Number(rawLimit);
+    }
+
+    const view = this.registry.getRunHistory(target.run.id, { limit, order: "oldest" });
+    return {
+      ok: true,
+      action: "history",
+      output: formatRunHistory(view),
+      data: buildHistoryData(view),
     };
   }
 
@@ -1144,6 +938,7 @@ export class WorkflowCommandController {
       "  /workflow start <name>       - Start a new workflow run",
       "  /workflow status             - Show active workflow runs",
       "  /workflow status <run-id>    - Show detailed status of a specific run",
+      "  /workflow history <run-id>   - Show bounded recent event history for a run",
       "  /workflow pause <run-id>     - Pause an active run and suspend wakeups",
       "  /workflow resume <run-id>    - Resume a paused or blocked run",
       "  /workflow stop <run-id>      - Stop a run and cancel its scheduler task",
@@ -1192,6 +987,18 @@ export class WorkflowCommandController {
           return this.executeStatusList();
         }
         return this.executeStatusRun(parsed.target);
+      }
+
+      case "history": {
+        if (!parsed.target) {
+          const errorMsg = "Missing required argument <run-id> for '/workflow history'. Usage: /workflow history <run-id> [limit]";
+          return { ok: false, action: "history", output: errorMsg, error: errorMsg };
+        }
+        if (parsed.extra.length > 1) {
+          const errorMsg = `Unexpected argument(s) for '/workflow history': "${parsed.extra.join(" ")}". Usage: /workflow history <run-id> [limit]`;
+          return { ok: false, action: "history", output: errorMsg, error: errorMsg };
+        }
+        return this.executeHistory(parsed.target, parsed.extra[0]);
       }
 
       case "pause": {
@@ -1251,7 +1058,7 @@ export class WorkflowCommandController {
       default: {
         const errorMsg =
           `Unknown workflow subcommand "${parsed.subcommand}". ` +
-          `Available subcommands: list, start, status, pause, resume, stop, reload. Run '/workflow help' for usage.`;
+          `Available subcommands: list, start, status, history, pause, resume, stop, reload. Run '/workflow help' for usage.`;
         return { ok: false, action: "unknown", output: errorMsg, error: errorMsg };
       }
     }
@@ -1304,6 +1111,7 @@ export class WorkflowCommandController {
       { name: "list", description: "List discovered workflow definitions" },
       { name: "start", description: "Start a new workflow run" },
       { name: "status", description: "Show active workflow runs or run details" },
+      { name: "history", description: "Show bounded recent event history for a run" },
       { name: "pause", description: "Pause an active run and suspend wakeups" },
       { name: "resume", description: "Resume a paused or blocked run" },
       { name: "stop", description: "Stop a run and cancel its scheduler task" },
@@ -1343,7 +1151,7 @@ export class WorkflowCommandController {
     }
 
     // Case 3: Completing run IDs for status, pause, resume, stop
-    if (["status", "pause", "resume", "stop"].includes(subcommand)) {
+    if (["status", "history", "pause", "resume", "stop"].includes(subcommand)) {
       let candidateRuns: WorkflowRun[];
       if (subcommand === "pause") {
         candidateRuns = this.registry.getActiveRuns();

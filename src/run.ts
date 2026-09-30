@@ -680,6 +680,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
       verificationFindings: Object.freeze(findings),
       verificationAttempts: attempt,
       data: mergedData,
+      ...appendHistoryEntry(
+        current,
+        "verify",
+        `Completion verified (accepted) on attempt ${attempt}; run completed`,
+        { decision: "accepted", attempt: attempt as any, outcome: "completed" as any },
+        now
+      ),
       updatedAt: Math.max(now, current.updatedAt),
       completedAt: now,
     });
@@ -697,6 +704,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
         verificationFindings: Object.freeze(findings),
         verificationAttempts: attempt,
         data: mergedData,
+        ...appendHistoryEntry(
+          current,
+          "verify",
+          `Verification rejected (attempt ${attempt}/${maxAttempts}); run cancelled after exhausting verification attempts`,
+          { decision: "rejected", attempt: attempt as any, outcome: "cancelled" as any },
+          now
+        ),
         updatedAt: Math.max(now, current.updatedAt),
         completedAt: now,
       });
@@ -719,6 +733,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
       verificationFindings: Object.freeze(findings),
       verificationAttempts: attempt,
       data: mergedData,
+      ...appendHistoryEntry(
+        current,
+        "verify",
+        `Verification rejected (attempt ${attempt}/${maxAttempts}); run blocked for human review`,
+        { decision: "rejected", attempt: attempt as any, outcome: "blocked" as any },
+        now
+      ),
       updatedAt: Math.max(now, current.updatedAt),
     });
   }
@@ -748,6 +769,13 @@ export function applyVerifyRun(current: WorkflowRun, options: VerifyCompletionOp
     verificationFindings: Object.freeze(findings),
     verificationAttempts: attempt,
     data: Object.freeze(cleanedData),
+    ...appendHistoryEntry(
+      current,
+      "verify",
+      `Verification rejected (attempt ${attempt}/${maxAttempts}); returning to step "${returnStep}"`,
+      { decision: "rejected", attempt: attempt as any, outcome: "retry" as any, returnStep: returnStep as any },
+      now
+    ),
     updatedAt: Math.max(now, current.updatedAt),
   });
 }
