@@ -250,6 +250,7 @@ When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral i
 
 - **Current-Run Scoping**: Model tools mutate only the currently executing workflow run. The model never passes raw run IDs or internal scheduler task IDs.
 - **Fail-Closed Execution**: Calling tools outside an active iteration immediately fails closed with `WorkflowIterationError`.
+- **Per-Instance Ownership**: Every scheduler adapter carries a durable owner identity. A run with a live lease may only be dispatched, reconnected, or mutated by its owning instance; other instances skip it, and dispatch/tool calls fail closed with `WorkflowOwnershipError`. Ownership is only transferred after the previous lease expires (or is released), and takeover is recorded durably.
 - **Exclusivity**: Only one workflow iteration turn may hold the active mutation context at any time. Dispatching a new run or turn safely replaces the previous binding and increments the monotonic generation counter.
 - **Strict Turn Signal Identity (No Unsafe Fallback)**: Model-facing tools FAIL CLOSED unless BOTH:
   1. The active iteration was dispatched with a turn-bound `AbortSignal` (`binding.signal`);
@@ -259,7 +260,7 @@ When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral i
 - **Stale Late Tool Call Protection**: Every iteration turn is assigned a unique token and a monotonic generation counter. Asynchronous tool calls capture the turn token/generation at execution start and re-verify before and after applying state mutations. If an earlier turn settled, aborted, or was replaced before the tool completed, the mutation is rejected with `WorkflowStaleIterationError`.
 - **Lifecycle Guarantees**: Blocked or terminal runs cannot continue scheduling (`workflow_continue` fails closed). Blocking or completing a run cancels any scheduled wakeup via the scheduler port.
 - **Automatic Lifecycle Cleanup**: Active iteration bindings are safely cleared on session reload (`session_start`), session tree switching (`session_tree`), agent settlement (`agent_settled`), and process shutdown (`session_shutdown`).
-- **Trusted Direct Dispatcher & Registry APIs**: Programmatic extensions that need to address a run directly can use trusted registry and dispatcher APIs (`dispatcher.beginIteration`, `dispatcher.withIteration`, `registry.transitionStep`, `registry.blockRun`, `registry.completeRun`) with explicit run IDs. Model-facing tools, however, strictly enforce turn-bound signal identity.
+- **Trusted Direct Dispatcher & Registry APIs**: Programmatic extensions that need to address a run directly can use trusted registry and dispatcher APIs (`dispatcher.beginIteration`, `dispatcher.withIteration`, `registry.transitionStep`, `registry.blockRun`, `registry.completeRun`) with explicit run IDs. When a run carries a live ownership lease, `beginIteration` must be given the owning instance's `ownerId` (`adapter.dispatchIteration` does this automatically); dispatching a live-leased run without proof of ownership fails closed with `WorkflowOwnershipError`. Model-facing tools strictly enforce turn-bound signal identity and re-verify ownership.
 
 ### Dispatcher & Scheduler Port Boundary
 
@@ -430,14 +431,34 @@ During `adapter.reconcile()`:
 ### 5. Work Ownership & Lease Metadata
 
 Durable lease metadata (`run.lease`) records owner identity and expiration timestamps. Duplicate workflow instances cannot both believe they own the same logical run:
-- Acquiring an active lease by another owner fails closed with `WorkflowOwnershipError`.
+
+- Every `LoopSchedulerAdapter` instance carries a stable per-instance identity (`ownerId`, defaulting to `<sessionId>:inst-<random>`), which is stamped into durable leases and iteration prompts (`- Owner: <ownerId>`).
+- Acquiring or renewing an active lease held by another live owner fails closed with `WorkflowOwnershipError`.
+- Production dispatch paths (`handleBeforeAgentStart`, `handleTurnStart`, `dispatchIteration`) always pass the real per-instance `ownerId` into the dispatcher. `beginIteration` refuses to dispatch a run while a *live* lease is held by a different owner or when ownership is not proven, and model tools re-verify ownership on every call (`assertToolBinding`), so a lease taken over mid-iteration causes the stale turn to fail closed.
+- On session reconstruction, a nonterminal run leased by a **different, still-live** instance is skipped (diagnostic `run-leased-by-other`) rather than duplicated. After the lease **expires**, the reconciling instance takes it over deterministically, renewing the durable lease before reconnecting the *same* live task and recording a `scheduler_reconnected` recovery event.
+- The lease is heartbeated (renewed) when an owning instance starts an iteration turn, so a crashed instance's lease lapses no later than `leaseDurationMs` (default 15 minutes) after its last turn, bounding fail-closed stall time before takeover.
 - Generic claim tokens (`getEffectClaimToken(runId, effectKey)`) provide stable identifiers for external resource tagging and branching.
+
+### 5b. Stale Linkage & Cross-Link Safety
+
+- **Stale run↔task link**: If `run.loopTaskId` points at a task that no longer exists while exactly one live task declares the run (and ownership can be proven, e.g. the task's `- Owner:` marker matches or the previous lease expired), the adapter reconnects the live task in place, updates durable linkage, and records `scheduler_reconnected` — it never creates a duplicate task.
+- **Unprovable ownership**: If a live task declares the run but its ownership cannot be proven and takeover is disallowed, the adapter fails closed: the run is blocked `human-required`, the unverified task is stopped, and `scheduler_ambiguous` is recorded.
+- **Terminal cross-links**: A terminal run whose linkage points at a **user `/loop`** task or **another run's** task never stops or deletes that task; the bogus linkage is cleared (in-memory and durable) and a `cross-point-user-task` / `cross-point-other-run` diagnostic plus `scheduler_cleaned` recovery event are emitted.
+- **Active run → user task**: An active run linked to a non-workflow task is blocked `human-required`, its bogus durable linkage is cleared, and the user task is strictly preserved.
+- **Direct control safety**: `/workflow pause` / `/workflow stop` (via `cancelWakeup`) validates the authoritative task and its prompt before stopping anything. A linked task belonging to another run or a user `/loop` task is refused and left untouched (fail closed) rather than stopped blindly; stale links to absent tasks are cleared so pause/stop are not blocked forever.
+- **Ownership before budget**: `scheduleRun` proves ownership *before* any registry mutation, so a non-owner can never trigger a budget-driven cancel/block of another live owner's run.
+
 
 ### 6. Durable History & Visibility
 
 All recovery events (such as `effect_ambiguous`, `effect_reconciled`, `scheduler_reconnected`, `scheduler_recreated`, `scheduler_cleaned`, `scheduler_ambiguous`) are recorded in chronological run history:
 - Accessible programmatically via `registry.getRunHistory(runId)` and `registry.getRunRecoveryEvents(runId)`.
 - Visible to operators in `/workflow status <run-id>` with explicit warnings when reconciliation is required.
+
+**Synthesized vs persisted recovery events:**
+- **Persisted** events (e.g. `effect_reconciled`, `scheduler_reconnected`) are written through registry mutation methods and appended as session entries; they are replayed on reconstruction.
+- **Synthesized** events are derived during replay when a `started` effect on a non-terminal run is encountered (the run was interrupted before `workflow_effect_commit`). They are marked `details.synthesized === true`, use deterministic ids (`recov-<runId>-<effectKey>`) and the effect's `startedAt` timestamp, and are added to BOTH `recoveryEvents` and `history`. They are intentionally NOT persisted as new session entries, so repeated reconstruction/`refresh()` is idempotent and never duplicates them.
+
 
 
 ### Deterministic Prompt Construction

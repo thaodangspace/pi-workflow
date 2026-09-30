@@ -4,6 +4,7 @@ import {
   createLoopSchedulerAdapter,
   createWorkflowRunRegistry,
   createWorkflowTools,
+  extractWorkflowOwnerId,
   formatNextWakeup,
   getAmbiguousEffects,
   getEffectClaimToken,
@@ -501,7 +502,9 @@ Body`,
 
       const recon = await adapter.reconcile({ recreateMissing: false });
 
-      assert.equal(recon.blocked.length, 2); // runA blocked for mismatch, runB blocked for missing task
+      assert.equal(recon.blocked.length, 1); // runA blocked; runB safely reconnects its matching task
+      assert.equal(recon.matched.length, 1);
+      assert.equal(recon.matched[0].runId, runB.id);
       const blockedRunA = registry.requireRun(runA.id);
       assert.equal(blockedRunA.lifecycle, "blocked");
       assert.match(blockedRunA.blocker?.reason ?? "", /belongs to run "wfrun-mismatch-B", but run "wfrun-mismatch-A" links to it/);
@@ -607,6 +610,571 @@ Body`,
   });
 
   // =========================================================================
+  // 3b. Production Ownership Enforcement, Takeover, and Linkage Safety
+  // =========================================================================
+  describe("Production Ownership Enforcement, Takeover & Linkage Safety", () => {
+    it("same-session dual instances: only the lease owner may intercept, bind, or dispatch", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcherA = new WorkflowDispatcher(registry);
+      const dispatcherB = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapterA = createLoopSchedulerAdapter({
+        registry,
+        dispatcher: dispatcherA,
+        service: loopService,
+        ownerId: "owner-A",
+      });
+      const adapterB = createLoopSchedulerAdapter({
+        registry,
+        dispatcher: dispatcherB,
+        service: loopService,
+        ownerId: "owner-B",
+      });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const { run, task } = await adapterA.startRun(def, { runId: "wfrun-dual" });
+
+      const leased = registry.requireRun(run.id);
+      assert.equal(leased.lease?.ownerId, "owner-A");
+      assert.equal(extractWorkflowOwnerId(task.prompt), "owner-A");
+      assert.equal(loopService.listTasks().length, 1);
+
+      // Non-owner must not reconnect, adopt, or recreate the run's task.
+      const reconB = await adapterB.reconcile();
+      assert.equal(reconB.matched.length, 0);
+      assert.equal(reconB.recreated.length, 0);
+      assert(reconB.diagnostics.some((d) => d.code === "run-leased-by-other"));
+      assert.equal(loopService.listTasks().length, 1);
+
+      // Non-owner must not intercept or bind the run's turn.
+      assert.equal(adapterB.handleBeforeAgentStart({ prompt: task.prompt }), undefined);
+      assert.equal(adapterB.handleTurnStart({ signal: new AbortController().signal }, task.prompt), undefined);
+
+      // Non-owner programmatic dispatch fails closed with owner diagnostics.
+      assert.throws(
+        () => adapterB.dispatchIteration(run.id),
+        (err: any) => {
+          assert(err instanceof WorkflowOwnershipError);
+          assert.equal(err.currentOwnerId, "owner-A");
+          assert.equal(err.requestedOwnerId, "owner-B");
+          return true;
+        }
+      );
+
+      // Non-owner programmatic wakeup reschedule also fails closed.
+      await assert.rejects(
+        async () => {
+          await adapterB.scheduleWakeup({ runId: run.id, delayMs: 60_000 });
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowOwnershipError);
+          assert.equal(err.currentOwnerId, "owner-A");
+          return true;
+        }
+      );
+
+      // Non-owner cancellation also fails closed; the owner's task remains alive.
+      await assert.rejects(
+        async () => {
+          await adapterB.cancelWakeup(run.id);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowOwnershipError);
+          assert.equal(err.currentOwnerId, "owner-A");
+          return true;
+        }
+      );
+      assert.equal(loopService.listTasks().length, 1);
+
+      // Owner still intercepts, binds, and can use model tools.
+      const before = adapterA.handleBeforeAgentStart({ prompt: task.prompt });
+      assert(before?.message);
+      const ac = new AbortController();
+      const binding = adapterA.handleTurnStart({ signal: ac.signal });
+      assert(binding);
+      assert.equal(binding.ownerId, "owner-A");
+
+      const getContextTool = createWorkflowTools({ dispatcher: dispatcherA, registry }).find(
+        (t) => t.name === "workflow_get_context"
+      )!;
+      const ctxResult = await getContextTool.execute("ctx", {}, ac.signal, undefined, {} as any);
+      assert.equal((ctxResult.details as any).runId, run.id);
+
+      adapterA.handleAgentSettled();
+      assert.equal(dispatcherA.getActiveIteration(), undefined);
+    });
+
+    it("expired lease is taken over by another instance, then the former owner is denied", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcherA = new WorkflowDispatcher(registry);
+      const dispatcherB = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapterA = createLoopSchedulerAdapter({
+        registry,
+        dispatcher: dispatcherA,
+        service: loopService,
+        ownerId: "owner-A",
+      });
+      const adapterB = createLoopSchedulerAdapter({
+        registry,
+        dispatcher: dispatcherB,
+        service: loopService,
+        ownerId: "owner-B",
+      });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const { run, task } = await adapterA.startRun(def, { runId: "wfrun-takeover" });
+      const expiry = registry.requireRun(run.id).lease!.expiresAt!;
+
+      // B tries before expiry: denied/skipped, no duplicate task.
+      const beforeExpiry = await adapterB.reconcile({ now: expiry - 1 });
+      assert.equal(beforeExpiry.matched.length, 0);
+      assert.equal(loopService.listTasks().length, 1);
+      assert.equal(registry.requireRun(run.id).lease?.ownerId, "owner-A");
+
+      // After expiry: B deterministically takes over the SAME task and records the lease.
+      const afterExpiry = await adapterB.reconcile({ now: expiry + 1 });
+      assert.equal(afterExpiry.matched.length, 1);
+      assert.equal(afterExpiry.matched[0].taskId, task.id);
+      assert.equal(afterExpiry.recreated.length, 0);
+      assert.equal(loopService.listTasks().length, 1);
+      assert.equal(registry.requireRun(run.id).lease?.ownerId, "owner-B");
+
+      // Former owner A is now denied dispatch of the run it no longer owns.
+      assert.throws(
+        () => adapterA.dispatchIteration(run.id),
+        (err: any) => {
+          assert(err instanceof WorkflowOwnershipError);
+          assert.equal(err.currentOwnerId, "owner-B");
+          return true;
+        }
+      );
+
+      // New owner B can dispatch.
+      const binding = adapterB.dispatchIteration(run.id, { incrementTurns: false });
+      assert.equal(binding.ownerId, "owner-B");
+      dispatcherB.endIteration();
+    });
+
+    it("model tools fail closed if ownership of the run is taken over mid-iteration", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({
+        registry,
+        dispatcher,
+        service: loopService,
+        ownerId: "owner-A",
+      });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const { run, task } = await adapter.startRun(def, { runId: "wfrun-mid-takeover" });
+
+      const ac = new AbortController();
+      const binding = adapter.handleTurnStart({ signal: ac.signal }, task.prompt);
+      assert(binding);
+
+      // Simulate another instance forcibly taking over after expiry while this turn is live.
+      const future = Date.now() + 60 * 60_000;
+      registry.acquireLease(run.id, {
+        ownerId: "owner-B",
+        expiresAt: Date.now() + 90 * 60_000,
+        now: future,
+      });
+
+      const continueTool = createWorkflowTools({ dispatcher, registry }).find(
+        (t) => t.name === "workflow_continue"
+      )!;
+      await assert.rejects(
+        async () => {
+          await continueTool.execute("call", { delay: "5m" }, ac.signal, undefined, {} as any);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowOwnershipError);
+          assert.equal(err.currentOwnerId, "owner-B");
+          assert.equal(err.requestedOwnerId, "owner-A");
+          return true;
+        }
+      );
+    });
+
+    it("live task with stale run linkage is reconnected deterministically without creating a duplicate", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({
+        registry,
+        dispatcher,
+        service: loopService,
+        ownerId: "owner-A",
+      });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const { run, task } = await adapter.startRun(def, { runId: "wfrun-stale-link" });
+
+      // The original task is gone and run.loopTaskId is stale; a replacement live task
+      // exists in pi-loop whose prompt declares this run (and its owner).
+      loopService.deleteTask(task.id);
+      const liveTask = loopService.scheduleSelfPaced(dispatcher.buildPrompt(run.id));
+      registry.updateRun(run.id, { loopTaskId: "task-ghost-missing" });
+
+      const recon = await adapter.reconcile();
+
+      assert.equal(recon.matched.length, 1);
+      assert.equal(recon.matched[0].runId, run.id);
+      assert.equal(recon.matched[0].taskId, liveTask.id);
+      assert.equal(recon.recreated.length, 0);
+      assert.equal(loopService.listTasks().length, 1);
+      assert.equal(loopService.listTasks()[0].id, liveTask.id);
+      assert.equal(registry.requireRun(run.id).loopTaskId, liveTask.id);
+      assert.equal(adapter.getLinkedTaskId(run.id), liveTask.id);
+
+      const recEvents = registry.requireRun(run.id).recoveryEvents?.filter((e) => e.type === "scheduler_reconnected");
+      assert.equal(recEvents?.length, 1);
+    });
+
+    it("terminal run linked to a user /loop task clears linkage but never touches the user task", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const run = registry.createRun(def, { runId: "wfrun-term-userlink" });
+      const userTask = loopService.scheduleFixed(5 * 60_000, "user maintenance loop");
+      registry.updateRun(run.id, { loopTaskId: userTask.id });
+      registry.completeRun(run.id, { summary: "Done" });
+
+      const recon = await adapter.reconcile();
+
+      // User /loop task is strictly preserved.
+      assert.equal(loopService.listTasks().length, 1);
+      assert.equal(loopService.listTasks()[0].id, userTask.id);
+      assert(recon.diagnostics.some((d) => d.code === "cross-point-user-task" && d.runId === run.id));
+      assert.equal(recon.orphans.length, 0);
+    });
+
+    it("terminal run linked to another live run's task never stops the other run's task", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+
+      const def = parseWorkflowContent(
+        `---
+name: multi-run-crosslink-wf
+description: cross link definition
+mode: self-paced
+concurrency:
+  maxRuns: 5
+---
+Body`,
+        { path: "/multi.md", scope: "project" }
+      );
+      const runT = registry.createRun(def, { runId: "wfrun-term-T" });
+      const runU = registry.createRun(def, { runId: "wfrun-term-U" });
+      const taskU = loopService.scheduleSelfPaced(`- Run ID: ${runU.id}`);
+      registry.updateRun(runT.id, { loopTaskId: taskU.id });
+      registry.completeRun(runT.id, { summary: "T done" });
+
+      const recon = await adapter.reconcile();
+
+      // Other run's task stays alive and is reconnected to its true owner.
+      assert(loopService.listTasks().some((t) => t.id === taskU.id));
+      assert(recon.diagnostics.some((d) => d.code === "cross-point-other-run" && d.runId === runT.id));
+      assert.equal(recon.matched.some((m) => m.runId === runU.id && m.taskId === taskU.id), true);
+      assert.equal(registry.requireRun(runT.id).lifecycle, "completed");
+    });
+
+    it("active run linked to a user task blocks fail-closed and preserves the user task", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const run = registry.createRun(def, { runId: "wfrun-active-userlink" });
+      const userTask = loopService.scheduleFixed(5 * 60_000, "user maintenance loop");
+      registry.updateRun(run.id, { loopTaskId: userTask.id });
+
+      const recon = await adapter.reconcile();
+
+      assert(loopService.listTasks().some((t) => t.id === userTask.id));
+      assert.equal(recon.blocked.length, 1);
+      assert.equal(recon.blocked[0].runId, run.id);
+      const blocked = registry.requireRun(run.id);
+      assert.equal(blocked.lifecycle, "blocked");
+      assert.equal(blocked.blocker?.category, "human-required");
+      assert.equal(blocked.loopTaskId, undefined);
+    });
+
+    it("crash after effect-begin: blind re-begin and unrelated new effects are refused until reconciled", async () => {
+      const session = new FakeSessionManager();
+      const registry1 = new WorkflowRunRegistry(session);
+      const dispatcher1 = new WorkflowDispatcher(registry1);
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+
+      const run1 = registry1.createRun(def, { runId: "wfrun-blind-rebegin" });
+      registry1.transitionStep(run1.id, { toStep: "CREATING_PR" });
+
+      const ac1 = new AbortController();
+      dispatcher1.beginIteration(run1.id, { signal: ac1.signal, incrementTurns: false });
+      const tools1 = createWorkflowTools({ dispatcher: dispatcher1, registry: registry1 });
+      await tools1.find((t) => t.name === "workflow_effect_begin")!.execute(
+        "begin",
+        { key: "create-pr", kind: "github.pull_request.create" },
+        ac1.signal,
+        undefined,
+        {} as any
+      );
+      dispatcher1.endIteration();
+
+      // Crash & restart
+      const registry2 = new WorkflowRunRegistry(session);
+      registry2.reconstructFromSession();
+      const reloaded = registry2.requireRun("wfrun-blind-rebegin");
+      assert.equal(hasAmbiguousEffects(reloaded), true);
+
+      const dispatcher2 = new WorkflowDispatcher(registry2);
+      const ac2 = new AbortController();
+      dispatcher2.beginIteration(reloaded.id, { signal: ac2.signal, incrementTurns: false });
+      const tools2 = createWorkflowTools({ dispatcher: dispatcher2, registry: registry2 });
+      const beginTool = tools2.find((t) => t.name === "workflow_effect_begin")!;
+
+      // Re-begin of the same ambiguous key must be refused (no blind replay).
+      await assert.rejects(
+        async () => {
+          await beginTool.execute("rebegin", { key: "create-pr", kind: "github.pull_request.create" }, ac2.signal, undefined, {} as any);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowAmbiguousEffectError);
+          assert.equal(err.ambiguousKey, "create-pr");
+          return true;
+        }
+      );
+
+      // An unrelated new effect is also refused while an ambiguous effect is outstanding.
+      await assert.rejects(
+        async () => {
+          await beginTool.execute("other", { key: "post-notice", kind: "slack.post" }, ac2.signal, undefined, {} as any);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowAmbiguousEffectError);
+          return true;
+        }
+      );
+
+      const stillAmbiguous = registry2.requireRun(reloaded.id);
+      assert.equal(stillAmbiguous.effects?.["create-pr"].status, "started");
+      assert.equal(stillAmbiguous.effects?.["post-notice"], undefined);
+    });
+
+    it("scheduled run interrupted after effect-begin resumes reconciliation after lease takeover", async () => {
+      const session = new FakeSessionManager();
+      const registry1 = new WorkflowRunRegistry(session);
+      const dispatcher1 = new WorkflowDispatcher(registry1);
+      const loopService = new FakeLoopService();
+      const adapterA = createLoopSchedulerAdapter({
+        registry: registry1,
+        dispatcher: dispatcher1,
+        service: loopService,
+        ownerId: "owner-A",
+      });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const { run, task } = await adapterA.startRun(def, { runId: "wfrun-crash-leased" });
+      registry1.transitionStep(run.id, { toStep: "CREATING_PR" });
+
+      // Real external action intent persisted, then process crashes before commit.
+      const ac1 = new AbortController();
+      dispatcher1.beginIteration(run.id, {
+        ownerId: "owner-A",
+        signal: ac1.signal,
+        schedulerPort: adapterA.getSchedulerPort(run.id),
+        incrementTurns: false,
+      });
+      await createWorkflowTools({ dispatcher: dispatcher1, registry: registry1 })
+        .find((t) => t.name === "workflow_effect_begin")!
+        .execute("b", { key: "create-pr", kind: "github.pull_request.create" }, ac1.signal, undefined, {} as any);
+      dispatcher1.endIteration();
+
+      // CRASH & RELOAD: reconstruct durable state; started effect becomes ambiguous.
+      const registry2 = new WorkflowRunRegistry(session);
+      registry2.reconstructFromSession();
+      const reloaded = registry2.requireRun(run.id);
+      assert.equal(hasAmbiguousEffects(reloaded), true);
+
+      const dispatcher2 = new WorkflowDispatcher(registry2);
+      assert.match(dispatcher2.buildPrompt(run.id), /RECOVERY REQUIRED/);
+
+      // New instance must not steal the still-leased run before expiry.
+      const adapterB = createLoopSchedulerAdapter({
+        registry: registry2,
+        dispatcher: dispatcher2,
+        service: loopService,
+        ownerId: "owner-B",
+      });
+      const preExpiry = await adapterB.reconcile();
+      assert.equal(preExpiry.matched.length, 0);
+      assert(preExpiry.diagnostics.some((d) => d.code === "run-leased-by-other"));
+
+      // After expiry, the new instance takes over the SAME task and resumes reconciliation.
+      const expiry = reloaded.lease!.expiresAt!;
+      const postExpiry = await adapterB.reconcile({ now: expiry + 1 });
+      assert.equal(postExpiry.matched.length, 1);
+      assert.equal(postExpiry.matched[0].taskId, task.id);
+      assert.equal(registry2.requireRun(run.id).lease?.ownerId, "owner-B");
+
+      const acB = new AbortController();
+      const binding = adapterB.handleTurnStart({ signal: acB.signal }, dispatcher2.buildPrompt(run.id));
+      assert(binding);
+      assert.equal(binding.ownerId, "owner-B");
+
+      // Blind completion is refused while the effect remains ambiguous.
+      const completeTool = createWorkflowTools({ dispatcher: dispatcher2, registry: registry2 }).find(
+        (t) => t.name === "workflow_complete"
+      )!;
+      await assert.rejects(
+        async () => {
+          await completeTool.execute("c", { summary: "done" }, acB.signal, undefined, {} as any);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowAmbiguousEffectError);
+          assert.equal(err.ambiguousKey, "create-pr");
+          return true;
+        }
+      );
+      adapterB.handleAgentSettled();
+    });
+
+    it("scheduleRun denies a non-owner BEFORE budget exhaustion can cancel/block the run", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapterA = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+      const adapterB = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-B" });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const run = registry.createRun(def, { runId: "wfrun-budget-owner", budget: { maxTurns: 1 } });
+      // Exhaust the turn budget and place a live lease owned by A.
+      registry.updateRun(run.id, { turns: 1 });
+      registry.acquireLease(run.id, { ownerId: "owner-A", expiresAt: Date.now() + 15 * 60_000 });
+
+      assert.equal(registry.requireRun(run.id).lifecycle, "active");
+
+      // Non-owner scheduling must fail on ownership WITHOUT running the budget
+      // cancel/block mutation first.
+      await assert.rejects(
+        async () => {
+          await adapterB.scheduleRun(run.id);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowOwnershipError);
+          assert.equal(err.currentOwnerId, "owner-A");
+          return true;
+        }
+      );
+
+      const after = registry.requireRun(run.id);
+      assert.equal(after.lifecycle, "active");
+      assert.equal(after.blocker, undefined);
+      assert.equal(after.lease?.ownerId, "owner-A");
+      assert.equal(loopService.listTasks().length, 0);
+    });
+
+    it("direct control refuses to stop a task cross-linked to another run and preserves it", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+      const controller = new WorkflowCommandController({ registry, adapter, dispatcher, cwd: process.cwd() });
+
+      const def = parseWorkflowContent(
+        `---
+name: ctrl-crosslink-wf
+description: control cross link definition
+mode: self-paced
+concurrency:
+  maxRuns: 5
+---
+Body`,
+        { path: "/multi.md", scope: "project" }
+      );
+      const runA = registry.createRun(def, { runId: "wfrun-ctrl-A" });
+      const runB = registry.createRun(def, { runId: "wfrun-ctrl-B" });
+      const taskB = loopService.scheduleSelfPaced(`- Run ID: ${runB.id}`);
+      // Corrupt linkage: runA points at runB's live task.
+      registry.updateRun(runA.id, { loopTaskId: taskB.id });
+
+      const pauseRes = await controller.executePause(runA.id);
+      assert.equal(pauseRes.ok, false);
+      assert.match(pauseRes.output, /Refusing to stop scheduler task/);
+      assert(loopService.listTasks().some((t) => t.id === taskB.id));
+      assert.equal(registry.requireRun(runA.id).lifecycle, "active");
+
+      const stopRes = await controller.executeStop(runA.id);
+      assert.equal(stopRes.ok, false);
+      assert.match(stopRes.output, /Refusing to stop scheduler task/);
+      assert(loopService.listTasks().some((t) => t.id === taskB.id));
+      assert.equal(registry.requireRun(runA.id).lifecycle, "active");
+    });
+
+    it("direct control refuses to stop a user /loop task cross-linked to a run and preserves it", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+      const controller = new WorkflowCommandController({ registry, adapter, dispatcher, cwd: process.cwd() });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const run = registry.createRun(def, { runId: "wfrun-ctrl-userlink" });
+      const userTask = loopService.scheduleFixed(5 * 60_000, "user maintenance loop");
+      registry.updateRun(run.id, { loopTaskId: userTask.id });
+
+      const pauseRes = await controller.executePause(run.id);
+      assert.equal(pauseRes.ok, false);
+      assert.match(pauseRes.output, /Refusing to stop scheduler task/);
+      assert(loopService.listTasks().some((t) => t.id === userTask.id));
+      assert.equal(registry.requireRun(run.id).lifecycle, "active");
+
+      const stopRes = await controller.executeStop(run.id);
+      assert.equal(stopRes.ok, false);
+      assert(loopService.listTasks().some((t) => t.id === userTask.id));
+      assert.equal(registry.requireRun(run.id).lifecycle, "active");
+    });
+
+    it("direct control still stops a correctly linked task and preserves unrelated user tasks", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const loopService = new FakeLoopService();
+      const adapter = createLoopSchedulerAdapter({ registry, dispatcher, service: loopService, ownerId: "owner-A" });
+      const controller = new WorkflowCommandController({ registry, adapter, dispatcher, cwd: process.cwd() });
+
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+      const { run, task } = await adapter.startRun(def, { runId: "wfrun-ctrl-ok" });
+      const userTask = loopService.scheduleFixed(5 * 60_000, "user maintenance loop");
+
+      const pauseRes = await controller.executePause(run.id);
+      assert.equal(pauseRes.ok, true);
+      assert.equal(registry.requireRun(run.id).lifecycle, "paused");
+      assert.equal(loopService.listTasks().some((t) => t.id === task.id), false);
+      assert(loopService.listTasks().some((t) => t.id === userTask.id));
+      assert.equal(adapter.getLinkedTaskId(run.id), undefined);
+    });
+  });
+
+  // =========================================================================
   // 4. Command Status Inspection & Visibility (Acceptance Criteria 7)
   // =========================================================================
   describe("Visibility in Run History and Status Command", () => {
@@ -655,6 +1223,80 @@ Body`,
       assert(actions.includes("effect_begin"));
       assert(actions.includes("effect_commit"));
       assert(actions.includes("complete"));
+    });
+
+    it("records the synthesized effect_ambiguous recovery event in run history after reload", () => {
+      const session = new FakeSessionManager();
+      const registry1 = new WorkflowRunRegistry(session);
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+
+      const run1 = registry1.createRun(def, { runId: "wfrun-history-ambig" });
+      registry1.beginEffect(run1.id, { key: "create-pr", kind: "github.pull_request.create" });
+
+      // Reload from durable session entries.
+      const registry2 = new WorkflowRunRegistry();
+      const result1 = registry2.reconstructFromSession(session);
+      const reloaded1 = result1.runs.find((r) => r.id === "wfrun-history-ambig")!;
+      assert.equal(hasAmbiguousEffects(reloaded1), true);
+
+      const expectedEventId = "recov-wfrun-history-ambig-create-pr";
+      const startedAt = reloaded1.effects!["create-pr"].startedAt;
+
+      // The synthesized recovery event is exposed in run history (issue #7 acceptance).
+      const historyHit = registry2
+        .getRunHistory(reloaded1.id)
+        .filter((h) => h.eventId === expectedEventId);
+      assert.equal(historyHit.length, 1);
+      assert.equal(historyHit[0].action, "recovery");
+      assert.match(historyHit[0].summary, /effect_ambiguous/);
+      assert.match(historyHit[0].summary, /create-pr/);
+      assert.equal(historyHit[0].timestamp, startedAt);
+      assert.equal((historyHit[0].details as any)?.synthesized, true);
+
+      // The recovery event itself carries the same deterministic id and flags synthesized.
+      const recEvent = reloaded1.recoveryEvents!.find((e) => e.eventId === expectedEventId)!;
+      assert.equal(recEvent.type, "effect_ambiguous");
+      assert.equal((recEvent.details as any)?.synthesized, true);
+
+      // Repeated reconstruction is deterministic and never duplicates the synthesized entry.
+      const result2 = registry2.reconstructFromSession(session);
+      const reloaded2 = result2.runs.find((r) => r.id === "wfrun-history-ambig")!;
+      assert.deepEqual(reloaded2, reloaded1);
+      assert.equal(reloaded2.history!.filter((h) => h.eventId === expectedEventId).length, 1);
+      assert.equal(reloaded2.recoveryEvents!.filter((e) => e.eventId === expectedEventId).length, 1);
+
+      // The refresh() path (session_start/session_tree) is idempotent too.
+      registry2.refresh();
+      const reloaded3 = registry2.requireRun("wfrun-history-ambig");
+      assert.deepEqual(reloaded3, reloaded1);
+      assert.equal(reloaded3.history!.filter((h) => h.eventId === expectedEventId).length, 1);
+    });
+
+    it("marks started effects ambiguous after reload even for paused/blocked nonterminal runs", () => {
+      const session = new FakeSessionManager();
+      const registry1 = new WorkflowRunRegistry(session);
+      const def = parseWorkflowContent(WORKFLOW_DEF_YAML, { path: "/rec.md", scope: "project" });
+
+      const run1 = registry1.createRun(def, { runId: "wfrun-paused-ambig" });
+      registry1.beginEffect(run1.id, { key: "deploy", kind: "kubernetes.deploy" });
+      registry1.pauseRun(run1.id, { reason: "Paused mid-effect" });
+
+      const registry2 = new WorkflowRunRegistry(session);
+      registry2.reconstructFromSession();
+      const reloaded = registry2.requireRun("wfrun-paused-ambig");
+
+      assert.equal(reloaded.lifecycle, "paused");
+      assert.equal(hasAmbiguousEffects(reloaded), true);
+      assert.equal(
+        reloaded.recoveryEvents!.some(
+          (e) => e.type === "effect_ambiguous" && e.eventId === "recov-wfrun-paused-ambig-deploy"
+        ),
+        true
+      );
+      assert.equal(
+        reloaded.history!.some((h) => h.eventId === "recov-wfrun-paused-ambig-deploy"),
+        true
+      );
     });
   });
 });

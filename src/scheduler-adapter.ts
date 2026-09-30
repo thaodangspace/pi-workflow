@@ -10,9 +10,10 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { DEFAULT_LEASE_DURATION_MS } from "./constants.ts";
 import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { parseDuration } from "./duration.ts";
-import { extractWorkflowRunId } from "./prompt.ts";
+import { extractWorkflowOwnerId, extractWorkflowRunId } from "./prompt.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
 import { isTerminalLifecycle, checkRunBudgetExhaustion } from "./run.ts";
 import {
@@ -23,8 +24,10 @@ import {
   type WorkflowDefinitionV1,
   WorkflowBudgetExhaustedError,
   WorkflowInvalidTransitionError,
+  WorkflowOwnershipError,
   type WorkflowRun,
   WorkflowRunError,
+  type WorkflowRunLease,
   type WorkflowScheduleWakeupParams,
   type WorkflowSchedulerPort,
   type WorkflowSnapshotV1,
@@ -327,6 +330,8 @@ export interface ScheduleRunOptions {
   expiresAt?: number;
   /** Explicit absolute execution time for one-shot runs (epoch ms) */
   at?: number;
+  /** Optional ownership lease duration in milliseconds */
+  leaseDurationMs?: number;
 }
 
 export interface StartRunOptions extends ScheduleRunOptions {
@@ -347,6 +352,10 @@ export interface ReconcileOptions {
   recreateMissing?: boolean;
   /** Whether to delete/stop orphan scheduler tasks with no live run (default: true) */
   reconcileOrphans?: boolean;
+  /** Whether to allow taking over un-leased or expired-lease runs upon reload (default: true) */
+  allowTakeover?: boolean;
+  /** Mock timestamp for deterministic expiration testing */
+  now?: number;
 }
 
 export interface WorkflowSchedulerDiagnostic {
@@ -381,6 +390,9 @@ export interface LoopSchedulerAdapterOptions {
   service?: LoopServiceV1;
   events?: EventBusLike;
   discoveryTimeoutMs?: number;
+  ownerId?: string;
+  sessionId?: string;
+  leaseDurationMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +405,9 @@ export interface LoopSchedulerAdapterOptions {
  * runId ↔ loopTaskId linkage, prompt dispatch correlation, and authoritative reconciliation.
  */
 export class LoopSchedulerAdapter {
+  public readonly ownerId: string;
+  public readonly sessionId: string;
+  public readonly leaseDurationMs: number;
   private registry: WorkflowRunRegistry;
   private dispatcher: WorkflowDispatcher;
   private service?: LoopServiceV1;
@@ -410,6 +425,9 @@ export class LoopSchedulerAdapter {
     this.service = options.service;
     this.events = options.events;
     this.discoveryTimeoutMs = options.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS;
+    this.sessionId = options.sessionId ?? options.service?.sessionId ?? "default";
+    this.ownerId = options.ownerId ?? `${this.sessionId}:inst-${randomUUID().slice(0, 8)}`;
+    this.leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
 
     if (this.events) {
       this.bindEvents(this.events);
@@ -514,6 +532,51 @@ export class LoopSchedulerAdapter {
   }
 
   /**
+   * Returns true when an ownership lease is still in force at the given time.
+   * A lease without an expiry never lapses until explicitly released.
+   */
+  private isLeaseLive(lease: WorkflowRunLease | undefined, now: number): boolean {
+    return Boolean(lease && (lease.expiresAt === undefined || lease.expiresAt > now));
+  }
+
+  /**
+   * Returns true when the run is owned by a DIFFERENT, still-live instance.
+   * Such runs must never be dispatched, adopted, or mutated by this instance.
+   */
+  private isOwnedByOther(run: WorkflowRun, now = Date.now()): boolean {
+    return Boolean(run.lease && run.lease.ownerId !== this.ownerId && this.isLeaseLive(run.lease, now));
+  }
+
+  /**
+   * Durable ownership heartbeat: renews the lease for this instance when it is
+   * missing, expired, held by another expired owner, or nearing expiry.
+   * Fails closed if another live instance currently owns the run.
+   * No-ops (no durable churn) when this instance already owns a lease with ample time.
+   */
+  private ensureOwnership(run: WorkflowRun, now = Date.now()): WorkflowRun {
+    if (this.isOwnedByOther(run, now)) {
+      throw new WorkflowOwnershipError(
+        `Cannot claim ownership of run "${run.id}": run is leased to active owner "${run.lease!.ownerId}".`,
+        { runId: run.id, currentOwnerId: run.lease!.ownerId, requestedOwnerId: this.ownerId }
+      );
+    }
+    const refreshThreshold = now + Math.floor(this.leaseDurationMs / 2);
+    if (
+      run.lease &&
+      run.lease.ownerId === this.ownerId &&
+      run.lease.expiresAt !== undefined &&
+      run.lease.expiresAt > refreshThreshold
+    ) {
+      return run;
+    }
+    return this.registry.acquireLease(run.id, {
+      ownerId: this.ownerId,
+      expiresAt: now + this.leaseDurationMs,
+      now,
+    });
+  }
+
+  /**
    * Schedules a task in pi-loop for an existing workflow run based on its definition mode and schedule.
    * Updates the run record and internal maps with the newly allocated loopTaskId.
    */
@@ -521,7 +584,10 @@ export class LoopSchedulerAdapter {
     runOrId: string | WorkflowRun,
     options: ScheduleRunOptions = {}
   ): Promise<LoopTaskSummary> {
-    const run = typeof runOrId === "string" ? this.registry.requireRun(runOrId) : runOrId;
+    const provided = typeof runOrId === "string" ? this.registry.requireRun(runOrId) : runOrId;
+    // Always consult authoritative durable state so ownership/budget checks cannot be
+    // bypassed with a stale snapshot handed in by the caller.
+    const run = this.registry.hasRun(provided.id) ? this.registry.requireRun(provided.id) : provided;
     const service = this.assertServiceAvailable(run.id);
 
     if (run.lifecycle !== "active" && run.lifecycle !== "verifying") {
@@ -532,7 +598,17 @@ export class LoopSchedulerAdapter {
       );
     }
 
-    // Check hard budget limits before scheduling
+    // Ownership MUST be asserted BEFORE any registry mutation. Budget exhaustion below
+    // cancels/blocks the run, so a non-owner must never reach it.
+    const now = Date.now();
+    if (this.isOwnedByOther(run, now)) {
+      throw new WorkflowOwnershipError(
+        `Cannot schedule task for run "${run.id}": run is leased to owner "${run.lease!.ownerId}".`,
+        { runId: run.id, currentOwnerId: run.lease!.ownerId, requestedOwnerId: this.ownerId }
+      );
+    }
+
+    // Check hard budget limits before scheduling (only ever mutates runs we own)
     const exhaustion = checkRunBudgetExhaustion(run);
     if (exhaustion.exhausted) {
       const budgetPolicy = run.budget ?? run.snapshot.budget;
@@ -550,6 +626,13 @@ export class LoopSchedulerAdapter {
         { runId: run.id, dimension: exhaustion.dimension, limit: exhaustion.limit, actual: exhaustion.actual }
       );
     }
+
+    const leaseDurationMs = options.leaseDurationMs ?? this.leaseDurationMs;
+    this.registry.acquireLease(run.id, {
+      ownerId: this.ownerId,
+      expiresAt: now + leaseDurationMs,
+      now,
+    });
 
     // Idempotency: check if run already has a live scheduled task in pi-loop
     const existingTaskId = this.runToTaskMap.get(run.id) ?? run.loopTaskId;
@@ -670,6 +753,12 @@ export class LoopSchedulerAdapter {
     }
 
     const run = this.registry.createRun(definitionOrSnapshot, options);
+    const leaseDurationMs = options.leaseDurationMs ?? this.leaseDurationMs;
+    this.registry.acquireLease(run.id, {
+      ownerId: this.ownerId,
+      expiresAt: Date.now() + leaseDurationMs,
+      leaseToken: `lease-${randomUUID().slice(0, 8)}`,
+    });
     try {
       const task = await this.scheduleRun(run, options);
       return { run: this.registry.requireRun(run.id), task };
@@ -704,6 +793,13 @@ export class LoopSchedulerAdapter {
 
     const run = this.registry.getRun(runId);
     if (run) {
+      // Ownership enforcement: never reschedule another live instance's run.
+      if (this.isOwnedByOther(run)) {
+        throw new WorkflowOwnershipError(
+          `Cannot schedule wakeup for run "${runId}": run is leased to active owner "${run.lease!.ownerId}".`,
+          { runId, currentOwnerId: run.lease!.ownerId, requestedOwnerId: this.ownerId }
+        );
+      }
       const exhaustion = checkRunBudgetExhaustion(run);
       if (exhaustion.exhausted) {
         const budgetPolicy = run.budget ?? run.snapshot.budget;
@@ -744,9 +840,55 @@ export class LoopSchedulerAdapter {
    */
   async cancelWakeup(runId: string): Promise<boolean> {
     const service = this.assertServiceAvailable(runId);
+    // Ownership enforcement: never stop another live instance's scheduler task.
+    const ownedRun = this.registry.getRun(runId);
+    if (ownedRun && this.isOwnedByOther(ownedRun)) {
+      throw new WorkflowOwnershipError(
+        `Cannot cancel scheduler task for run "${runId}": run is leased to active owner "${ownedRun.lease!.ownerId}".`,
+        { runId, currentOwnerId: ownedRun.lease!.ownerId, requestedOwnerId: this.ownerId }
+      );
+    }
     const taskId = this.getLinkedTaskId(runId);
     if (!taskId) {
       return true;
+    }
+
+    // Authoritative task snapshot: fail closed if the scheduler cannot be queried,
+    // so we never mutate based on an unverified in-memory mapping.
+    let liveTasks: LoopTaskSummary[];
+    try {
+      liveTasks = service.listTasks();
+    } catch (listErr) {
+      if (listErr instanceof LoopServiceUnavailableError) {
+        throw new WorkflowSchedulerUnavailableError(listErr.message, runId);
+      }
+      throw new WorkflowSchedulerError(
+        `Failed to verify scheduler task "${taskId}" for run "${runId}": ${listErr instanceof Error ? listErr.message : String(listErr)}`,
+        runId
+      );
+    }
+
+    const linkedTask = liveTasks.find((t) => t.id === taskId);
+    if (!linkedTask) {
+      // Task already absent from authoritative scheduler state: the linkage was stale.
+      // Clear it so pause and stop are not blocked forever.
+      this.clearLinkedTask(runId, taskId);
+      return true;
+    }
+
+    // CRITICAL SAFETY: only stop a task whose prompt provably belongs to THIS run.
+    // A corrupt cross-link to another workflow run or a user /loop task must be
+    // preserved, never stopped.
+    const declaredRunId = extractWorkflowRunId(linkedTask.prompt);
+    if (declaredRunId !== runId) {
+      const owner =
+        declaredRunId !== undefined
+          ? `run "${declaredRunId}"`
+          : "a non-workflow task (likely a user /loop)";
+      throw new WorkflowSchedulerError(
+        `Refusing to stop scheduler task "${taskId}" for run "${runId}": task belongs to ${owner}. Ambiguous linkage requires reconciliation; the task was left untouched.`,
+        runId
+      );
     }
 
     let stopped: boolean;
@@ -763,10 +905,10 @@ export class LoopSchedulerAdapter {
     }
 
     if (!stopped) {
-      // Check authoritative scheduler tasks to verify whether task is already absent
-      let liveTasks: LoopTaskSummary[] = [];
+      // Verify against authoritative scheduler state whether the task is already absent.
+      let afterTasks: LoopTaskSummary[] = [];
       try {
-        liveTasks = service.listTasks();
+        afterTasks = service.listTasks();
       } catch (listErr) {
         if (listErr instanceof LoopServiceUnavailableError) {
           throw new WorkflowSchedulerUnavailableError(listErr.message, runId);
@@ -777,8 +919,7 @@ export class LoopSchedulerAdapter {
         );
       }
 
-      const taskStillPresent = liveTasks.some((t) => t.id === taskId);
-      if (taskStillPresent) {
+      if (afterTasks.some((t) => t.id === taskId)) {
         // Task is still live in scheduler service, but stopTask failed to stop it. Fail closed!
         throw new WorkflowSchedulerError(
           `Failed to stop scheduler task "${taskId}" for run "${runId}": task is still active in scheduler service but could not be stopped.`,
@@ -786,21 +927,28 @@ export class LoopSchedulerAdapter {
         );
       }
       // If task is confirmed absent from scheduler, the linkage was stale.
-      // Clear the stale linkage below so pause and stop are not blocked forever.
     }
 
-    // Success or stale linkage confirmed absent: delete in-memory maps and clear durable linkage in registry
-    this.runToTaskMap.delete(runId);
-    this.taskToRunMap.delete(taskId);
+    // Success or stale linkage confirmed absent: clear linkage (never touch other tasks).
+    this.clearLinkedTask(runId, taskId);
+    return true;
+  }
 
+  /**
+   * Clears in-memory and durable scheduler linkage for a run's task without touching
+   * the scheduler task itself or any other run's mapping.
+   */
+  private clearLinkedTask(runId: string, taskId: string): void {
+    this.runToTaskMap.delete(runId);
+    if (this.taskToRunMap.get(taskId) === runId) {
+      this.taskToRunMap.delete(taskId);
+    }
     if (this.registry.hasRun(runId)) {
       const current = this.registry.getRun(runId);
       if (current && !isTerminalLifecycle(current.lifecycle)) {
         this.registry.updateRun(runId, { loopTaskId: null });
       }
     }
-
-    return true;
   }
 
   /**
@@ -866,16 +1014,14 @@ export class LoopSchedulerAdapter {
       }
     }
 
-    // 1. Reconcile terminal runs: terminal runs must NOT retain live scheduler tasks
+    // 1. Reconcile terminal runs: terminal runs must NOT retain live scheduler tasks.
+    // CRITICAL SAFETY: Reconciliation MUST NOT stop another run's task or a user /loop task
+    // when linkage cross-points!
     const allRuns = this.registry.listRuns();
     for (const run of allRuns) {
       if (isTerminalLifecycle(run.lifecycle)) {
+        // A) Tasks whose prompts explicitly declare run.id:
         const taskList = tasksByRunId.get(run.id) ?? [];
-        const existingTaskId = run.loopTaskId;
-        if (existingTaskId && taskMap.has(existingTaskId) && !taskList.some((t) => t.id === existingTaskId)) {
-          taskList.push(taskMap.get(existingTaskId)!);
-        }
-
         for (const t of taskList) {
           let stopped = false;
           try {
@@ -888,18 +1034,126 @@ export class LoopSchedulerAdapter {
             });
           }
           this.runToTaskMap.delete(run.id);
-          this.taskToRunMap.delete(t.id);
+          if (this.taskToRunMap.get(t.id) === run.id) {
+            this.taskToRunMap.delete(t.id);
+          }
           claimedTaskIds.add(t.id);
           result.orphans.push({ taskId: t.id, runId: run.id, stopped });
+        }
+
+        // B) Check run.loopTaskId cross-pointing:
+        const existingTaskId = run.loopTaskId;
+        if (existingTaskId && taskMap.has(existingTaskId)) {
+          const linkedTask = taskMap.get(existingTaskId)!;
+          const promptRunId = extractWorkflowRunId(linkedTask.prompt);
+
+          if (!promptRunId) {
+            // Task has NO workflow run ID -> It is a USER /loop task or ordinary non-workflow task!
+            // CRITICAL: NEVER stop or delete user /loop tasks!
+            result.diagnostics.push({
+              type: "warning",
+              code: "cross-point-user-task",
+              message: `Terminal run "${run.id}" linked to user task "${existingTaskId}". Linkage cleared without modifying user task.`,
+              runId: run.id,
+            });
+          } else if (promptRunId !== run.id) {
+            // Task prompt belongs to ANOTHER RUN!
+            // CRITICAL: NEVER stop another run's live task!
+            result.diagnostics.push({
+              type: "warning",
+              code: "cross-point-other-run",
+              message: `Terminal run "${run.id}" linked to task "${existingTaskId}" belonging to run "${promptRunId}". Linkage cleared without modifying other run's task.`,
+              runId: run.id,
+            });
+          } else {
+            // Task prompt declared run.id, but wasn't in taskList
+            if (!claimedTaskIds.has(existingTaskId)) {
+              let stopped = false;
+              try {
+                stopped = this.service.deleteTask(existingTaskId);
+              } catch (err) {
+                // ignore
+              }
+              claimedTaskIds.add(existingTaskId);
+              result.orphans.push({ taskId: existingTaskId, runId: run.id, stopped });
+            }
+          }
+          this.runToTaskMap.delete(run.id);
+          if (this.taskToRunMap.get(existingTaskId) === run.id) {
+            this.taskToRunMap.delete(existingTaskId);
+          }
         }
       }
     }
 
     // 2. Reconcile nonterminal runs from registry
     const nonterminalRuns = this.registry.getNonterminalRuns();
+    const reconcileNow = options.now ?? Date.now();
+
     for (const run of nonterminalRuns) {
       const existingTaskId = run.loopTaskId;
       const matchingTasks = tasksByRunId.get(run.id) ?? [];
+
+      // Check if run is leased by another active instance in this or another session
+      const ownedByOther = this.isOwnedByOther(run, reconcileNow);
+
+      if (ownedByOther) {
+        result.diagnostics.push({
+          type: "warning",
+          code: "run-leased-by-other",
+          message: `Run "${run.id}" is leased to another active instance "${run.lease!.ownerId}"; skipping reconciliation by instance "${this.ownerId}".`,
+          runId: run.id,
+        });
+        for (const t of matchingTasks) {
+          claimedTaskIds.add(t.id);
+        }
+        continue;
+      }
+
+      // Check cross-pointing for existingTaskId on nonterminal run:
+      if (existingTaskId && taskMap.has(existingTaskId)) {
+        const linkedTask = taskMap.get(existingTaskId)!;
+        const promptRunId = extractWorkflowRunId(linkedTask.prompt);
+        if (!promptRunId) {
+          // Linkage cross-points to a USER task! Never touch user task.
+          const reason = `Ambiguous scheduler task mapping: run "${run.id}" links to user task "${existingTaskId}". Linkage cleared without modifying user task.`;
+          if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+            this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
+            result.blocked.push({ runId: run.id, reason });
+          }
+          this.runToTaskMap.delete(run.id);
+          if (this.taskToRunMap.get(existingTaskId) === run.id) {
+            this.taskToRunMap.delete(existingTaskId);
+          }
+          this.registry.updateRun(run.id, { loopTaskId: null });
+          try {
+            this.registry.recordRecoveryEvent(run.id, {
+              type: "scheduler_ambiguous",
+              message: reason,
+            });
+          } catch {}
+          continue;
+        } else if (promptRunId !== run.id) {
+          // Linkage cross-points to ANOTHER run's task! Never touch other run's task.
+          const reason = `Ambiguous scheduler task mapping: task "${existingTaskId}" belongs to run "${promptRunId}", but run "${run.id}" links to it.`;
+          if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+            this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
+            result.blocked.push({ runId: run.id, reason });
+          }
+          this.runToTaskMap.delete(run.id);
+          if (this.taskToRunMap.get(existingTaskId) === run.id) {
+            this.taskToRunMap.delete(existingTaskId);
+          }
+          this.registry.updateRun(run.id, { loopTaskId: null });
+          try {
+            this.registry.recordRecoveryEvent(run.id, {
+              type: "scheduler_ambiguous",
+              message: reason,
+            });
+          } catch {}
+          continue;
+        }
+      }
 
       // Check for ambiguous mapping: multiple tasks claiming the same run ID
       if (matchingTasks.length > 1) {
@@ -921,7 +1175,10 @@ export class LoopSchedulerAdapter {
           claimedTaskIds.add(t.id);
         }
         this.runToTaskMap.delete(run.id);
-        if (existingTaskId) this.taskToRunMap.delete(existingTaskId);
+        if (existingTaskId && this.taskToRunMap.get(existingTaskId) === run.id) {
+          this.taskToRunMap.delete(existingTaskId);
+        }
+        this.registry.updateRun(run.id, { loopTaskId: null });
         try {
           this.registry.recordRecoveryEvent(run.id, {
             type: "scheduler_ambiguous",
@@ -934,40 +1191,36 @@ export class LoopSchedulerAdapter {
         continue;
       }
 
-      // Check for mismatched linkage: run.loopTaskId points to a task belonging to a different run
-      if (existingTaskId && taskMap.has(existingTaskId)) {
-        const declaredRunId = extractWorkflowRunId(taskMap.get(existingTaskId)!.prompt);
-        if (declaredRunId && declaredRunId !== run.id) {
-          const reason = `Ambiguous scheduler task mapping: task "${existingTaskId}" belongs to run "${declaredRunId}", but run "${run.id}" links to it.`;
-          if (run.lifecycle === "active" || run.lifecycle === "verifying") {
-            this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
-            result.blocked.push({ runId: run.id, reason });
-          }
-          this.runToTaskMap.delete(run.id);
-          this.taskToRunMap.delete(existingTaskId);
-          try {
-            this.registry.recordRecoveryEvent(run.id, {
-              type: "scheduler_ambiguous",
-              message: reason,
-            });
-          } catch {
-            // ignore
-          }
-          continue;
-        }
-      }
-
       // Check hard budget exhaustion
       const exhaustion = checkRunBudgetExhaustion(run);
       if (exhaustion.exhausted) {
-        if (existingTaskId && taskMap.has(existingTaskId)) {
+        // A budget-exhausted run must not retain live scheduler tasks, whether the
+        // linkage is exact or stale. Stop every live task that declares this run.
+        let cleanedAny = false;
+        for (const t of matchingTasks) {
+          try {
+            this.service.deleteTask(t.id);
+          } catch {
+            // ignore
+          }
+          claimedTaskIds.add(t.id);
+          if (this.taskToRunMap.get(t.id) === run.id) {
+            this.taskToRunMap.delete(t.id);
+          }
+          cleanedAny = true;
+        }
+        if (existingTaskId && taskMap.has(existingTaskId) && !claimedTaskIds.has(existingTaskId)) {
           try {
             this.service.deleteTask(existingTaskId);
           } catch {
             // ignore
           }
+          claimedTaskIds.add(existingTaskId);
+          cleanedAny = true;
+        }
+        if (cleanedAny) {
           this.runToTaskMap.delete(run.id);
-          this.taskToRunMap.delete(existingTaskId);
+          this.registry.updateRun(run.id, { loopTaskId: null });
         }
         if (run.lifecycle === "active" || run.lifecycle === "verifying") {
           const reason = exhaustion.reason!;
@@ -988,14 +1241,25 @@ export class LoopSchedulerAdapter {
 
       // Paused runs: must NOT have active scheduler task
       if (run.lifecycle === "paused") {
-        if (existingTaskId && taskMap.has(existingTaskId)) {
-          try {
-            this.service.deleteTask(existingTaskId);
-          } catch {
-            // ignore
+        if (matchingTasks.length > 0 || (existingTaskId && taskMap.has(existingTaskId))) {
+          for (const t of matchingTasks) {
+            try {
+              this.service.deleteTask(t.id);
+            } catch {}
+            claimedTaskIds.add(t.id);
+          }
+          if (existingTaskId && taskMap.has(existingTaskId)) {
+            try {
+              this.service.deleteTask(existingTaskId);
+            } catch {
+              // ignore
+            }
           }
           this.runToTaskMap.delete(run.id);
-          this.taskToRunMap.delete(existingTaskId);
+          if (existingTaskId && this.taskToRunMap.get(existingTaskId) === run.id) {
+            this.taskToRunMap.delete(existingTaskId);
+          }
+          this.registry.updateRun(run.id, { loopTaskId: null });
         }
         continue;
       }
@@ -1004,35 +1268,122 @@ export class LoopSchedulerAdapter {
       if (run.lifecycle === "blocked") {
         const isRetryable = run.blocker?.category === "external-retryable";
         if (!isRetryable) {
+          for (const t of matchingTasks) {
+            try {
+              this.service.deleteTask(t.id);
+            } catch {}
+            claimedTaskIds.add(t.id);
+          }
           if (existingTaskId && taskMap.has(existingTaskId)) {
             try {
               this.service.deleteTask(existingTaskId);
             } catch {
               // ignore
             }
-            this.runToTaskMap.delete(run.id);
+          }
+          this.runToTaskMap.delete(run.id);
+          if (existingTaskId && this.taskToRunMap.get(existingTaskId) === run.id) {
             this.taskToRunMap.delete(existingTaskId);
           }
+          this.registry.updateRun(run.id, { loopTaskId: null });
           continue;
         } else {
           // external-retryable may keep its live task if matched
-          if (existingTaskId && taskMap.has(existingTaskId)) {
-            this.runToTaskMap.set(run.id, existingTaskId);
-            this.taskToRunMap.set(existingTaskId, run.id);
-            claimedTaskIds.add(existingTaskId);
-            result.matched.push({ runId: run.id, taskId: existingTaskId });
+          if (matchingTasks.length === 1) {
+            const liveTask = matchingTasks[0];
+            if (options.allowTakeover !== false || run.lease?.ownerId === this.ownerId) {
+              this.ensureOwnership(run, reconcileNow);
+            }
+            this.runToTaskMap.set(run.id, liveTask.id);
+            this.taskToRunMap.set(liveTask.id, run.id);
+            claimedTaskIds.add(liveTask.id);
+            result.matched.push({ runId: run.id, taskId: liveTask.id });
           }
           continue;
         }
       }
 
-      if (existingTaskId && taskMap.has(existingTaskId)) {
-        // Live matching task
-        this.runToTaskMap.set(run.id, existingTaskId);
-        this.taskToRunMap.set(existingTaskId, run.id);
-        claimedTaskIds.add(existingTaskId);
-        result.matched.push({ runId: run.id, taskId: existingTaskId });
-      } else if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+      // Exactly ONE matching live task in pi-loop:
+      if (matchingTasks.length === 1) {
+        const taskB = matchingTasks[0];
+
+        // Case A: exact match (run.loopTaskId already points to task B)
+        if (existingTaskId === taskB.id) {
+          if (options.allowTakeover !== false || run.lease?.ownerId === this.ownerId) {
+            this.ensureOwnership(run, reconcileNow);
+          }
+          this.runToTaskMap.set(run.id, taskB.id);
+          this.taskToRunMap.set(taskB.id, run.id);
+          claimedTaskIds.add(taskB.id);
+          result.matched.push({ runId: run.id, taskId: taskB.id });
+          continue;
+        }
+
+        // Case B: existingTaskId !== taskB.id (e.g. run.loopTaskId was missing task A or undefined)
+        // Check if ownership of task B can be proven:
+        const taskOwnerId = extractWorkflowOwnerId(taskB.prompt);
+        const isSameOwner = Boolean(
+          run.lease &&
+            taskOwnerId &&
+            run.lease.ownerId === taskOwnerId &&
+            this.ownerId === run.lease.ownerId
+        );
+
+        const isTakeover = Boolean(
+          (!run.lease || (run.lease.expiresAt !== undefined && run.lease.expiresAt <= reconcileNow)) &&
+            options.allowTakeover !== false
+        );
+
+        const ownershipProven = isSameOwner || isTakeover;
+
+        if (ownershipProven) {
+          // Ownership proven! Reconnect task B without creating a new task C!
+          this.ensureOwnership(run, reconcileNow);
+          this.runToTaskMap.set(run.id, taskB.id);
+          this.taskToRunMap.set(taskB.id, run.id);
+          claimedTaskIds.add(taskB.id);
+          this.registry.updateRun(run.id, { loopTaskId: taskB.id });
+          result.matched.push({ runId: run.id, taskId: taskB.id });
+          try {
+            this.registry.recordRecoveryEvent(run.id, {
+              type: "scheduler_reconnected",
+              message: `Reconnected proven live scheduler task "${taskB.id}" for run "${run.id}".`,
+              details: { taskId: taskB.id as any, previousTaskId: (existingTaskId ?? null) as any },
+            });
+          } catch {}
+          continue;
+        } else {
+          // Ownership CANNOT be proven!
+          // Fail closed: block run and stop task B to prevent duplicate/unauthorized execution!
+          const reason = `Ambiguous scheduler task mapping: run "${run.id}" links to missing task "${existingTaskId ?? "none"}", but found unverified live task "${taskB.id}". Blocked because task ownership could not be proven.`;
+          if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+            this.registry.blockRun(run.id, { reason, category: "human-required", requiresHuman: true });
+            result.blocked.push({ runId: run.id, reason });
+          }
+          try {
+            this.service.deleteTask(taskB.id);
+          } catch {
+            // ignore
+          }
+          claimedTaskIds.add(taskB.id);
+          this.runToTaskMap.delete(run.id);
+          if (existingTaskId && this.taskToRunMap.get(existingTaskId) === run.id) {
+            this.taskToRunMap.delete(existingTaskId);
+          }
+          this.registry.updateRun(run.id, { loopTaskId: null });
+          try {
+            this.registry.recordRecoveryEvent(run.id, {
+              type: "scheduler_ambiguous",
+              message: reason,
+              details: { taskBId: taskB.id as any, oldTaskId: (existingTaskId ?? null) as any },
+            });
+          } catch {}
+          continue;
+        }
+      }
+
+      // matchingTasks.length === 0: NO live tasks found for run.id in pi-loop
+      if (run.lifecycle === "active" || run.lifecycle === "verifying") {
         // Active run missing its scheduler task (e.g. after reload where ephemeral self-paced task was dropped)
         if (options.recreateMissing !== false) {
           try {
@@ -1072,10 +1423,14 @@ export class LoopSchedulerAdapter {
         // Blocked or paused run missing task is normal
         if (existingTaskId) {
           this.runToTaskMap.delete(run.id);
-          this.taskToRunMap.delete(existingTaskId);
+          if (this.taskToRunMap.get(existingTaskId) === run.id) {
+            this.taskToRunMap.delete(existingTaskId);
+          }
+          this.registry.updateRun(run.id, { loopTaskId: null });
         }
       }
     }
+
 
 
     // 2. Identify orphan workflow tasks in pi-loop
@@ -1130,6 +1485,12 @@ export class LoopSchedulerAdapter {
     }
     const run = this.registry.getRun(runId);
     if (!run || (run.lifecycle !== "active" && run.lifecycle !== "verifying")) {
+      return undefined;
+    }
+
+    // Ownership enforcement: never intercept a run that a DIFFERENT live instance owns.
+    // The owning instance (or a takeover after lease expiry) handles the turn.
+    if (this.isOwnedByOther(run)) {
       return undefined;
     }
 
@@ -1188,12 +1549,21 @@ export class LoopSchedulerAdapter {
       return undefined;
     }
 
+    // Fail closed: a DIFFERENT live instance owns this run; do not bind or execute it here.
+    if (this.isOwnedByOther(run)) {
+      return undefined;
+    }
+
     const exhaustion = checkRunBudgetExhaustion(run);
     if (exhaustion.exhausted) {
       return undefined;
     }
 
+    // Durable ownership heartbeat: refresh the lease before executing a turn.
+    this.ensureOwnership(run);
+
     return this.dispatcher.beginIteration(run.id, {
+      ownerId: this.ownerId,
       signal: ctx.signal,
       schedulerPort: this.getSchedulerPort(run.id),
     });
@@ -1212,8 +1582,9 @@ export class LoopSchedulerAdapter {
    */
   dispatchIteration(runId: string, options: DispatchIterationOptions = {}): IterationBinding {
     return this.dispatcher.beginIteration(runId, {
-      schedulerPort: this.getSchedulerPort(runId),
       ...options,
+      ownerId: options.ownerId ?? this.ownerId,
+      schedulerPort: options.schedulerPort ?? this.getSchedulerPort(runId),
     });
   }
 }

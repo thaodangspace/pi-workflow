@@ -103,3 +103,6 @@ export const MAX_EFFECT_NOTE_LENGTH = 4096;
 
 /** Maximum number of effects stored on a single run */
 export const MAX_EFFECTS_PER_RUN = 1000;
+
+/** Default ownership lease duration for workflow runs (15 minutes) */
+export const DEFAULT_LEASE_DURATION_MS = 15 * 60 * 1000;

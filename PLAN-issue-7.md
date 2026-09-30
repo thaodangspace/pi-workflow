@@ -52,11 +52,23 @@ Recovery always prefers **observed external reality** over stale assumptions and
 ### 4. Work Ownership & Lease Metadata
 - `WorkflowRunLease`: Records `ownerId`, `acquiredAt`, `expiresAt`, and `leaseToken`.
 - `acquireLease`: Exclusive lease acquisition. Attempting to acquire a run with an active, unexpired lease by a different owner fails closed with `WorkflowOwnershipError`.
+- Every `LoopSchedulerAdapter` mints a stable per-instance `ownerId` (`<sessionId>:inst-<random>`), stamped into leases and iteration prompts (`- Owner: <ownerId>`).
+- Production paths (`handleBeforeAgentStart`, `handleTurnStart`, `dispatchIteration`, model tools) pass the real per-instance owner into the dispatcher; a live lease held by another owner cannot be intercepted, dispatched, reconnected, or mutated (fail closed).
+- On reconstruction, runs leased by another **live** instance are skipped with a `run-leased-by-other` diagnostic; after lease **expiry** the reconciling instance takes over deterministically (durable lease renewal + `scheduler_reconnected`). Leases are heartbeated on turn start so a crashed instance's lease lapses within `leaseDurationMs` (default 15m).
 - Generic claim tokens via `getEffectClaimToken(runId, effectKey)` enable domain-specific external resource tagging, branching, and PR labeling.
+
+### 6. Stale Linkage & Cross-Link Safety
+- **Stale run↔task link**: reconnects the single live task that declares the run in place (never a duplicate) when ownership is proven, records `scheduler_reconnected`, and updates durable linkage.
+- **Unprovable ownership**: fails closed (block `human-required`, stop the unverified task, record `scheduler_ambiguous`).
+- **Terminal cross-links**: never stops a user `/loop` task or another run's task; clears the bogus linkage and emits `cross-point-*` diagnostics plus `scheduler_cleaned`.
+- **Active run → user task**: blocks `human-required`, clears bogus durable linkage, preserves the user task.
+- **Direct-control validation**: `cancelWakeup` (used by `/workflow pause`/`stop`) refuses to stop a task whose prompt belongs to another run or is a non-workflow task, preserving it; stale links to absent tasks are cleared.
+- **Ownership precedes budget mutation**: `scheduleRun` asserts ownership before the budget check, so a non-owner cannot cancel/block another live owner's run.
 
 ### 5. Audit History & Visibility
 - `WorkflowRun.history`: Chronological audit trail of all lifecycle mutations and actions.
 - `WorkflowRun.recoveryEvents`: Chronological record of recovery and reconciliation events (`effect_ambiguous`, `effect_reconciled`, `effect_aborted`, `scheduler_reconnected`, `scheduler_recreated`, `scheduler_cleaned`, `scheduler_ambiguous`).
+- Post-replay ambiguity marking appends to BOTH `recoveryEvents` and `history`. These entries are **synthesized** (`details.synthesized === true`, deterministic id `recov-<runId>-<effectKey>`, timestamp `effect.startedAt`), not persisted, so repeated reconstruction/`refresh()` is deterministic and duplicate-free.
 - `/workflow status <run-id>`: Displays active effects, ambiguous warnings, lease details, and recent recovery events.
 
 ---

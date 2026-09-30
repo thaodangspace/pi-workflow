@@ -616,7 +616,7 @@ Body`,
 
       // 1. Block run with human-required blocker
       const ac1 = new AbortController();
-      const binding1 = dispatcher.beginIteration(run.id, { signal: ac1.signal, schedulerPort: adapter.getSchedulerPort(run.id), incrementTurns: false });
+      const binding1 = dispatcher.beginIteration(run.id, { ownerId: adapter.ownerId, signal: ac1.signal, schedulerPort: adapter.getSchedulerPort(run.id), incrementTurns: false });
       const blockTool = createWorkflowTools({ dispatcher, registry }).find((t) => t.name === "workflow_block")!;
 
       await blockTool.execute(
@@ -680,7 +680,7 @@ Body`,
 
       // Block with external-retryable category and 15m delay
       const ac = new AbortController();
-      dispatcher.beginIteration(run.id, { signal: ac.signal, schedulerPort: adapter.getSchedulerPort(run.id), incrementTurns: false });
+      dispatcher.beginIteration(run.id, { ownerId: adapter.ownerId, signal: ac.signal, schedulerPort: adapter.getSchedulerPort(run.id), incrementTurns: false });
       const blockTool = createWorkflowTools({ dispatcher, registry }).find((t) => t.name === "workflow_block")!;
 
       await blockTool.execute(
@@ -1235,7 +1235,12 @@ Body`,
 
       // Verifier can evaluate and accept the reconstructed verifying run
       const ac = new AbortController();
-      dispatcher2.beginIteration(run.id, { signal: ac.signal, schedulerPort: adapter.getSchedulerPort(run.id), incrementTurns: false });
+      dispatcher2.beginIteration(run.id, {
+        ownerId: adapter.ownerId,
+        signal: ac.signal,
+        schedulerPort: adapter.getSchedulerPort(run.id),
+        incrementTurns: false,
+      });
       const verifyTool = createWorkflowVerifyTool(dispatcher2, registry2);
 
       const verifyResult = await verifyTool.execute(

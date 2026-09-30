@@ -18,6 +18,7 @@ import {
   WorkflowInvalidTransitionError,
   WorkflowIterationError,
   type WorkflowIterationContext,
+  WorkflowOwnershipError,
   WorkflowRunError,
   type WorkflowRunLifecycle,
   WorkflowStaleIterationError,
@@ -176,6 +177,20 @@ export class WorkflowDispatcher {
       );
     }
 
+    // Ownership lease enforcement (fail closed):
+    // A run with a LIVE ownership lease may only be dispatched by the owning instance.
+    // A missing or expired lease permits takeover, which the scheduler adapter records
+    // durably before dispatching. Omitting ownerId while a live lease exists is denied.
+    if (run.lease) {
+      const leaseLive = run.lease.expiresAt === undefined || run.lease.expiresAt > Date.now();
+      if (leaseLive && run.lease.ownerId !== options.ownerId) {
+        throw new WorkflowOwnershipError(
+          `Cannot dispatch iteration for run "${runId}": run is leased to owner "${run.lease.ownerId}".`,
+          { runId, currentOwnerId: run.lease.ownerId, requestedOwnerId: options.ownerId }
+        );
+      }
+    }
+
     // Safely invalidate any existing active iteration
     if (this.activeBinding) {
       this.clearActiveIteration("replaced");
@@ -211,6 +226,7 @@ export class WorkflowDispatcher {
       schedulerPort: options.schedulerPort,
       capabilities: capsSet,
       signal: options.signal,
+      ownerId: options.ownerId,
     };
 
     this.activeBinding = binding;
@@ -322,6 +338,19 @@ export class WorkflowDispatcher {
         `Stale workflow iteration call: iteration generation ${generation} is no longer active (current generation: ${this.activeBinding.generation}).`,
         { runId: this.activeBinding.runId, generation, currentGeneration: this.activeBinding.generation }
       );
+    }
+
+    // Secondary ownership enforcement: even a live iteration binding may not mutate a run
+    // whose durable lease was taken over by another instance mid-iteration (fail closed).
+    const ownedRun = this.registry.getRun(this.activeBinding.runId);
+    if (ownedRun?.lease) {
+      const leaseLive = ownedRun.lease.expiresAt === undefined || ownedRun.lease.expiresAt > Date.now();
+      if (leaseLive && ownedRun.lease.ownerId !== this.activeBinding.ownerId) {
+        throw new WorkflowOwnershipError(
+          `Cannot execute workflow tool: run "${ownedRun.id}" is leased to owner "${ownedRun.lease.ownerId}", but iteration is bound to "${this.activeBinding.ownerId ?? "no owner"}".`,
+          { runId: ownedRun.id, currentOwnerId: ownedRun.lease.ownerId, requestedOwnerId: this.activeBinding.ownerId }
+        );
+      }
     }
 
     return this.activeBinding;

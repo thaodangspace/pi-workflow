@@ -913,6 +913,7 @@ export interface IterationBinding {
   readonly schedulerPort?: WorkflowSchedulerPort;
   readonly capabilities?: ReadonlySet<string>;
   readonly signal?: AbortSignal;
+  readonly ownerId?: string;
 }
 
 /** Options for dispatching an iteration turn */
@@ -921,6 +922,7 @@ export interface DispatchIterationOptions {
   capabilities?: Iterable<string> | Record<string, boolean>;
   signal?: AbortSignal;
   incrementTurns?: boolean;
+  ownerId?: string;
 }
 
 /** Budget status and remaining limits exposed in iteration context */

@@ -405,7 +405,8 @@ describe("LoopSchedulerAdapter & pi-loop Integration", () => {
 
       assert.equal(newAdapter.getLinkedTaskId("run-recon-1"), task.id); // Read from registry
 
-      const report = await newAdapter.reconcile();
+      // A new instance must not take over a live lease; simulate the former owner expiring.
+      const report = await newAdapter.reconcile({ now: (run.lease?.expiresAt ?? Date.now()) + 1 });
       assert.equal(report.matched.length, 1);
       assert.equal(report.matched[0].runId, "run-recon-1");
       assert.equal(report.matched[0].taskId, task.id);

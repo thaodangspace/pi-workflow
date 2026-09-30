@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { WORKFLOW_RUN_ENTRY_TYPE } from "./constants.ts";
 import { validateRunId } from "./data-bounds.ts";
 import {
+  appendHistoryEntry,
   applyAcquireLease,
   applyBlockRun,
   applyCancelRun,
@@ -805,12 +806,20 @@ export class WorkflowRunRegistry {
     // Post-replay reconciliation pass:
     // Identify any uncommitted effects that were in "started" state when session reloaded.
     // In accordance with recovery model: started effects after interruption are ambiguous, never auto-retried.
+    //
+    // These "effect_ambiguous" recovery events are SYNTHESIZED in memory (not persisted as
+    // session entries) because ambiguity is a derived property of durable replay, not a new
+    // user action. They are marked with `synthesized: true` to distinguish them from
+    // PERSISTED recovery events (e.g. `effect_reconciled` written via applyEffectReconcile).
+    // Event/ history IDs and timestamps are deterministic so repeated reconstruction is
+    // idempotent and never duplicates entries.
     for (const [runId, run] of newRuns.entries()) {
-      if (run.lifecycle === "active" || run.lifecycle === "verifying") {
+      if (!isTerminalLifecycle(run.lifecycle)) {
         if (run.effects) {
           let hasAmbiguous = false;
           const updatedEffects = { ...run.effects };
-          let updatedRecovery = run.recoveryEvents ? [...run.recoveryEvents] : [];
+          const updatedRecovery = run.recoveryEvents ? [...run.recoveryEvents] : [];
+          let updatedHistory = run.history ?? [];
 
           for (const [key, effect] of Object.entries(run.effects)) {
             if (effect.status === "started" && !effect.ambiguous) {
@@ -820,14 +829,27 @@ export class WorkflowRunRegistry {
                 ambiguous: true,
               });
               const eventId = `recov-${runId}-${key}`;
-              const recEvent: WorkflowRecoveryEvent = Object.freeze({
-                eventId,
-                type: "effect_ambiguous",
-                timestamp: effect.startedAt,
-                message: `Effect "${effect.key}" (${effect.kind}) was in started state when session reloaded. State is ambiguous; reconciliation required before new side effects.`,
-                details: Object.freeze({ key: effect.key, kind: effect.kind }),
-              });
-              updatedRecovery.push(recEvent);
+              const alreadyRecorded =
+                (run.recoveryEvents ?? []).some((e) => e.eventId === eventId) ||
+                updatedHistory.some((h) => h.eventId === eventId);
+              if (!alreadyRecorded) {
+                const recEvent: WorkflowRecoveryEvent = Object.freeze({
+                  eventId,
+                  type: "effect_ambiguous",
+                  timestamp: effect.startedAt,
+                  message: `Effect "${effect.key}" (${effect.kind}) was in started state when session reloaded. State is ambiguous; reconciliation required before new side effects.`,
+                  details: Object.freeze({ key: effect.key, kind: effect.kind, synthesized: true }),
+                });
+                updatedRecovery.push(recEvent);
+                updatedHistory = appendHistoryEntry(
+                  updatedHistory,
+                  "recovery",
+                  `Recovery event [effect_ambiguous]: ${recEvent.message}`,
+                  { key: effect.key, kind: effect.kind, synthesized: true },
+                  effect.startedAt,
+                  eventId
+                );
+              }
             }
           }
 
@@ -836,6 +858,7 @@ export class WorkflowRunRegistry {
               ...run,
               effects: Object.freeze(updatedEffects),
               recoveryEvents: Object.freeze(updatedRecovery),
+              history: Object.freeze(updatedHistory),
             });
             newRuns.set(runId, updatedRun);
           }

@@ -52,6 +52,28 @@ export function extractWorkflowRunId(prompt: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Extracts a workflow owner / runner instance identifier from an iteration prompt text.
+ * Matches standard prompt header "- Owner: <ownerId>" or explicit marker "[pi-workflow:owner:<ownerId>]".
+ * Returns undefined if no owner ID is present.
+ */
+export function extractWorkflowOwnerId(prompt: string): string | undefined {
+  if (typeof prompt !== "string" || !prompt) {
+    return undefined;
+  }
+  const match = prompt.match(/(?:^|\n)-\s*Owner:\s*([^\s\r\n]+)/m);
+  if (match) {
+    return match[1].trim();
+  }
+  const markerMatch =
+    prompt.match(/\[pi-workflow:owner:([^\s\]]+)\]/) ||
+    prompt.match(/<!--\s*pi-workflow:owner:([^\s>]+)\s*-->/);
+  if (markerMatch) {
+    return markerMatch[1].trim();
+  }
+  return undefined;
+}
+
 export interface BuildIterationPromptOptions {
   /** Authoritative run record */
   run: WorkflowRun;
@@ -92,6 +114,10 @@ export function buildVerifierPrompt(options: BuildIterationPromptOptions): strin
     `## Submitted Completion Claim`,
     `- Summary: ${claimSummary}`,
   ];
+
+  if (run.lease?.ownerId) {
+    lines.splice(4, 0, `- Owner: ${run.lease.ownerId}`);
+  }
 
   if (claimEvidence.length > 0) {
     lines.push(`- Evidence Items (${claimEvidence.length}):`);
@@ -156,12 +182,19 @@ export function buildRecoveryPrompt(options: BuildIterationPromptOptions): strin
     `- Source: ${run.definitionSource}`,
     `- Current Step: ${run.step}`,
     `- Lifecycle: ${run.lifecycle}`,
+  ];
+
+  if (run.lease?.ownerId) {
+    lines.splice(4, 0, `- Owner: ${run.lease.ownerId}`);
+  }
+
+  lines.push(
     ``,
     `## RECOVERY REQUIRED: Ambiguous External Effects Detected`,
     `This workflow was interrupted while one or more external side effects were in progress.`,
     `Durable state records the following effect(s) that were started before interruption but never committed:`,
     ``,
-  ];
+  );
 
   for (const effect of ambiguousEffects) {
     lines.push(`### Effect: "${effect.key}"`);
@@ -242,6 +275,13 @@ export function buildIterationPrompt(options: BuildIterationPromptOptions): stri
     `- Run ID: ${run.id}`,
     `- Definition: ${snapshot.name} (schema ${versionStr})`,
     `- Source: ${run.definitionSource}`,
+  ];
+
+  if (run.lease?.ownerId) {
+    lines.push(`- Owner: ${run.lease.ownerId}`);
+  }
+
+  lines.push(
     ``,
     `You are executing an iteration turn of the workflow "${run.workflow}".`,
     `Interact with the workflow engine using the following model tools:`,
@@ -259,7 +299,7 @@ export function buildIterationPrompt(options: BuildIterationPromptOptions): stri
     `- Current Step: ${run.step}`,
     `- Turn: ${turnsStr}`,
     `- Attempts: ${attemptsStr}`,
-  ];
+  );
 
   if (maxDuration) {
     lines.push(`- Max Duration: ${maxDuration}`);
