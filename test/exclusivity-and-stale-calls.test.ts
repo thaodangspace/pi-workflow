@@ -271,13 +271,16 @@ describe("Iteration Exclusivity, Stale Late Calls, and Lifecycle Boundaries", ()
 
     workflowExtension(fakePi);
 
-    // Verify all 6 tools were registered
-    assert.equal(fakePi.registeredTools.length, 6);
+    // Verify all 9 tools were registered
+    assert.equal(fakePi.registeredTools.length, 9);
     const toolNames = fakePi.registeredTools.map((t: any) => t.name).sort();
     assert.deepEqual(toolNames, [
       "workflow_block",
       "workflow_complete",
       "workflow_continue",
+      "workflow_effect_begin",
+      "workflow_effect_commit",
+      "workflow_effect_reconcile",
       "workflow_get_context",
       "workflow_transition",
       "workflow_verify",

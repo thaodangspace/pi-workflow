@@ -49,12 +49,15 @@ describe("Workflow Extension Entrypoint", () => {
     assert(handlers.has("agent_settled"));
     assert(handlers.has("session_shutdown"));
 
-    assert.equal(registeredTools.length, 6);
+    assert.equal(registeredTools.length, 9);
     const toolNames = registeredTools.map((t) => t.name).sort();
     assert.deepEqual(toolNames, [
       "workflow_block",
       "workflow_complete",
       "workflow_continue",
+      "workflow_effect_begin",
+      "workflow_effect_commit",
+      "workflow_effect_reconcile",
       "workflow_get_context",
       "workflow_transition",
       "workflow_verify",

@@ -667,6 +667,36 @@ export class WorkflowCommandController {
       }
     }
 
+    if (run.effects && Object.keys(run.effects).length > 0) {
+      const effectKeys = Object.keys(run.effects).sort();
+      lines.push(`  Effects (${effectKeys.length}):`);
+      for (const key of effectKeys) {
+        const eff = run.effects[key];
+        const ambigStr = eff.ambiguous ? " [AMBIGUOUS - RECONCILIATION REQUIRED]" : "";
+        lines.push(`    • [${eff.status.toUpperCase()}] ${eff.key} (${eff.kind})${ambigStr}`);
+        if (eff.recoveryNote) {
+          lines.push(`      Note: ${eff.recoveryNote}`);
+        }
+      }
+    }
+
+    if (run.recoveryEvents && run.recoveryEvents.length > 0) {
+      lines.push(`  Recovery Events (${run.recoveryEvents.length}):`);
+      const recentEvents = run.recoveryEvents.slice(-5);
+      for (const rev of recentEvents) {
+        lines.push(`    • [${new Date(rev.timestamp).toISOString()}] ${rev.type}: ${rev.message}`);
+      }
+    }
+
+    if (run.lease) {
+      lines.push(`  Lease:`);
+      lines.push(`    Owner:     ${run.lease.ownerId}`);
+      lines.push(`    Acquired:  ${new Date(run.lease.acquiredAt).toISOString()}`);
+      if (run.lease.expiresAt) {
+        lines.push(`    Expires:   ${new Date(run.lease.expiresAt).toISOString()}`);
+      }
+    }
+
     return {
       ok: true,
       action: "status",

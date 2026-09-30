@@ -2,6 +2,7 @@
  * Deterministic prompt construction for workflow iterations.
  */
 
+import { getAmbiguousEffects, hasAmbiguousEffects } from "./run.ts";
 import type { WorkflowRun } from "./types.ts";
 
 /**
@@ -51,6 +52,28 @@ export function extractWorkflowRunId(prompt: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Extracts a workflow owner / runner instance identifier from an iteration prompt text.
+ * Matches standard prompt header "- Owner: <ownerId>" or explicit marker "[pi-workflow:owner:<ownerId>]".
+ * Returns undefined if no owner ID is present.
+ */
+export function extractWorkflowOwnerId(prompt: string): string | undefined {
+  if (typeof prompt !== "string" || !prompt) {
+    return undefined;
+  }
+  const match = prompt.match(/(?:^|\n)-\s*Owner:\s*([^\s\r\n]+)/m);
+  if (match) {
+    return match[1].trim();
+  }
+  const markerMatch =
+    prompt.match(/\[pi-workflow:owner:([^\s\]]+)\]/) ||
+    prompt.match(/<!--\s*pi-workflow:owner:([^\s>]+)\s*-->/);
+  if (markerMatch) {
+    return markerMatch[1].trim();
+  }
+  return undefined;
+}
+
 export interface BuildIterationPromptOptions {
   /** Authoritative run record */
   run: WorkflowRun;
@@ -91,6 +114,10 @@ export function buildVerifierPrompt(options: BuildIterationPromptOptions): strin
     `## Submitted Completion Claim`,
     `- Summary: ${claimSummary}`,
   ];
+
+  if (run.lease?.ownerId) {
+    lines.splice(4, 0, `- Owner: ${run.lease.ownerId}`);
+  }
 
   if (claimEvidence.length > 0) {
     lines.push(`- Evidence Items (${claimEvidence.length}):`);
@@ -136,6 +163,79 @@ export function buildVerifierPrompt(options: BuildIterationPromptOptions): strin
 }
 
 /**
+ * Builds a constrained recovery reconciliation iteration prompt combining:
+ * 1. Engine preamble describing recovery context, run ID, and ambiguous effects
+ * 2. Strict directive NOT to repeat unconfirmed external effects
+ * 3. Step-by-step instructions to observe external reality and reconcile
+ * 4. Current durable run state and data
+ * 5. Constrained recovery actions (workflow_effect_commit, workflow_effect_reconcile, or workflow_block)
+ */
+export function buildRecoveryPrompt(options: BuildIterationPromptOptions): string {
+  const { run } = options;
+  const snapshot = run.snapshot;
+  const ambiguousEffects = getAmbiguousEffects(run);
+
+  const lines: (string | null)[] = [
+    `# Workflow Recovery & Reconciliation: ${run.workflow}`,
+    `- Run ID: ${run.id}`,
+    `- Definition: ${snapshot.name}`,
+    `- Source: ${run.definitionSource}`,
+    `- Current Step: ${run.step}`,
+    `- Lifecycle: ${run.lifecycle}`,
+  ];
+
+  if (run.lease?.ownerId) {
+    lines.splice(4, 0, `- Owner: ${run.lease.ownerId}`);
+  }
+
+  lines.push(
+    ``,
+    `## RECOVERY REQUIRED: Ambiguous External Effects Detected`,
+    `This workflow was interrupted while one or more external side effects were in progress.`,
+    `Durable state records the following effect(s) that were started before interruption but never committed:`,
+    ``,
+  );
+
+  for (const effect of ambiguousEffects) {
+    lines.push(`### Effect: "${effect.key}"`);
+    lines.push(`- Kind: ${effect.kind}`);
+    lines.push(`- Started At: ${new Date(effect.startedAt).toISOString()}`);
+    if (effect.inputSummary !== undefined) {
+      lines.push(`- Input Summary:`);
+      lines.push("```json");
+      lines.push(deterministicJsonStringify(effect.inputSummary, 2));
+      lines.push("```");
+    }
+  }
+
+  lines.push(``);
+  lines.push(`## Critical Reconciliation Directive`);
+  lines.push(`DO NOT blindly re-execute the external action(s) above!`);
+  lines.push(`You must observe external reality first:`);
+  lines.push(`1. Inspect the external system (e.g. check if the PR, commit, issue, or resource already exists).`);
+  lines.push(`2. If the external action ALREADY SUCCEEDED in the real world:`);
+  lines.push(`   Confirm and commit it using \`workflow_effect_commit({ key: "<key>", resultSummary: { ... } })\`.`);
+  lines.push(`3. If the external action did NOT occur or failed:`);
+  lines.push(`   Reconcile it using \`workflow_effect_reconcile({ key: "<key>", resolution: "aborted" | "retryable", reason: "..." })\`.`);
+  lines.push(`4. If external state is ambiguous or requires human decision:`);
+  lines.push(`   Halt execution using \`workflow_block({ reason: "...", category: "human-required", requiresHuman: true })\`.`);
+  lines.push(``);
+  lines.push(`## Current Run State & Data`);
+  lines.push(`- Data:`);
+  lines.push("```json");
+  lines.push(deterministicJsonStringify(run.data, 2));
+  lines.push("```");
+  lines.push(``);
+  lines.push(`## Required Reconciliation Action`);
+  lines.push(`Choose one of the following tools to resolve the ambiguous effect:`);
+  lines.push(`1. \`workflow_effect_commit({ key: "...", resultSummary?: { ... } })\` if external action was confirmed.`);
+  lines.push(`2. \`workflow_effect_reconcile({ key: "...", resolution: "committed" | "aborted" | "retryable", reason: "..." })\` to resolve or abort.`);
+  lines.push(`3. \`workflow_block({ reason: "...", category: "human-required", requiresHuman: true })\` if uncertain.`);
+
+  return lines.filter((line) => line !== null).join("\n");
+}
+
+/**
  * Builds a deterministic iteration prompt combining:
  * 1. Engine preamble describing run context and tool contracts
  * 2. Workflow definition Markdown policy body
@@ -144,6 +244,9 @@ export function buildVerifierPrompt(options: BuildIterationPromptOptions): strin
  */
 export function buildIterationPrompt(options: BuildIterationPromptOptions): string {
   const { run } = options;
+  if (hasAmbiguousEffects(run)) {
+    return buildRecoveryPrompt(options);
+  }
   if (run.step === "VERIFYING" || run.data?._verificationRequested === true) {
     return buildVerifierPrompt(options);
   }
@@ -172,6 +275,13 @@ export function buildIterationPrompt(options: BuildIterationPromptOptions): stri
     `- Run ID: ${run.id}`,
     `- Definition: ${snapshot.name} (schema ${versionStr})`,
     `- Source: ${run.definitionSource}`,
+  ];
+
+  if (run.lease?.ownerId) {
+    lines.push(`- Owner: ${run.lease.ownerId}`);
+  }
+
+  lines.push(
     ``,
     `You are executing an iteration turn of the workflow "${run.workflow}".`,
     `Interact with the workflow engine using the following model tools:`,
@@ -189,7 +299,7 @@ export function buildIterationPrompt(options: BuildIterationPromptOptions): stri
     `- Current Step: ${run.step}`,
     `- Turn: ${turnsStr}`,
     `- Attempts: ${attemptsStr}`,
-  ];
+  );
 
   if (maxDuration) {
     lines.push(`- Max Duration: ${maxDuration}`);
