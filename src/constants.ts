@@ -46,3 +46,40 @@ export const ALLOWED_FRONTMATTER_FIELDS = [
   "completion",
   "metadata",
 ] as const;
+
+/** CustomEntry customType identifier for workflow run mutations */
+export const WORKFLOW_RUN_ENTRY_TYPE = "workflow-run";
+
+/** Version of the persisted workflow run mutation log schema */
+export const WORKFLOW_RUN_PERSISTENCE_VERSION = 1;
+
+/** Maximum byte size per individual run data payload (64 KiB) */
+export const MAX_RUN_DATA_BYTES = 64 * 1024;
+
+/** Maximum cumulative byte size of data stored on a single run (256 KiB) */
+export const MAX_RUN_TOTAL_DATA_BYTES = 256 * 1024;
+
+/** Maximum object nesting depth for workflow data */
+export const MAX_DATA_DEPTH = 10;
+
+/** Maximum allowed key length in workflow data objects */
+export const MAX_DATA_KEY_LENGTH = 128;
+
+/** Maximum string length for scalar values in workflow data (16 KiB) */
+export const MAX_DATA_STRING_LENGTH = 16 * 1024;
+
+/** Maximum number of evidence items in a completion record */
+export const MAX_EVIDENCE_ITEMS = 50;
+
+/** Maximum character length for blocker reason */
+export const MAX_BLOCKER_REASON_LENGTH = 2048;
+
+/** Maximum character length for completion summary */
+export const MAX_COMPLETION_SUMMARY_LENGTH = 4096;
+
+/** Maximum length for workflow step names */
+export const MAX_STEP_NAME_LENGTH = 64;
+
+/** Maximum length for workflow run IDs */
+export const MAX_RUN_ID_LENGTH = 128;
+

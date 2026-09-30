@@ -166,3 +166,348 @@ export class WorkflowValidationError extends Error {
     this.diagnostics = diagnostics.length > 0 ? diagnostics : [{ type: "error", path, field, message }];
   }
 }
+
+// ---------------------------------------------------------------------------
+// Workflow Run & Persistence Types (Issue #2)
+// ---------------------------------------------------------------------------
+
+/** JSON-safe primitive types */
+export type JsonPrimitive = string | number | boolean | null;
+
+/** Bounded JSON-safe value type */
+export type JsonValue =
+  | JsonPrimitive
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+/** Generic workflow run execution lifecycle */
+export type WorkflowRunLifecycle =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "completed"
+  | "cancelled";
+
+/** Structured evidence reference for workflow completion */
+export interface WorkflowEvidence {
+  /** Evidence category e.g. "pr", "commit", "url", "test", "file" */
+  type: string;
+  /** Human-readable explanation of this evidence */
+  description: string;
+  /** Web or PR URL if applicable */
+  url?: string;
+  /** Local filesystem path if applicable */
+  path?: string;
+  /** Optional JSON-safe structured metadata */
+  data?: Record<string, JsonValue>;
+}
+
+/** Information attached to a blocked workflow run */
+export interface WorkflowBlockerInfo {
+  /** Concrete reason why the run is blocked */
+  reason: string;
+  /** Whether human intervention/decision is required to unblock */
+  requiresHuman?: boolean;
+  /** Timestamp when blocked (Unix epoch ms) */
+  blockedAt: number;
+}
+
+/** Completion record for a successful workflow run */
+export interface WorkflowCompletionInfo {
+  /** Executive summary of work performed and outcomes */
+  summary: string;
+  /** Structured verification or outcome evidence */
+  evidence: WorkflowEvidence[];
+  /** Timestamp when completed (Unix epoch ms) */
+  completedAt: number;
+}
+
+/**
+ * Concrete, durable workflow execution record.
+ */
+export interface WorkflowRun {
+  /** Stable unique run identifier */
+  readonly id: string;
+  /** Workflow definition name */
+  readonly workflow: string;
+  /** Version number or string of the workflow definition */
+  readonly definitionVersion: number | string;
+  /** Source identity or path of the definition */
+  readonly definitionSource: string;
+  /** Immutable definition snapshot */
+  readonly snapshot: WorkflowSnapshotV1;
+
+  /** Generic lifecycle status (active, paused, blocked, completed, cancelled) */
+  readonly lifecycle: WorkflowRunLifecycle;
+  /** Current workflow-specific execution step (e.g., WAITING_CI, IMPLEMENTING) */
+  readonly step: string;
+
+  /** Timestamp created (Unix epoch ms) */
+  readonly createdAt: number;
+  /** Timestamp last updated (Unix epoch ms) */
+  readonly updatedAt: number;
+  /** Timestamp when execution started (Unix epoch ms) */
+  readonly startedAt?: number;
+  /** Timestamp when execution ended (completed or cancelled) */
+  readonly completedAt?: number;
+
+  /** Linkage to scheduled task or loop task ID if managed by scheduler */
+  readonly loopTaskId?: string;
+
+  /** Number of retry or execution attempts */
+  readonly attempts: number;
+  /** Number of agent turns or iterations completed */
+  readonly turns: number;
+
+  /** Bounded JSON-safe workflow-specific key/value state */
+  readonly data: Readonly<Record<string, JsonValue>>;
+
+  /** Details if the run is currently in "blocked" state */
+  readonly blocker?: Readonly<WorkflowBlockerInfo>;
+  /** Details if the run has transitioned to "completed" state */
+  readonly completion?: Readonly<WorkflowCompletionInfo>;
+}
+
+/** Mutation actions for append-only session entries */
+export type WorkflowRunMutationAction =
+  | "create"
+  | "update"
+  | "transition"
+  | "block"
+  | "pause"
+  | "resume"
+  | "complete"
+  | "cancel";
+
+/** Persisted CustomEntry data payload in Pi session */
+export interface WorkflowRunMutationEntryData {
+  readonly version: number;
+  readonly eventId: string;
+  readonly runId: string;
+  readonly workflow: string;
+  readonly action: WorkflowRunMutationAction;
+  readonly timestamp: number;
+  readonly payload: unknown;
+}
+
+/** Diagnostic emitted during session reconstruction or entry validation */
+export interface WorkflowRunDiagnostic {
+  type: "error" | "warning";
+  code: string;
+  message: string;
+  runId?: string;
+  entryId?: string;
+  timestamp?: number;
+  details?: unknown;
+}
+
+/** Session provider that returns entries along the active session branch */
+export interface SessionBranchProvider {
+  getBranch(fromId?: string): readonly any[] | any[];
+}
+
+/** Session appender interface matching Pi's SessionManager and ExtensionAPI */
+export interface SessionEntryAppender {
+  appendCustomEntry?(customType: string, data?: unknown): string;
+  appendEntry?(customType: string, data?: unknown): void | string;
+}
+
+/** Combined session target for reading active branch and appending mutations */
+export type WorkflowSessionTarget = SessionBranchProvider & SessionEntryAppender;
+
+// ---------------------------------------------------------------------------
+// Registry Options
+// ---------------------------------------------------------------------------
+
+export interface CreateRunOptions {
+  /** Optional custom run ID (auto-generated if omitted) */
+  runId?: string;
+  /** Initial workflow step (defaults to "INITIAL") */
+  initialStep?: string;
+  /** Initial workflow data */
+  initialData?: Record<string, JsonValue>;
+  /** Linkage to scheduler task */
+  loopTaskId?: string;
+  /** Optional creation timestamp (Unix epoch ms) */
+  createdAt?: number;
+  /**
+   * Concurrency resolution policy if maxRuns is exceeded:
+   * - "fail" (default): throw WorkflowConcurrencyError
+   * - "returnExisting": return the currently active/nonterminal run
+   */
+  existingPolicy?: "fail" | "returnExisting";
+}
+
+export interface UpdateRunOptions {
+  /** Update workflow step without full transition */
+  step?: string;
+  /** Shallow-merged key/value updates to data */
+  data?: Record<string, JsonValue>;
+  /** Explicit absolute attempts count */
+  attempts?: number;
+  /** Relative attempts increment */
+  incrementAttempts?: number;
+  /** Explicit absolute turns count */
+  turns?: number;
+  /** Relative turns increment */
+  incrementTurns?: number;
+  /** Update scheduler task linkage */
+  loopTaskId?: string;
+  /** Update timestamp (Unix epoch ms) */
+  updatedAt?: number;
+}
+
+export interface TransitionStepOptions {
+  /** Target workflow step name */
+  toStep: string;
+  /** Optional data updates during step transition */
+  data?: Record<string, JsonValue>;
+  /** Reason for transition */
+  reason?: string;
+  /** Update timestamp (Unix epoch ms) */
+  updatedAt?: number;
+}
+
+export interface BlockRunOptions {
+  /** Required explanation of the blocking condition */
+  reason: string;
+  /** Whether human action/judgment is required to unblock */
+  requiresHuman?: boolean;
+  /** Optional data updates during blocking */
+  data?: Record<string, JsonValue>;
+  /** Timestamp when blocked (Unix epoch ms) */
+  blockedAt?: number;
+}
+
+export interface PauseRunOptions {
+  /** Reason for pausing */
+  reason?: string;
+  /** Optional data updates during pause */
+  data?: Record<string, JsonValue>;
+  /** Timestamp when paused (Unix epoch ms) */
+  pausedAt?: number;
+}
+
+export interface ResumeRunOptions {
+  /** Optional step to resume into */
+  step?: string;
+  /** Optional data updates upon resume */
+  data?: Record<string, JsonValue>;
+  /** Reason for resume */
+  reason?: string;
+  /** Timestamp when resumed (Unix epoch ms) */
+  resumedAt?: number;
+}
+
+export interface CompleteRunOptions {
+  /** Summary of completion outcomes */
+  summary: string;
+  /** Concrete verification evidence */
+  evidence?: WorkflowEvidence[];
+  /** Optional final data updates */
+  data?: Record<string, JsonValue>;
+  /** Timestamp when completed (Unix epoch ms) */
+  completedAt?: number;
+}
+
+export interface CancelRunOptions {
+  /** Reason for cancellation */
+  reason?: string;
+  /** Optional data updates upon cancellation */
+  data?: Record<string, JsonValue>;
+  /** Timestamp when cancelled (Unix epoch ms) */
+  cancelledAt?: number;
+}
+
+export interface ReconstructOptions {
+  /** If true, throws on first malformed entry rather than collecting diagnostics */
+  strict?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Error Hierarchy
+// ---------------------------------------------------------------------------
+
+export class WorkflowRunError extends Error {
+  readonly runId?: string;
+  constructor(message: string, runId?: string) {
+    super(message);
+    this.name = "WorkflowRunError";
+    this.runId = runId;
+  }
+}
+
+export class WorkflowConcurrencyError extends WorkflowRunError {
+  readonly workflow: string;
+  readonly activeRunIds: readonly string[];
+  readonly maxRuns: number;
+
+  constructor(workflow: string, activeRunIds: string[], maxRuns: number, message?: string) {
+    super(
+      message ??
+        `Workflow "${workflow}" concurrency limit reached (${activeRunIds.length}/${maxRuns} nonterminal runs active). Active runs: [${activeRunIds.join(", ")}].`,
+      activeRunIds[0]
+    );
+    this.name = "WorkflowConcurrencyError";
+    this.workflow = workflow;
+    this.activeRunIds = Object.freeze([...activeRunIds]);
+    this.maxRuns = maxRuns;
+  }
+}
+
+export class WorkflowInvalidTransitionError extends WorkflowRunError {
+  readonly fromLifecycle?: WorkflowRunLifecycle;
+  readonly toLifecycle?: WorkflowRunLifecycle;
+  readonly action?: string;
+
+  constructor(
+    runId: string,
+    message: string,
+    options?: {
+      fromLifecycle?: WorkflowRunLifecycle;
+      toLifecycle?: WorkflowRunLifecycle;
+      action?: string;
+    }
+  ) {
+    super(message, runId);
+    this.name = "WorkflowInvalidTransitionError";
+    this.fromLifecycle = options?.fromLifecycle;
+    this.toLifecycle = options?.toLifecycle;
+    this.action = options?.action;
+  }
+}
+
+export class WorkflowRunNotFoundError extends WorkflowRunError {
+  constructor(runId: string, message?: string) {
+    super(message ?? `Workflow run not found: "${runId}"`, runId);
+    this.name = "WorkflowRunNotFoundError";
+  }
+}
+
+export class WorkflowDataBoundsError extends WorkflowRunError {
+  readonly field?: string;
+  readonly limit?: number;
+  readonly actual?: number;
+
+  constructor(
+    message: string,
+    options?: { runId?: string; field?: string; limit?: number; actual?: number }
+  ) {
+    super(message, options?.runId);
+    this.name = "WorkflowDataBoundsError";
+    this.field = options?.field;
+    this.limit = options?.limit;
+    this.actual = options?.actual;
+  }
+}
+
+export class WorkflowPersistenceError extends WorkflowRunError {
+  readonly entryId?: string;
+
+  constructor(message: string, options?: { runId?: string; entryId?: string }) {
+    super(message, options?.runId);
+    this.name = "WorkflowPersistenceError";
+    this.entryId = options?.entryId;
+  }
+}
+
