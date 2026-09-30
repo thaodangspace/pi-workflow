@@ -226,12 +226,22 @@ describe("aggregate status projection (issue #10)", () => {
     await adapter.scheduleRun(later.id);
     await adapter.scheduleRun(earlier.id);
 
+    // Self-paced tasks are armed immediate, so their `nextFireAt` can already be
+    // in the past by projection time. Arm explicit, well-separated future wakeups
+    // so the "earliest future wakeup" assertion is deterministic instead of
+    // racing the projection clock against an already-due timestamp.
+    await adapter.scheduleWakeup({ runId: later.id, delayMs: 10 * 60_000 });
+    await adapter.scheduleWakeup({ runId: earlier.id, delayMs: 5 * 60_000 });
+
     const projection = buildStatusProjection(registry, adapter);
-    const expected = Math.min(
-      adapter.getService()!.listTasks().find((t) => t.id === adapter.getLinkedTaskId(later.id))!.nextFireAt!,
-      adapter.getService()!.listTasks().find((t) => t.id === adapter.getLinkedTaskId(earlier.id))!.nextFireAt!
-    );
+    const laterFireAt = adapter.getService()!.listTasks().find((t) => t.id === adapter.getLinkedTaskId(later.id))!
+      .nextFireAt!;
+    const earlierFireAt = adapter.getService()!.listTasks().find((t) => t.id === adapter.getLinkedTaskId(earlier.id))!
+      .nextFireAt!;
+    const expected = Math.min(laterFireAt, earlierFireAt);
     assert.equal(projection.earliestNextWakeupAt, expected);
+    // The nearer (5m) wakeup is selected over the later (10m) one.
+    assert.equal(projection.earliestNextWakeupAt, earlierFireAt);
     assert.ok(projection.earliestNextWakeupAt! >= projection.now);
   });
 

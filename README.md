@@ -882,12 +882,15 @@ begins with an underscore and can never be produced by the loader.
 
 - Node.js >= 22.0.0
 - npm >= 10.0.0
+- Pi host: `@earendil-works/pi-coding-agent` **>= 0.87.1** (the declared peer
+  dependency). This is the minimum supported Pi version; the extension only uses
+  APIs and lifecycle events present in that release.
 
 ### Commands
 
 ```bash
-# Install dependencies
-npm install
+# Clean install from the lockfile (matches CI)
+npm ci
 
 # Run TypeScript typecheck
 npm run typecheck
@@ -895,3 +898,25 @@ npm run typecheck
 # Run unit tests
 npm test
 ```
+
+### Smoke-load
+
+Some Pi invocations load extensions **without starting a session**. Use this to
+verify that the extension entrypoint compiles and its factory registers cleanly
+without creating any workflow resources:
+
+```bash
+# `-e` / `--extension` is Pi's documented local extension flag.
+# `--mode rpc` is headless, `--no-session` loads the extension without starting
+# a session, and `--no-extensions` disables discovery/built-ins so unrelated
+# user-installed extensions cannot affect the result (explicit -e paths still
+# load). Exits 0 with empty stdout and stderr when the extension loads cleanly.
+PI_OFFLINE=1 pi --mode rpc --no-session --no-extensions --extension ./src/index.ts </dev/null >/dev/null
+```
+
+A genuinely broken extension fails this load with a non-zero exit code and an
+error on stderr (Pi reports `Failed to load extension "<path>": …`). Note that
+`pi --extension ./src/index.ts --help` is **not** a valid smoke-load: `--help`
+short-circuits before extension load errors are surfaced, so even a throwing
+extension exits 0 with no error. Starting workflow resources requires an explicit
+run (e.g. `/workflow start` or `/goal`), not extension loading.
