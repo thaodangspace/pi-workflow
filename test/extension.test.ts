@@ -24,7 +24,7 @@ describe("Workflow Extension Entrypoint", () => {
     assert(dispatcher instanceof WorkflowDispatcher);
   });
 
-  it("subscribes to session_start, session_tree, agent_settled, and session_shutdown events on ExtensionAPI and registers tools", async () => {
+  it("subscribes to session_start, session_tree, agent_start, agent_settled, and session_shutdown events on ExtensionAPI and registers tools", async () => {
     const handlers = new Map<string, Function>();
     const registeredTools: any[] = [];
     const registeredCommands = new Map<string, any>();
@@ -50,6 +50,7 @@ describe("Workflow Extension Entrypoint", () => {
 
     assert(handlers.has("session_start"));
     assert(handlers.has("session_tree"));
+    assert(handlers.has("agent_start"));
     assert(handlers.has("agent_settled"));
     assert(handlers.has("session_shutdown"));
 

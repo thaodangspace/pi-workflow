@@ -97,6 +97,7 @@ describe("Extension bootstrap inertness (issue #11)", () => {
       "session_start",
       "session_tree",
       "before_agent_start",
+      "agent_start",
       "turn_start",
       "agent_settled",
       "session_shutdown",

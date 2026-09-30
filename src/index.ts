@@ -323,6 +323,14 @@ export default function workflowExtension(
     return adapter.handleBeforeAgentStart(event, ctx) as any;
   });
 
+  // `agent_start` is a distinct Pi lifecycle event ("fired when an agent loop
+  // starts"), not an alias for `before_agent_start` or `turn_start`. Session
+  // ownership is bound on `session_start`, and the turn-bound iteration is
+  // established on `before_agent_start`/`turn_start`, so this handler is
+  // intentionally side-effect free rather than re-deriving that state. It is
+  // registered to cover the full issue #11 lifecycle surface.
+  pi.on("agent_start", () => {});
+
   pi.on("turn_start", async (_event, ctx) => {
     adapter.handleTurnStart(ctx);
   });
