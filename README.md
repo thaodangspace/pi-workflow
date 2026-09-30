@@ -259,7 +259,7 @@ When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral i
   If either signal is absent, or if they differ, the tool call is rejected immediately (`WorkflowIterationError` / `WorkflowStaleIterationError`), ensuring a late or stale tool call from an earlier turn can never be mistaken for or mutate a newer run.
 - **Stale Late Tool Call Protection**: Every iteration turn is assigned a unique token and a monotonic generation counter. Asynchronous tool calls capture the turn token/generation at execution start and re-verify before and after applying state mutations. If an earlier turn settled, aborted, or was replaced before the tool completed, the mutation is rejected with `WorkflowStaleIterationError`.
 - **Lifecycle Guarantees**: Blocked or terminal runs cannot continue scheduling (`workflow_continue` fails closed). Blocking or completing a run cancels any scheduled wakeup via the scheduler port.
-- **Automatic Lifecycle Cleanup**: Active iteration bindings are safely cleared on session reload (`session_start`), session tree switching (`session_tree`), agent settlement (`agent_settled`), and process shutdown (`session_shutdown`).
+- **Automatic Lifecycle Cleanup**: Active iteration bindings are safely cleared on session reload (`session_start`), session tree switching (`session_tree`), agent settlement (`agent_settled`), and process shutdown (`session_shutdown`). The scheduler adapter session generation is bound on `session_start` / refreshed on `session_tree` before discovery/reconciliation, and ended on `session_shutdown` (see [Session Identity & Adapter Lifecycle](#session-identity--adapter-lifecycle)).
 - **Trusted Direct Dispatcher & Registry APIs**: Programmatic extensions that need to address a run directly can use trusted registry and dispatcher APIs (`dispatcher.beginIteration`, `dispatcher.withIteration`, `registry.transitionStep`, `registry.blockRun`, `registry.completeRun`) with explicit run IDs. When a run carries a live ownership lease, `beginIteration` must be given the owning instance's `ownerId` (`adapter.dispatchIteration` does this automatically); dispatching a live-leased run without proof of ownership fails closed with `WorkflowOwnershipError`. Model-facing tools strictly enforce turn-bound signal identity and re-verify ownership.
 
 ### Dispatcher & Scheduler Port Boundary
@@ -350,6 +350,74 @@ await adapter.discover(pi.events);
 // Start and schedule workflow run
 const { run, task } = await adapter.startRun(workflowDefinition);
 console.log(`Workflow run ${run.id} scheduled as pi-loop task ${task.id}`);
+```
+
+### Session Identity & Adapter Lifecycle
+
+The adapter is constructed before the first concrete `session_start` (there is no
+active session yet), so it begins with a **provisional placeholder** identity.
+The extension then drives an explicit lifecycle on every session boundary:
+
+```text
+no session
+  -> beginSession(activeSessionId)   # session_start
+  -> discover / attach pi-loop service
+  -> reconcile
+  -> endSession()                    # session_shutdown
+```
+
+- `beginSession(sessionId)` binds the adapter to the concrete active workflow/Pi
+  session, derives a fresh owner id of the form
+  `<workflow-session-id>:inst-<random>`, clears ephemeral run↔task maps and
+  pending turn correlation, detaches/invalidates the previous session's service
+  handle and availability subscription, and clears active iteration state.
+  Discovery and reconciliation run **after** this bind.
+- `endSession()` detaches and invalidates the service handle, releases
+  subscriptions, clears ephemeral mappings and pending turn correlation, and
+  clears active iteration state — leaving no active session/service binding.
+- **Same-session refresh**: `session_tree` navigation within one session
+  preserves the owner identity and attached service handle while resetting
+  ephemeral correlation so the new active branch can be reconciled. Only a
+  *different* session id is a hard boundary that rotates ownership.
+- **Session switch is a hard boundary**: state from the previous session can
+  never claim, reschedule, cancel, or satisfy task-link lookup for the new
+  session. Scheduler ports and pending turns captured in the old generation fail
+  closed: a stale scheduler port throws `WorkflowSchedulerUnavailableError`, and
+  a stale pending turn is dropped rather than bound.
+- **Late discovery replies are generation-guarded**: `discover()` captures the
+  session generation before awaiting `pi-loop`, and only attaches the handle when
+  that generation is still active — a reply for session A that resolves after
+  `beginSession(B)` is never bound into session B. A superseded reply is reported
+  as `{ ok: false, reason: "unavailable", message: "…generation changed…" }`
+  rather than a false-positive success. Availability-change broadcasts likewise
+  capture their generation, so a queued/slow notification from a superseded
+  session cannot clear the active handle. After the awaited discovery the
+  extension re-checks the bound generation before reconciling, so a suspended
+  `session_start` superseded by a newer one cannot reconcile the new session.
+- **Missing/invalid concrete session id fails closed**: if `session_start`
+  cannot resolve a non-empty session id, the adapter ends its session (detaching
+  any previous handle) and skips discovery/reconciliation instead of retaining a
+  previous session's service. `session_tree` with an unresolvable identity skips
+  reconciliation entirely rather than assuming the previously bound session.
+
+**Workflow session id vs `LoopServiceV1.sessionId`.** These are deliberately
+distinct and are never treated as interchangeable. The workflow/Pi session id
+scopes workflow ownership (`ownerId`), while `LoopServiceV1.sessionId` is the
+pi-loop provider's own session-generation id
+(`adapter.getService()?.sessionId`). A new workflow session always re-discovers
+the provider (which may expose its own new generation id) instead of assuming
+the two ids match.
+
+`session_start` wiring order:
+
+```text
+session_start
+  -> clear active iteration
+  -> capabilityRegistry.beginSession(...)
+  -> registry.bindSession(...) / registry.refresh()
+  -> adapter.beginSession(...)        # bind identity BEFORE discovery
+  -> discover pi-loop service
+  -> reconcile
 ```
 
 ### Supported Scheduling Modes
@@ -452,7 +520,7 @@ During `adapter.reconcile()`:
 
 Durable lease metadata (`run.lease`) records owner identity and expiration timestamps. Duplicate workflow instances cannot both believe they own the same logical run:
 
-- Every `LoopSchedulerAdapter` instance carries a stable per-instance identity (`ownerId`, defaulting to `<sessionId>:inst-<random>`), which is stamped into durable leases and iteration prompts (`- Owner: <ownerId>`).
+- Every `LoopSchedulerAdapter` carries a **session-scoped** owner identity (`ownerId`, `<workflow-session-id>:inst-<random>`), derived by `beginSession` and stamped into durable leases and iteration prompts (`- Owner: <ownerId>`). The owner id is rotated on a session switch and preserved across a same-session `session_tree` refresh, so an owner from a previous session can never claim, mutate, or cancel the new session's runs.
 - Acquiring or renewing an active lease held by another live owner fails closed with `WorkflowOwnershipError`.
 - Production dispatch paths (`handleBeforeAgentStart`, `handleTurnStart`, `dispatchIteration`) always pass the real per-instance `ownerId` into the dispatcher. `beginIteration` refuses to dispatch a run while a *live* lease is held by a different owner or when ownership is not proven, and model tools re-verify ownership on every call (`assertToolBinding`), so a lease taken over mid-iteration causes the stale turn to fail closed.
 - On session reconstruction, a nonterminal run leased by a **different, still-live** instance is skipped (diagnostic `run-leased-by-other`) rather than duplicated. After the lease **expires**, the reconciling instance takes it over deterministically, renewing the durable lease before reconnecting the *same* live task and recording a `scheduler_reconnected` recovery event.

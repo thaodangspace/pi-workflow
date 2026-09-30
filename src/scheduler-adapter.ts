@@ -151,7 +151,21 @@ export interface LoopSchedulerAdapterOptions {
   service?: LoopServiceV1;
   events?: EventBusLike;
   discoveryTimeoutMs?: number;
+  /**
+   * Optional explicit, immutable owner identity. When supplied, the adapter
+   * never rotates ownership across session boundaries (trusted/testing
+   * override). Production callers should omit this and let `beginSession`
+   * derive a session-scoped owner id.
+   */
   ownerId?: string;
+  /**
+   * Optional provisional workflow/Pi session id used before `beginSession` is
+   * called. This is a convenience for direct programmatic use and tests; the
+   * extension path binds the concrete session via `beginSession`.
+   *
+   * This is the WORKFLOW session identity, not the pi-loop provider's
+   * `LoopServiceV1.sessionId` generation id. The two are deliberately distinct.
+   */
   sessionId?: string;
   leaseDurationMs?: number;
   /**
@@ -172,8 +186,6 @@ export interface LoopSchedulerAdapterOptions {
  * runId ↔ loopTaskId linkage, prompt dispatch correlation, and authoritative reconciliation.
  */
 export class LoopSchedulerAdapter {
-  public readonly ownerId: string;
-  public readonly sessionId: string;
   public readonly leaseDurationMs: number;
   private registry: WorkflowRunRegistry;
   private dispatcher: WorkflowDispatcher;
@@ -183,9 +195,33 @@ export class LoopSchedulerAdapter {
   private discoveryTimeoutMs: number;
   private capabilityRegistry?: WorkflowCapabilityRegistry;
 
+  /**
+   * Effective per-instance ownership identity stamped into durable leases.
+   * Scoped to the active workflow session generation in the form
+   * `<workflow-session-id>:inst-<random>`. Before `beginSession` (and after
+   * `endSession`) it is a provisional placeholder, never a durable
+   * production identity.
+   */
+  private ownerIdValue: string;
+  /**
+   * Effective workflow/Pi session identity used to scope workflow ownership.
+   *
+   * This is deliberately distinct from the pi-loop provider generation id
+   * exposed as `LoopServiceV1.sessionId`. They are not interchangeable unless
+   * a provider contract explicitly guarantees it.
+   */
+  private sessionIdValue: string;
+  /** True when the caller supplied an explicit, immutable owner id. */
+  private readonly ownerExplicit: boolean;
+  /** Concrete workflow session id once `beginSession` has bound one. */
+  private boundSessionId?: string;
+  /** Monotonic workflow-session generation; bumps on every session boundary. */
+  private sessionGeneration = 0;
+
   private runToTaskMap = new Map<string, string>();
   private taskToRunMap = new Map<string, string>();
   private pendingTurnRunId?: string;
+  private pendingTurnGeneration?: number;
 
   constructor(options: LoopSchedulerAdapterOptions) {
     this.registry = options.registry;
@@ -193,8 +229,9 @@ export class LoopSchedulerAdapter {
     this.service = options.service;
     this.events = options.events;
     this.discoveryTimeoutMs = options.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS;
-    this.sessionId = options.sessionId ?? options.service?.sessionId ?? "default";
-    this.ownerId = options.ownerId ?? `${this.sessionId}:inst-${randomUUID().slice(0, 8)}`;
+    this.ownerExplicit = options.ownerId !== undefined;
+    this.sessionIdValue = options.sessionId ?? options.service?.sessionId ?? "default";
+    this.ownerIdValue = options.ownerId ?? `${this.sessionIdValue}:inst-${randomUUID().slice(0, 8)}`;
     this.leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
     this.capabilityRegistry = options.capabilityRegistry;
 
@@ -205,6 +242,19 @@ export class LoopSchedulerAdapter {
     if (this.events) {
       this.bindEvents(this.events);
     }
+  }
+
+  /** Durable ownership identity, scoped to the active workflow session. */
+  get ownerId(): string {
+    return this.ownerIdValue;
+  }
+
+  /**
+   * Active workflow/Pi session identity used to scope ownership. Distinct from
+   * the pi-loop provider's `LoopServiceV1.sessionId`.
+   */
+  get sessionId(): string {
+    return this.sessionIdValue;
   }
 
   /**
@@ -279,15 +329,136 @@ export class LoopSchedulerAdapter {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Session lifecycle
+  // -------------------------------------------------------------------------
+
+  /**
+   * Binds the adapter to a concrete active workflow/Pi session generation.
+   *
+   * Same session id => branch/tree refresh: the owner identity and the attached
+   * service handle are preserved; only ephemeral correlation state is reset so
+   * the caller can reconcile the new branch.
+   *
+   * A different session id is a hard boundary:
+   * 1. the previous session's service handle and subscription are detached and
+   *    invalidated;
+   * 2. ephemeral run↔task mappings and pending turn correlation are cleared;
+   * 3. active iteration state is cleared so stale closures cannot mutate the
+   *    new session;
+   * 4. a fresh owner identity scoped to the new session is derived.
+   *
+   * Discovery/attach of the current `pi-loop` service happens after this call
+   * (e.g. `beginSession(...)` then `discover(...)` then `reconcile(...)`).
+   */
+  beginSession(sessionId: string): void {
+    const next = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!next) {
+      throw new WorkflowSchedulerError("beginSession requires a non-empty workflow session id.");
+    }
+
+    if (this.boundSessionId === next) {
+      // Same workflow session generation: rebuild branch-derived state only.
+      this.clearEphemeralState();
+      this.dispatcher.clearActiveIteration("session_refresh");
+      return;
+    }
+
+    // Hard session boundary: invalidate everything scoped to the old generation.
+    this.detachService();
+    this.clearEphemeralState();
+    this.dispatcher.clearActiveIteration("session_switch");
+
+    this.boundSessionId = next;
+    this.sessionIdValue = next;
+    this.sessionGeneration += 1;
+    if (!this.ownerExplicit) {
+      this.ownerIdValue = `${next}:inst-${randomUUID().slice(0, 8)}`;
+    }
+  }
+
+  /**
+   * Ends the scheduler session generation.
+   *
+   * Detaches and invalidates the service handle, releases event subscriptions,
+   * clears ephemeral run/task mappings and pending turn correlation, clears
+   * active iteration state, and rotates the ownership identity so a stale
+   * handle from this session can never mutate a later one.
+   */
+  endSession(): void {
+    this.detachService();
+    this.clearEphemeralState();
+    this.dispatcher.clearActiveIteration("session_end");
+    this.sessionGeneration += 1;
+    this.boundSessionId = undefined;
+    this.sessionIdValue = "default";
+    if (!this.ownerExplicit) {
+      this.ownerIdValue = `default:inst-${randomUUID().slice(0, 8)}`;
+    }
+  }
+
+  /** True when bound to a concrete active workflow session generation. */
+  isSessionActive(): boolean {
+    return this.boundSessionId !== undefined;
+  }
+
+  /**
+   * Concrete active workflow session id, or undefined before `beginSession`
+   * and after `endSession`.
+   */
+  getActiveSessionId(): string | undefined {
+    return this.boundSessionId;
+  }
+
+  /** Monotonic workflow-session generation counter (bumps on each boundary). */
+  getSessionGeneration(): number {
+    return this.sessionGeneration;
+  }
+
+  /**
+   * Clears ephemeral, in-memory correlation state. Durable linkage
+   * (`run.loopTaskId`) is intentionally preserved and is authoritative on
+   * reconciliation.
+   */
+  private clearEphemeralState(): void {
+    this.runToTaskMap.clear();
+    this.taskToRunMap.clear();
+    this.pendingTurnRunId = undefined;
+    this.pendingTurnGeneration = undefined;
+  }
+
+  /**
+   * Fails closed when a captured session generation no longer matches the
+   * active one, so stale callbacks cannot mutate a later session.
+   */
+  private assertSessionGeneration(generation: number, operation: string, runId?: string): void {
+    if (generation !== this.sessionGeneration) {
+      throw new WorkflowSchedulerUnavailableError(
+        `Cannot ${operation}: the workflow session generation changed; stale scheduler callback refused.`,
+        runId
+      );
+    }
+  }
+
   /**
    * Binds to an event bus to observe service availability broadcasts.
+   *
+   * The handler captures the active session generation so a broadcast delivered
+   * by a superseded generation (e.g. a queued/slow provider notification from a
+   * previous session) can never clear the current session's service handle.
+   * `beginSession`/`endSession` also unsubscribe the previous handler.
    */
   bindEvents(events: EventBusLike): void {
     if (this.unsubscribeChange) {
       this.unsubscribeChange();
+      this.unsubscribeChange = undefined;
     }
     this.events = events;
+    const generation = this.sessionGeneration;
     this.unsubscribeChange = onLoopServiceChange(events, (status) => {
+      if (generation !== this.sessionGeneration) {
+        return;
+      }
       if (!status.available) {
         if (this.service) {
           this.service = undefined;
@@ -298,6 +469,13 @@ export class LoopSchedulerAdapter {
 
   /**
    * Performs dynamic service discovery over the configured or provided event bus.
+   *
+   * Discovery is asynchronous: the reply may resolve after a session switch.
+   * The request captures the session generation at call time and only attaches
+   * the discovered handle when that generation is still active, so a late reply
+   * for session A can never bind A's handle into session B. A superseded reply
+   * resolves to `{ ok: false, reason: "unavailable" }` (never a false-positive
+   * success), regardless of what the provider itself returned.
    */
   async discover(events?: EventBusLike, options?: DiscoverLoopServiceOptions): Promise<LoopServiceDiscovery> {
     const bus = events ?? this.events;
@@ -309,10 +487,25 @@ export class LoopSchedulerAdapter {
       };
     }
 
+    const generation = this.sessionGeneration;
     const discovery = await discoverLoopService(bus, {
       timeoutMs: options?.timeoutMs ?? this.discoveryTimeoutMs,
       requestId: options?.requestId,
     });
+
+    // If the session generation changed while awaiting, the reply belongs to a
+    // superseded session: report failure (never a false positive success) and
+    // never attach the stale handle. This takes precedence over the provider's
+    // own unavailable/timeout result so callers cannot mistake it for a live
+    // service for the current session.
+    if (generation !== this.sessionGeneration) {
+      return {
+        ok: false,
+        reason: "unavailable",
+        message:
+          "pi-loop discovery reply was discarded: the workflow session generation changed before it resolved.",
+      };
+    }
 
     if (discovery.ok) {
       this.attachService(discovery.service);
@@ -770,11 +963,16 @@ export class LoopSchedulerAdapter {
    * Returns a WorkflowSchedulerPort instance bound to the specified run ID.
    */
   getSchedulerPort(runId: string): WorkflowSchedulerPort {
+    // Capture the session generation so a port handed to a stale iteration
+    // from a previous session cannot mutate the new session's scheduler state.
+    const generation = this.sessionGeneration;
     return {
       scheduleWakeup: async (params) => {
+        this.assertSessionGeneration(generation, "schedule wakeup", params.runId);
         await this.scheduleWakeup(params);
       },
       cancelWakeup: async (targetRunId) => {
+        this.assertSessionGeneration(generation, "cancel wakeup", targetRunId);
         await this.cancelWakeup(targetRunId);
       },
     };
@@ -1323,6 +1521,7 @@ export class LoopSchedulerAdapter {
     }
 
     this.pendingTurnRunId = runId;
+    this.pendingTurnGeneration = this.sessionGeneration;
 
     // Generate fresh, deterministic prompt reflecting current run state, step, turn counters, and data
     const freshPrompt = this.dispatcher.buildPrompt(run.id, {
@@ -1352,10 +1551,19 @@ export class LoopSchedulerAdapter {
    */
   handleTurnStart(ctx: { signal?: AbortSignal }, prompt?: string): IterationBinding | undefined {
     let runId = this.pendingTurnRunId;
+    let generation = this.pendingTurnGeneration;
     if (!runId && prompt) {
       runId = extractWorkflowRunId(prompt);
+      generation = undefined;
     }
     this.pendingTurnRunId = undefined;
+    this.pendingTurnGeneration = undefined;
+
+    // A pending turn recorded in a previous session generation must never bind
+    // during the new session, even if the same run id also exists here.
+    if (generation !== undefined && generation !== this.sessionGeneration) {
+      return undefined;
+    }
 
     if (!runId) {
       return undefined;
