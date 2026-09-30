@@ -3,6 +3,7 @@
  */
 
 import { getAmbiguousEffects, hasAmbiguousEffects } from "./run.ts";
+import type { CapabilityResolution } from "./capabilities.ts";
 import type { WorkflowRun } from "./types.ts";
 
 /**
@@ -79,8 +80,50 @@ export interface BuildIterationPromptOptions {
   run: WorkflowRun;
   /** Available capabilities (optional) */
   availableCapabilities?: Iterable<string> | Record<string, boolean>;
+  /** Structured capability resolution captured at dispatch (optional) */
+  capabilityReport?: CapabilityResolution;
   /** Fixed timestamp for testing / reproducibility (optional) */
   now?: number;
+}
+
+/**
+ * Renders a capability visibility section for the iteration prompt.
+ * Only emitted when a structured capability report is present and reports an
+ * issue, so the default prompt output remains byte-stable.
+ */
+function buildCapabilitySection(report: CapabilityResolution): string[] | undefined {
+  const concerns: string[] = [];
+  if (report.missing.length > 0) {
+    concerns.push(`- Missing required capabilities: [${report.missing.join(", ")}]`);
+  }
+  if (report.incompatible.length > 0) {
+    concerns.push(`- Incompatible required capabilities: [${report.incompatible.join(", ")}]`);
+  }
+  if (report.degraded.length > 0) {
+    concerns.push(`- Degraded required capabilities: [${report.degraded.join(", ")}]`);
+  }
+  if (report.optionalMissing.length > 0) {
+    concerns.push(`- Unavailable optional capabilities: [${report.optionalMissing.join(", ")}]`);
+  }
+  if (report.optionalIncompatible.length > 0) {
+    concerns.push(`- Incompatible optional capabilities: [${report.optionalIncompatible.join(", ")}]`);
+  }
+  if (report.optionalDegraded.length > 0) {
+    concerns.push(`- Degraded optional capabilities: [${report.optionalDegraded.join(", ")}]`);
+  }
+
+  const reasons = report.items.filter((item) => item.reason).map((item) => `  * ${item.reason}`);
+  if (concerns.length === 0 && reasons.length === 0) {
+    return undefined;
+  }
+
+  const lines: string[] = [``, `## Capability Status`];
+  lines.push(...concerns);
+  lines.push(...reasons);
+  if (report.missing.length > 0 || report.incompatible.length > 0) {
+    lines.push(`Required capabilities must be restored before external side effects are attempted.`);
+  }
+  return lines;
 }
 
 /**
@@ -310,7 +353,17 @@ export function buildIterationPrompt(options: BuildIterationPromptOptions): stri
     "```json",
     deterministicJsonStringify(run.data, 2),
     "```",
-    ``,
+    ``
+  );
+
+  const capabilitySection = options.capabilityReport
+    ? buildCapabilitySection(options.capabilityReport)
+    : undefined;
+  if (capabilitySection) {
+    lines.push(...capabilitySection, ``);
+  }
+
+  lines.push(
     `## Required Action`,
     `You must choose and execute one of the following workflow actions during this turn:`,
     `1. \`workflow_transition({ toStep: "...", data?: { ... }, reason?: "..." })\` to advance step.`,

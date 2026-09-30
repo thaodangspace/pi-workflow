@@ -8,11 +8,19 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+  createLoopCapabilityRegistration,
+  createWorkflowCapabilityRegistry,
+  normalizeCapabilityRequirements,
+  type CapabilityResolution,
+  type WorkflowCapabilityRegistry,
+  type WorkflowCapabilityRequirement,
+} from "./capabilities.ts";
 import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { loadWorkflows, type LoadWorkflowsOptions } from "./loader.ts";
 import type { WorkflowRunRegistry } from "./registry.ts";
 import { isTerminalLifecycle } from "./run.ts";
-import type { LoopSchedulerAdapter } from "./scheduler-adapter.ts";
+import { LOOP_SERVICE_VERSION, type LoopSchedulerAdapter } from "./scheduler-adapter.ts";
 import {
   type JsonValue,
   type WorkflowDefinitionV1,
@@ -55,9 +63,51 @@ export interface WorkflowCommandControllerOptions {
   dispatcher?: WorkflowDispatcher;
   cwd?: string;
   loadOptions?: LoadWorkflowsOptions;
+  /** Trusted, explicitly declared capability names (authoritative; not a tool-name heuristic). */
   capabilities?: Iterable<string> | (() => Iterable<string> | Promise<Iterable<string>>);
+  /**
+   * Optional shared session-scoped capability registry. When omitted, the
+   * controller creates its own, seeded with the public pi-loop service and any
+   * explicit `capabilities`.
+   */
+  capabilityRegistry?: WorkflowCapabilityRegistry;
   outputStream?: (text: string) => void;
   pi?: ExtensionAPI;
+}
+
+/**
+ * Returns the structured requirement list for a workflow definition/snapshot,
+ * falling back to legacy bare capability names.
+ */
+export function declaredRequirements(def: {
+  requires: readonly string[];
+  capabilityRequirements?: readonly WorkflowCapabilityRequirement[];
+}): readonly (string | WorkflowCapabilityRequirement)[] {
+  return def.capabilityRequirements && def.capabilityRequirements.length > 0
+    ? def.capabilityRequirements
+    : def.requires;
+}
+
+/**
+ * Builds an actionable capability error message. For the legacy case of only
+ * missing names, returns undefined so the error keeps its canonical wording.
+ */
+export function buildCapabilityErrorMessage(
+  workflowName: string,
+  resolution: CapabilityResolution
+): string | undefined {
+  if (resolution.incompatible.length === 0) {
+    return undefined;
+  }
+  const reasons = resolution.items
+    .filter((item) => !item.optional && !item.satisfied && item.reason)
+    .map((item) => item.reason)
+    .join("; ");
+  const missingPart = resolution.missing.length > 0 ? `missing: [${resolution.missing.join(", ")}]` : "";
+  const incompatiblePart =
+    resolution.incompatible.length > 0 ? `incompatible: [${resolution.incompatible.join(", ")}]` : "";
+  const summary = [missingPart, incompatiblePart].filter(Boolean).join(", ");
+  return `Workflow "${workflowName}" requires capabilities that are not satisfied (${summary}). ${reasons}`;
 }
 
 /**
@@ -175,66 +225,90 @@ export class WorkflowCommandController {
   readonly registry: WorkflowRunRegistry;
   readonly adapter: LoopSchedulerAdapter;
   readonly dispatcher?: WorkflowDispatcher;
+  readonly capabilityRegistry: WorkflowCapabilityRegistry;
   private options: WorkflowCommandControllerOptions;
   private discoveredDefinitions = new Map<string, WorkflowDefinitionV1>();
   private definitionsLoaded = false;
+  private explicitCapabilitiesSeeded = false;
 
   constructor(options: WorkflowCommandControllerOptions) {
     this.options = options;
     this.registry = options.registry;
     this.adapter = options.adapter;
     this.dispatcher = options.dispatcher;
+    this.capabilityRegistry =
+      options.capabilityRegistry ??
+      createWorkflowCapabilityRegistry({ sessionId: options.adapter?.sessionId });
+
+    // Advertise the public pi-loop service as the `loop` capability. Status is
+    // resolved dynamically from the versioned service contract, so a degraded
+    // or missing scheduler is never silently treated as healthy.
+    if (!this.capabilityRegistry.isDisposed() && !this.capabilityRegistry.has("loop")) {
+      try {
+        this.capabilityRegistry.register(
+          createLoopCapabilityRegistration({
+            version: LOOP_SERVICE_VERSION,
+            isAvailable: () => this.adapter.isAvailable(),
+            reason: () => "the pi-loop scheduler service for this session is unavailable",
+          })
+        );
+      } catch {
+        // Conflicting registration must not break command setup.
+      }
+    }
   }
 
   /**
-   * Determine currently available capabilities across scheduler, Pi tools, and custom options.
-   *
-   * Note on Capability Discovery Limitations:
-   * Inspecting Pi tool names or namespaces (via pi.getAllTools()) is only a discovery heuristic;
-   * it confirms that a matching tool or namespace is registered in the Pi process, but does NOT
-   * verify that an external system dependency (such as tmux CLI or git CLI) is installed in PATH,
-   * nor that remote credentials or service tokens (such as GitHub OAuth or API tokens) are valid.
-   * Callers requiring rigorous environment verification should provide an authoritative capability
-   * checker in controller options.
+   * Registers explicit, trusted capability declarations supplied by the host.
+   * These are authoritative assertions (not a tool-name heuristic) and are
+   * registered lazily because a provider function may be asynchronous.
    */
-  async getAvailableCapabilities(pi?: ExtensionAPI): Promise<Set<string>> {
-    const caps = new Set<string>();
-
-    // Sibling scheduler service provides "loop"
-    if (this.adapter.isAvailable()) {
-      caps.add("loop");
+  private async seedExplicitCapabilities(): Promise<void> {
+    if (this.explicitCapabilitiesSeeded) {
+      return;
     }
-
-    // Registered Pi tools and namespaces
-    const effectivePi = pi ?? this.options.pi;
-    if (effectivePi && typeof effectivePi.getAllTools === "function") {
+    this.explicitCapabilitiesSeeded = true;
+    const source = this.options.capabilities;
+    if (!source || this.capabilityRegistry.isDisposed()) {
+      return;
+    }
+    let values: Iterable<string>;
+    try {
+      values = typeof source === "function" ? await source() : source;
+    } catch {
+      return;
+    }
+    for (const raw of values) {
+      const name = typeof raw === "string" ? raw.trim() : "";
+      if (!name) {
+        continue;
+      }
       try {
-        const tools = effectivePi.getAllTools();
-        for (const t of tools) {
-          caps.add(t.name);
-          if (t.namespace?.name) {
-            caps.add(t.namespace.name);
-          }
-        }
+        // Explicit declarations override dynamic discovery for the same name.
+        this.capabilityRegistry.register({ name, version: 1, features: [] }, { replace: true });
       } catch {
-        // Ignore inspection errors
+        // ignore
       }
     }
+  }
 
-    // Explicit custom capability provider
-    if (this.options.capabilities) {
-      if (typeof this.options.capabilities === "function") {
-        const custom = await this.options.capabilities();
-        for (const c of custom) {
-          caps.add(c);
-        }
-      } else {
-        for (const c of this.options.capabilities) {
-          caps.add(c);
-        }
+  /**
+   * Returns the names of capabilities currently satisfied by registered
+   * providers (available or degraded), plus explicit trusted declarations.
+   *
+   * This deliberately does NOT inspect `pi.getAllTools()`: a registered tool or
+   * namespace is a discovery hint at best and cannot prove that a compatible,
+   * healthy provider exists (binary installed, credentials valid, version
+   * matched). Only explicit provider registrations count.
+   */
+  async getAvailableCapabilities(_pi?: ExtensionAPI): Promise<Set<string>> {
+    await this.seedExplicitCapabilities();
+    const caps = new Set<string>();
+    for (const capability of this.capabilityRegistry.listCapabilities()) {
+      if (capability.status !== "unavailable") {
+        caps.add(capability.name);
       }
     }
-
     return caps;
   }
 
@@ -280,11 +354,22 @@ export class WorkflowCommandController {
     }
 
     // 3. Check if on-disk definition added new required capabilities
-    const diskCapCheck = await this.validateCapabilities(run.workflow, onDiskDef.requires, pi, run.id);
+    const diskCapCheck = await this.validateCapabilities(
+      run.workflow,
+      declaredRequirements(onDiskDef),
+      pi,
+      run.id
+    );
     if (!diskCapCheck.ok) {
+      const incompatible =
+        "incompatible" in diskCapCheck && diskCapCheck.incompatible.length > 0
+          ? ` Incompatible: [${diskCapCheck.incompatible.join(", ")}].`
+          : "";
       return {
         ok: false,
-        reason: `On-disk workflow definition requires additional capabilities: [${diskCapCheck.missing.join(", ")}] which are not currently available.`,
+        reason: `On-disk workflow definition requires additional capabilities: [${diskCapCheck.missing.join(
+          ", "
+        )}] which are not currently available.${incompatible}`,
       };
     }
 
@@ -292,27 +377,44 @@ export class WorkflowCommandController {
   }
 
   /**
-   * Validate that all required capabilities are satisfied by the current runtime.
+   * Validate that all required capabilities are satisfied by the currently
+   * registered providers. Accepts bare names and structured requirements.
+   *
+   * Distinguished outcomes:
+   * - `missing`: no provider (or an unavailable one) for a required name;
+   * - `incompatible`: provider present but below the required version or
+   *   lacking a required feature.
    */
   async validateCapabilities(
     workflowName: string,
-    requires: readonly string[],
-    pi?: ExtensionAPI,
+    requirements: readonly (string | WorkflowCapabilityRequirement)[],
+    _pi?: ExtensionAPI,
     runId?: string
-  ): Promise<{ ok: true } | { ok: false; missing: string[]; error: WorkflowCapabilityError }> {
-    if (!requires || requires.length === 0) {
+  ): Promise<
+    | { ok: true }
+    | { ok: false; missing: string[]; incompatible: string[]; error: WorkflowCapabilityError }
+  > {
+    await this.seedExplicitCapabilities();
+    const normalized = normalizeCapabilityRequirements(requirements);
+    if (normalized.length === 0) {
       return { ok: true };
     }
 
-    const available = await this.getAvailableCapabilities(pi);
-    const missing = requires.filter((req) => !available.has(req));
-
-    if (missing.length > 0) {
-      const error = new WorkflowCapabilityError(workflowName, missing, undefined, runId);
-      return { ok: false, missing, error };
+    const resolution = this.capabilityRegistry.resolveRequirements(normalized);
+    if (resolution.ok) {
+      return { ok: true };
     }
 
-    return { ok: true };
+    const missing = [...resolution.missing];
+    const incompatible = [...resolution.incompatible];
+    const error = new WorkflowCapabilityError(
+      workflowName,
+      missing,
+      buildCapabilityErrorMessage(workflowName, resolution),
+      runId,
+      { incompatible, resolution }
+    );
+    return { ok: false, missing, incompatible, error };
   }
 
   /**
@@ -459,7 +561,7 @@ export class WorkflowCommandController {
     }
 
     // 1. Validate required capabilities
-    const capCheck = await this.validateCapabilities(def.name, def.requires, options.pi);
+    const capCheck = await this.validateCapabilities(def.name, declaredRequirements(def), options.pi);
     if (!capCheck.ok) {
       const msg = capCheck.error.message;
       return { ok: false, action: "start", output: msg, error: msg };
@@ -805,7 +907,12 @@ export class WorkflowCommandController {
     }
 
     // 1. Revalidate required capabilities against run snapshot
-    const capCheck = await this.validateCapabilities(run.workflow, run.snapshot.requires, options.pi, run.id);
+    const capCheck = await this.validateCapabilities(
+      run.workflow,
+      declaredRequirements(run.snapshot),
+      options.pi,
+      run.id
+    );
     if (!capCheck.ok) {
       const msg = `Cannot resume run "${run.id}": ${capCheck.error.message}`;
       return { ok: false, action: "resume", output: msg, error: msg };

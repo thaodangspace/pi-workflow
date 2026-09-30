@@ -1090,6 +1090,69 @@ Body`,
       assert.equal(loopService.listTasks().length, 0);
     });
 
+    it("beginIteration denies a non-owner BEFORE budget exhaustion can cancel/block the run", () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+      const def = parseWorkflowContent(
+        `---
+name: begin-budget-wf
+description: begin iteration budget ownership definition
+mode: self-paced
+concurrency:
+  maxRuns: 2
+---
+Body`,
+        { path: "/begin-budget.md", scope: "project" }
+      );
+
+      // Case 1: default onExhaustion "block".
+      const blockRun = registry.createRun(def, {
+        runId: "wfrun-begin-budget-block",
+        budget: { maxTurns: 1 },
+      });
+      registry.updateRun(blockRun.id, { turns: 1 });
+      registry.acquireLease(blockRun.id, { ownerId: "owner-A", expiresAt: Date.now() + 15 * 60_000 });
+      assert.equal(registry.requireRun(blockRun.id).lifecycle, "active");
+
+      // Case 2: onExhaustion "cancel".
+      const cancelRun = registry.createRun(def, {
+        runId: "wfrun-begin-budget-cancel",
+        budget: { maxTurns: 1, onExhaustion: "cancel" },
+      });
+      registry.updateRun(cancelRun.id, { turns: 1 });
+      registry.acquireLease(cancelRun.id, { ownerId: "owner-A", expiresAt: Date.now() + 15 * 60_000 });
+      assert.equal(registry.requireRun(cancelRun.id).lifecycle, "active");
+
+      for (const run of [blockRun, cancelRun]) {
+        // Explicit non-owner dispatch is refused.
+        assert.throws(
+          () => dispatcher.beginIteration(run.id, { ownerId: "owner-B" }),
+          (err: any) => {
+            assert(err instanceof WorkflowOwnershipError);
+            assert.equal(err.currentOwnerId, "owner-A");
+            return true;
+          }
+        );
+
+        // Omitting the owner must not be treated as takeover of a live lease.
+        assert.throws(
+          () => dispatcher.beginIteration(run.id),
+          (err: any) => {
+            assert(err instanceof WorkflowOwnershipError);
+            return true;
+          }
+        );
+
+        // Crucially, the exhausted run was NOT mutated by the budget check.
+        const after = registry.requireRun(run.id);
+        assert.equal(after.lifecycle, "active", "non-owner dispatch must not mutate the run to blocked/cancelled");
+        assert.equal(after.blocker, undefined);
+        assert.equal(after.completion, undefined);
+        assert.equal(after.lease?.ownerId, "owner-A");
+      }
+    });
+
     it("direct control refuses to stop a task cross-linked to another run and preserves it", async () => {
       const session = new FakeSessionManager();
       const registry = new WorkflowRunRegistry(session);

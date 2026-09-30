@@ -13,6 +13,7 @@ import {
   WORKFLOW_SCHEMA_VERSION,
 } from "./constants.ts";
 import { parseDuration } from "./duration.ts";
+import type { WorkflowCapabilityRequirement } from "./capabilities.ts";
 import {
   type WorkflowBudgetPolicy,
   type WorkflowCompletionPolicy,
@@ -443,8 +444,9 @@ export function parseWorkflowContent(
     }
   }
 
-  // 9. Validate 'requires'
+  // 9. Validate 'requires' (bare names and/or structured constraints)
   const requires: string[] = [];
+  const capabilityRequirements: WorkflowCapabilityRequirement[] = [];
   if (raw.requires !== undefined && raw.requires !== null) {
     if (!Array.isArray(raw.requires)) {
       addError("requires", `Field "requires" must be an array of capability strings (got ${typeof raw.requires})`);
@@ -452,15 +454,98 @@ export function parseWorkflowContent(
       const seenCapabilities = new Set<string>();
       for (let i = 0; i < raw.requires.length; i++) {
         const item = raw.requires[i];
-        if (typeof item !== "string" || item.trim() === "") {
-          addError(`requires[${i}]`, `Capability item at index ${i} must be a non-empty string`);
-        } else {
+        let capName: string | undefined;
+        let requirement: WorkflowCapabilityRequirement | undefined;
+
+        if (typeof item === "string") {
           const cap = item.trim();
-          if (seenCapabilities.has(cap)) {
-            addError(`requires`, `Duplicate capability "${cap}" in field "requires"`);
+          if (cap === "") {
+            addError(`requires[${i}]`, `Capability item at index ${i} must be a non-empty string`);
           } else {
-            seenCapabilities.add(cap);
-            requires.push(cap);
+            capName = cap;
+            requirement = { name: cap };
+          }
+        } else if (isPlainObject(item)) {
+          const rawReq = item as Record<string, unknown>;
+          const rawName = rawReq.name;
+          if (typeof rawName !== "string" || rawName.trim() === "") {
+            addError(`requires[${i}].name`, `Capability requirement at index ${i} requires a non-empty string "name"`);
+          } else {
+            const name = rawName.trim();
+            const req: WorkflowCapabilityRequirement = { name };
+
+            if (rawReq.version !== undefined) {
+              if (
+                typeof rawReq.version !== "number" ||
+                !Number.isInteger(rawReq.version) ||
+                rawReq.version < 1
+              ) {
+                addError(
+                  `requires[${i}].version`,
+                  `Capability "${name}" version must be an integer >= 1 (got ${String(rawReq.version)})`
+                );
+              } else {
+                req.version = rawReq.version;
+              }
+            }
+
+            if (rawReq.features !== undefined) {
+              if (!Array.isArray(rawReq.features)) {
+                addError(`requires[${i}].features`, `Capability "${name}" features must be an array of strings`);
+              } else {
+                const features: string[] = [];
+                const seenFeatures = new Set<string>();
+                for (let f = 0; f < rawReq.features.length; f++) {
+                  const feature = rawReq.features[f];
+                  if (typeof feature !== "string" || feature.trim() === "") {
+                    addError(
+                      `requires[${i}].features[${f}]`,
+                      `Capability "${name}" feature at index ${f} must be a non-empty string`
+                    );
+                  } else {
+                    const trimmedFeature = feature.trim();
+                    if (seenFeatures.has(trimmedFeature)) {
+                      addError(
+                        `requires[${i}].features`,
+                        `Duplicate feature "${trimmedFeature}" for capability "${name}"`
+                      );
+                    } else {
+                      seenFeatures.add(trimmedFeature);
+                      features.push(trimmedFeature);
+                    }
+                  }
+                }
+                if (features.length > 0) {
+                  req.features = features;
+                }
+              }
+            }
+
+            if (rawReq.optional !== undefined) {
+              if (typeof rawReq.optional !== "boolean") {
+                addError(`requires[${i}].optional`, `Capability "${name}" optional must be a boolean`);
+              } else if (rawReq.optional) {
+                req.optional = true;
+              }
+            }
+
+            capName = name;
+            requirement = req;
+          }
+        } else {
+          addError(
+            `requires[${i}]`,
+            `Capability item at index ${i} must be a non-empty string or a structured capability object`
+          );
+        }
+
+        if (capName !== undefined && requirement !== undefined) {
+          if (seenCapabilities.has(capName)) {
+            addError(`requires`, `Duplicate capability "${capName}" in field "requires"`);
+          } else {
+            seenCapabilities.add(capName);
+            requires.push(capName);
+            capabilityRequirements.push(requirement);
           }
         }
       }
@@ -582,9 +667,15 @@ export function parseWorkflowContent(
     budget,
     wakeups,
     requires,
+    ...(capabilityRequirements.length > 0 ? { capabilityRequirements } : {}),
     ...(completion ? { completion } : {}),
     ...(metadata ? { metadata } : {}),
     body,
     source: fullSource,
   };
+}
+
+/** Narrows a value to a non-array object (used for structured requirements). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

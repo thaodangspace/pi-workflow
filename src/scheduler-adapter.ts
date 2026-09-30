@@ -10,6 +10,10 @@
  */
 
 import { randomUUID } from "node:crypto";
+import {
+  createLoopCapabilityRegistration,
+  type WorkflowCapabilityRegistry,
+} from "./capabilities.ts";
 import { DEFAULT_LEASE_DURATION_MS } from "./constants.ts";
 import type { WorkflowDispatcher } from "./dispatcher.ts";
 import { parseDuration } from "./duration.ts";
@@ -393,6 +397,12 @@ export interface LoopSchedulerAdapterOptions {
   ownerId?: string;
   sessionId?: string;
   leaseDurationMs?: number;
+  /**
+   * Optional session-scoped capability registry. When provided, the adapter
+   * advertises the public pi-loop service as the `loop` capability and
+   * captures capability status into each dispatched iteration context.
+   */
+  capabilityRegistry?: WorkflowCapabilityRegistry;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +424,7 @@ export class LoopSchedulerAdapter {
   private events?: EventBusLike;
   private unsubscribeChange?: () => void;
   private discoveryTimeoutMs: number;
+  private capabilityRegistry?: WorkflowCapabilityRegistry;
 
   private runToTaskMap = new Map<string, string>();
   private taskToRunMap = new Map<string, string>();
@@ -428,10 +439,55 @@ export class LoopSchedulerAdapter {
     this.sessionId = options.sessionId ?? options.service?.sessionId ?? "default";
     this.ownerId = options.ownerId ?? `${this.sessionId}:inst-${randomUUID().slice(0, 8)}`;
     this.leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
+    this.capabilityRegistry = options.capabilityRegistry;
+
+    if (this.capabilityRegistry) {
+      this.registerSchedulerCapability();
+    }
 
     if (this.events) {
       this.bindEvents(this.events);
     }
+  }
+
+  /**
+   * Advertises the public pi-loop service as the `loop` capability.
+   * Availability is derived from the versioned service contract, never from
+   * tool names, namespaces, or CLI presence. Idempotent across controller and
+   * adapter construction on the same shared registry.
+   */
+  private registerSchedulerCapability(): void {
+    const registry = this.capabilityRegistry;
+    if (!registry || registry.has("loop")) {
+      return;
+    }
+    try {
+      registry.register(
+        createLoopCapabilityRegistration({
+          version: LOOP_SERVICE_VERSION,
+          isAvailable: () => this.isAvailable(),
+          reason: () => "the pi-loop scheduler service for this session is unavailable",
+        })
+      );
+    } catch {
+      // A conflicting registration must never crash scheduler construction.
+    }
+  }
+
+  /**
+   * Resolves the run's declared capability requirements against the session
+   * registry, returning undefined when no registry is configured.
+   */
+  private resolveRunCapabilities(run: WorkflowRun): ReturnType<WorkflowCapabilityRegistry["resolveRequirements"]> | undefined {
+    if (!this.capabilityRegistry) {
+      return undefined;
+    }
+    const snapshot = run.snapshot;
+    const requirements =
+      snapshot.capabilityRequirements && snapshot.capabilityRequirements.length > 0
+        ? snapshot.capabilityRequirements
+        : snapshot.requires;
+    return this.capabilityRegistry.resolveRequirements(requirements);
   }
 
   /**
@@ -645,7 +701,9 @@ export class LoopSchedulerAdapter {
     }
 
     const snapshot = run.snapshot;
-    const prompt = options.prompt ?? this.dispatcher.buildPrompt(run.id);
+    const prompt = options.prompt ?? this.dispatcher.buildPrompt(run.id, {
+      capabilityReport: this.resolveRunCapabilities(run),
+    });
 
     // Calculate absolute expiry if specified in budget
     let expiresAt = options.expiresAt;
@@ -1510,7 +1568,9 @@ export class LoopSchedulerAdapter {
     this.pendingTurnRunId = runId;
 
     // Generate fresh, deterministic prompt reflecting current run state, step, turn counters, and data
-    const freshPrompt = this.dispatcher.buildPrompt(run.id);
+    const freshPrompt = this.dispatcher.buildPrompt(run.id, {
+      capabilityReport: this.resolveRunCapabilities(run),
+    });
 
     return {
       message: {
@@ -1562,10 +1622,14 @@ export class LoopSchedulerAdapter {
     // Durable ownership heartbeat: refresh the lease before executing a turn.
     this.ensureOwnership(run);
 
+    const capabilityReport = this.resolveRunCapabilities(run);
+
     return this.dispatcher.beginIteration(run.id, {
       ownerId: this.ownerId,
       signal: ctx.signal,
       schedulerPort: this.getSchedulerPort(run.id),
+      capabilities: capabilityReport ? capabilityReport.satisfied : undefined,
+      capabilityReport,
     });
   }
 
@@ -1581,8 +1645,12 @@ export class LoopSchedulerAdapter {
    * Programmatic dispatch helper: dispatches an iteration turn with an AbortSignal.
    */
   dispatchIteration(runId: string, options: DispatchIterationOptions = {}): IterationBinding {
+    const run = options.capabilityReport ? undefined : this.registry.getRun(runId);
+    const capabilityReport = options.capabilityReport ?? (run ? this.resolveRunCapabilities(run) : undefined);
     return this.dispatcher.beginIteration(runId, {
       ...options,
+      capabilities: options.capabilities ?? capabilityReport?.satisfied,
+      capabilityReport,
       ownerId: options.ownerId ?? this.ownerId,
       schedulerPort: options.schedulerPort ?? this.getSchedulerPort(runId),
     });
