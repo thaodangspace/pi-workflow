@@ -8,7 +8,7 @@ import type { DeepReadonly, WorkflowDefinitionV1, WorkflowSnapshotV1 } from "./t
 /**
  * Deep freezes an object recursively to guarantee immutability.
  */
-function deepFreeze<T>(obj: T): DeepReadonly<T> {
+export function deepFreeze<T>(obj: T): DeepReadonly<T> {
   if (obj === null || typeof obj !== "object") {
     return obj as DeepReadonly<T>;
   }
