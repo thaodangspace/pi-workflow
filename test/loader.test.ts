@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -289,5 +289,79 @@ Direct file body.`
     assert.equal(def.name, "single-wf");
     assert.equal(def.concurrency.maxRuns, 2);
     assert.equal(def.body, "Direct file body.");
+  });
+
+  it("skips and rejects directory and file symlinks during discovery to prevent loops and scope escapes", async () => {
+    const externalDir = join(tempRoot, "external-scope");
+    mkdirSync(externalDir, { recursive: true });
+
+    writeFileSync(
+      join(externalDir, "escaped.md"),
+      `---\nname: escaped-wf\ndescription: Escaped\nmode: self-paced\n---\nEscaped body`
+    );
+
+    // Symlink pointing outside scope
+    const symlinkSubdir = join(projectWorkflowsDir, "external-link");
+    symlinkSync(externalDir, symlinkSubdir, "dir");
+
+    // Circular symlink pointing to parent/self to test loop prevention
+    const circularLink = join(projectWorkflowsDir, "loop-link");
+    symlinkSync(projectWorkflowsDir, circularLink, "dir");
+
+    // Symlink file pointing to external file
+    const symlinkFile = join(projectWorkflowsDir, "escaped-link.md");
+    symlinkSync(join(externalDir, "escaped.md"), symlinkFile, "file");
+
+    const result = await loadWorkflows({
+      projectDir: projectWorkflowsDir,
+      userDir: userWorkflowsDir,
+    });
+
+    // Escaped workflow from symlink must NOT be discovered
+    assert.equal(result.workflows.has("escaped-wf"), false);
+  });
+
+  it("ensures loadWorkflow fails closed for invalid definitions", async () => {
+    writeFileSync(
+      join(projectWorkflowsDir, "broken-flow.md"),
+      `---\nname: broken-flow\ndescription: Broken\nmode: invalid-mode\n---\nBody`
+    );
+
+    // Default loadWorkflow (strict: true) must fail closed
+    await assert.rejects(
+      () =>
+        loadWorkflow("broken-flow", {
+          projectDir: projectWorkflowsDir,
+          userDir: userWorkflowsDir,
+        }),
+      (err: unknown) => {
+        assert(err instanceof WorkflowValidationError);
+        assert.match(err.message, /Field "mode" must be one of/);
+        return true;
+      }
+    );
+
+    // Even with strict: false explicitly passed, loading the invalid target fails closed
+    await assert.rejects(
+      () =>
+        loadWorkflow("broken-flow", {
+          projectDir: projectWorkflowsDir,
+          userDir: userWorkflowsDir,
+          strict: false,
+        }),
+      (err: unknown) => {
+        assert(err instanceof WorkflowValidationError);
+        assert.match(err.message, /Field "mode" must be one of/);
+        return true;
+      }
+    );
+
+    // Truly non-existent workflow in a clean directory returns null
+    rmSync(join(projectWorkflowsDir, "broken-flow.md"));
+    const nonExistent = await loadWorkflow("non-existent", {
+      projectDir: projectWorkflowsDir,
+      userDir: userWorkflowsDir,
+    });
+    assert.equal(nonExistent, null);
   });
 });

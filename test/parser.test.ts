@@ -44,6 +44,7 @@ describe("Workflow Parser & Spec v1", () => {
 
   describe("Frontmatter & Body Extraction", () => {
     it("extracts frontmatter and preserves body byte-for-byte", () => {
+      const trailingWhitespace = "Trailing whitespace:   ";
       const markdown = `---
 name: test-wf
 description: A test workflow.
@@ -55,13 +56,13 @@ mode: self-paced
   Indented line 1
   Indented line 2
 
-Trailing whitespace:   
+${trailingWhitespace}
 `;
       const { yamlString, body } = extractFrontmatterAndBody(markdown, "test.md");
       assert.match(yamlString, /name: test-wf/);
 
       // Verify body is preserved byte-for-byte after delimiter line
-      const expectedBody = `\n# Policy Header\n\n  Indented line 1\n  Indented line 2\n\nTrailing whitespace:   \n`;
+      const expectedBody = `\n# Policy Header\n\n  Indented line 1\n  Indented line 2\n\n${trailingWhitespace}\n`;
       assert.equal(body, expectedBody);
     });
 

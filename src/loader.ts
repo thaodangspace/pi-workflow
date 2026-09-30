@@ -111,28 +111,20 @@ function scanDirectoryDeterministic(dir: string, baseDir: string, scope: Workflo
       continue;
     }
 
-    const fullPath = join(dir, entry.name);
-
-    let isFile = entry.isFile();
-    let isDirectory = entry.isDirectory();
-
+    // Skip symbolic links during directory scanning to prevent recursion loops or scope escapes
     if (entry.isSymbolicLink()) {
-      try {
-        const stat = statSync(fullPath);
-        isFile = stat.isFile();
-        isDirectory = stat.isDirectory();
-      } catch {
-        continue;
-      }
+      continue;
     }
 
-    if (isFile && entry.name.endsWith(".md")) {
+    const fullPath = join(dir, entry.name);
+
+    if (entry.isFile() && entry.name.endsWith(".md")) {
       results.push({
         fullPath,
         relativePath: toPosixPath(relative(baseDir, fullPath)),
         scope,
       });
-    } else if (isDirectory) {
+    } else if (entry.isDirectory()) {
       results.push(...scanDirectoryDeterministic(fullPath, baseDir, scope));
     }
   }
@@ -388,11 +380,37 @@ export async function loadWorkflows(options: LoadWorkflowsOptions = {}): Promise
 
 /**
  * Load a single workflow definition by name, re-reading freshly from disk.
+ *
+ * Fails closed by throwing WorkflowValidationError if definitions contain fatal errors
+ * (defaults to strict: true). Even when strict: false is passed explicitly, fails closed
+ * if the requested workflow failed validation.
  */
 export async function loadWorkflow(
   name: string,
   options: LoadWorkflowsOptions = {}
 ): Promise<WorkflowDefinitionV1 | null> {
-  const result = await loadWorkflows(options);
-  return result.workflows.get(name) ?? null;
+  const strict = options.strict ?? true;
+  const result = await loadWorkflows({ ...options, strict });
+  const workflow = result.workflows.get(name) ?? null;
+
+  if (!workflow) {
+    // If not found in valid workflows, check whether this workflow failed with a diagnostic error
+    const matchingError = result.diagnostics.find(
+      (d) =>
+        d.type === "error" &&
+        (d.path.endsWith(`/${name}.md`) ||
+          d.path.endsWith(`\\${name}.md`) ||
+          d.message.includes(`"${name}"`))
+    );
+    if (matchingError) {
+      throw new WorkflowValidationError(
+        matchingError.message,
+        matchingError.path,
+        matchingError.field,
+        [matchingError]
+      );
+    }
+  }
+
+  return workflow;
 }
