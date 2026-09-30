@@ -159,3 +159,10 @@ export const MAX_STATUS_LINE_LENGTH = 200;
  * Maximum number of recent recovery events rendered by `/workflow status`.
  */
 export const MAX_RECOVERY_EVENTS_DISPLAYED = 5;
+
+/**
+ * Maximum character length of an object key rendered by safe diagnostics or
+ * retained in a sanitized history detail record (issue #10). Mirrors
+ * `MAX_DATA_KEY_LENGTH` so sanitized keys never grow beyond their source bound.
+ */
+export const MAX_DIAGNOSTIC_KEY_LENGTH = 128;

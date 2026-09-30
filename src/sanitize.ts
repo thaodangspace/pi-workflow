@@ -18,7 +18,7 @@
  * durable Pi session JSONL log remains the append-only source of truth.
  */
 
-import { MAX_DIAGNOSTIC_TEXT_LENGTH } from "./constants.ts";
+import { MAX_DIAGNOSTIC_KEY_LENGTH, MAX_DIAGNOSTIC_TEXT_LENGTH } from "./constants.ts";
 import type { JsonValue } from "./types.ts";
 
 /** Result of sanitizing a user/model-controlled diagnostic string. */
@@ -60,6 +60,15 @@ const REDACTION_RULES: readonly RedactionRule[] = [
   {
     pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
     replacement: "[redacted jwt]",
+  },
+  {
+    // HTTP authorization header with an optional scheme (`Bearer`, `Basic`,
+    // `Token`). MUST run before the generic keyword rule, which would otherwise
+    // redact the scheme word as the "value" and leave the actual token behind.
+    // Example: `Authorization: Bearer actualsecret` -> `Authorization: [redacted]`.
+    pattern:
+      /\b(authorization)\b\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?([^\s,;]+)/gi,
+    replacement: "$1: [redacted]",
   },
   {
     // `password is hunter2`, `token = abc`, `secret: xyz`, `api key was …`
@@ -112,15 +121,48 @@ export function sanitizeDiagnosticText(
 
 export interface SanitizeDetailsOptions {
   readonly maxStringLength?: number;
+  readonly maxKeyLength?: number;
   readonly maxDepth?: number;
   readonly maxArrayLength?: number;
   readonly maxKeys?: number;
 }
 
 /**
+ * Sanitize/bound a list of object keys, deterministically resolving collisions
+ * (two distinct raw keys can sanitize to the same safe key). Keys are sorted
+ * first, and each subsequent duplicate gets a stable `#N` suffix.
+ */
+export function sanitizeDiagnosticKeys(
+  keys: readonly string[],
+  options: { maxKeyLength?: number; maxItems?: number } = {}
+): string[] {
+  const maxKeyLength = options.maxKeyLength ?? MAX_DIAGNOSTIC_KEY_LENGTH;
+  const maxItems = options.maxItems ?? Number.POSITIVE_INFINITY;
+  const used = new Set<string>();
+  const out: string[] = [];
+  for (const raw of keys) {
+    if (out.length >= maxItems) {
+      break;
+    }
+    const base = sanitizeDiagnosticText(raw, maxKeyLength).text || "[key]";
+    let candidate = base;
+    let suffix = 1;
+    while (used.has(candidate)) {
+      suffix += 1;
+      candidate = `${base}#${suffix}`;
+    }
+    used.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
+/**
  * Recursively sanitize/bound a JSON-safe details record at the projection
- * boundary. Strings are sanitized and bounded; arrays and objects are bounded
- * in breadth and depth; non-finite numbers and non-JSON values are dropped.
+ * boundary. **Object keys are sanitized as well as values**, string values are
+ * bounded, arrays/objects are bounded in breadth and depth, and non-finite
+ * numbers/non-JSON values are dropped. Key collisions are resolved
+ * deterministically.
  *
  * Deterministic: the same input always yields the same output, so live and
  * replayed projections remain byte-for-byte identical.
@@ -133,6 +175,7 @@ export function sanitizeHistoryDetails<T extends JsonValue = JsonValue>(
     return undefined;
   }
   const maxStringLength = options.maxStringLength ?? MAX_DIAGNOSTIC_TEXT_LENGTH;
+  const maxKeyLength = options.maxKeyLength ?? MAX_DIAGNOSTIC_KEY_LENGTH;
   const maxDepth = options.maxDepth ?? 6;
   const maxArrayLength = options.maxArrayLength ?? 50;
   const maxKeys = options.maxKeys ?? 64;
@@ -158,15 +201,20 @@ export function sanitizeHistoryDetails<T extends JsonValue = JsonValue>(
         return "[truncated]";
       }
       const source = value as Record<string, unknown>;
+      const rawKeys = Object.keys(source).sort();
+      const safeKeys = sanitizeDiagnosticKeys(rawKeys, { maxKeyLength, maxItems: maxKeys });
       const out: Record<string, JsonValue> = {};
-      let count = 0;
-      for (const key of Object.keys(source).sort()) {
-        if (count >= maxKeys) {
-          out["[truncated]"] = true;
-          break;
+      for (let i = 0; i < safeKeys.length; i++) {
+        out[safeKeys[i]] = walk(source[rawKeys[i]], depth + 1);
+      }
+      if (rawKeys.length > maxKeys) {
+        let marker = "[truncated]";
+        let suffix = 1;
+        while (marker in out) {
+          suffix += 1;
+          marker = `[truncated]#${suffix}`;
         }
-        out[key] = walk(source[key], depth + 1);
-        count += 1;
+        out[marker] = true;
       }
       return out;
     }

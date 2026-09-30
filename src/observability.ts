@@ -38,11 +38,12 @@ import {
   MAX_STATUS_LINE_LENGTH,
 } from "./constants.ts";
 import { isTerminalLifecycle } from "./run.ts";
-import { sanitizeDiagnosticText } from "./sanitize.ts";
+import { sanitizeDiagnosticKeys, sanitizeDiagnosticText } from "./sanitize.ts";
 
 // The canonical sanitization policy lives in `./sanitize.ts` (shared with the
 // history-projection boundary). Re-exported here to preserve the public surface.
 export {
+  sanitizeDiagnosticKeys,
   sanitizeDiagnosticText,
   sanitizeHistoryDetails,
   type SanitizedText,
@@ -621,14 +622,22 @@ export function buildRunDiagnostic(
     }
   }
 
+  // Definition source paths are user/environment-controlled and can embed
+  // credential-like text (tokens in directory names, home paths, etc.). Sanitize
+  // and bound before placing into the safe diagnostic view/data.
+  const sourceSanitized = sanitizeDiagnosticText(run.definitionSource, MAX_DIAGNOSTIC_TEXT_LENGTH);
   const definition = Object.freeze({
-    source: run.definitionSource,
+    source: sourceSanitized.text || "[path omitted]",
     sha256: typeof run.snapshot.source?.sha256 === "string" ? run.snapshot.source.sha256.slice(0, 12) : "",
     schemaVersion: run.snapshot.schemaVersion,
     definitionVersion: run.definitionVersion,
     mode: run.snapshot.mode,
     requires: Object.freeze([...run.snapshot.requires]),
   });
+
+  // Data keys can themselves be credential-like; sanitize/bound them (and
+  // deterministically de-duplicate collisions) rather than exposing raw key text.
+  const dataKeys = Object.freeze(sanitizeDiagnosticKeys(Object.keys(run.data).sort()));
 
   const objectiveSanitized = run.objective !== undefined ? sanitizeDiagnosticText(run.objective, MAX_DIAGNOSTIC_TEXT_LENGTH) : undefined;
 
@@ -658,7 +667,7 @@ export function buildRunDiagnostic(
     effects,
     recoveryEvents,
     ...(latestReconciliation ? { latestReconciliation } : {}),
-    dataKeys: Object.freeze(Object.keys(run.data).sort()),
+    dataKeys,
     leased: run.lease !== undefined,
     ...(run.lease?.expiresAt !== undefined ? { leaseExpiresAt: run.lease.expiresAt } : {}),
   });

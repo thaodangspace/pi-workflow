@@ -17,6 +17,7 @@ import {
   formatStatusLine,
   formatStatusList,
   projectSchedulerLinkage,
+  sanitizeDiagnosticKeys,
   sanitizeDiagnosticText,
   sanitizeHistoryDetails,
 } from "../src/observability.ts";
@@ -139,6 +140,42 @@ describe("diagnostic text sanitization policy (issue #10)", () => {
     assert.equal((out.nested as any).codes[2], true);
     assert.equal((out.nested as any).codes[3], null);
     assert.equal(out.count, 3);
+  });
+
+  it("sanitizes credential-like detail keys and resolves collisions deterministically", () => {
+    const input = { "token is abc": 1, "token is xyz": 2, normal: 3 };
+    const out = sanitizeHistoryDetails(input)!;
+    const keys = Object.keys(out);
+    assert.equal(keys.length, 3);
+    assert.ok(keys.every((k) => !k.includes("abc") && !k.includes("xyz")), `credential key leaked: ${keys.join(",")}`);
+    assert.ok(keys.includes("normal"));
+    assert.ok(keys.includes("token is [redacted]"));
+    assert.ok(keys.includes("token is [redacted]#2"), "collision must get a deterministic suffix");
+    assert.equal(out["token is [redacted]"], 1);
+    assert.equal(out["token is [redacted]#2"], 2);
+    // Deterministic across calls.
+    assert.deepEqual(Object.keys(sanitizeHistoryDetails(input)!), keys);
+  });
+
+  it("redacts an Authorization header before the generic keyword rule (token leak regression)", () => {
+    const header = sanitizeDiagnosticText("Authorization: Bearer actualsecretvalue");
+    assert.equal(header.redacted, true);
+    assert.ok(!header.text.includes("actualsecretvalue"), "bearer token leaked");
+    assert.match(header.text, /Authorization: \[redacted\]/);
+
+    const basic = sanitizeDiagnosticText("authorization: basic dXNlcjpwYXNzd29yZA==");
+    assert.ok(!basic.text.includes("dXNlcjpwYXNzd29yZA=="));
+
+    const eq = sanitizeDiagnosticText("Authorization=Bearer anothersecret");
+    assert.ok(!eq.text.includes("anothersecret"));
+  });
+
+  it("sanitizes credential-like diagnostic keys and definition source paths", () => {
+    const keys = sanitizeDiagnosticKeys(["normal", "token=abcdef123456", "token is zzzyyy"]);
+    const joined = keys.join(",");
+    assert.ok(!joined.includes("abcdef123456"));
+    assert.ok(!joined.includes("zzzyyy"));
+    assert.ok(keys.includes("normal"));
   });
 });
 
@@ -322,6 +359,31 @@ describe("safe detailed run diagnostics (issue #10)", () => {
     assert.ok(!json.includes("abc123456789"));
     const output = formatRunDiagnostic(diag);
     assert.match(output, /\(description omitted\)|\[redacted\]/);
+  });
+
+  it("sanitizes credential-like data keys and definition source paths", () => {
+    const session = new FakeSessionManager();
+    const registry = new WorkflowRunRegistry(session);
+    const dispatcher = new WorkflowDispatcher(registry);
+    const adapter = new LoopSchedulerAdapter({ registry, dispatcher, service: new FakeLoopService() });
+
+    const def = parseWorkflowContent(SELF_PACED_YAML, {
+      path: "/home/dev/token=abcdef123456/workflow.md",
+      scope: "project",
+    });
+    const run = registry.createRun(def, { runId: "wfrun-secret-keys" });
+    registry.updateRun(run.id, { data: { "token=abcdef123456": "value", normal: 1 } });
+
+    const diag = buildRunDiagnostic(registry.requireRun(run.id), adapter);
+    const json = JSON.stringify(diag);
+    assert.ok(!json.includes("abcdef123456"), "credential-like key/path leaked into diagnostic data");
+    assert.ok(diag.dataKeys.includes("normal"));
+    assert.ok(diag.dataKeys.some((k) => k.includes("[redacted]")));
+    assert.ok(!diag.definition.source.includes("abcdef123456"));
+    assert.match(diag.definition.source, /\[redacted\]/);
+
+    const output = formatRunDiagnostic(diag);
+    assert.ok(!output.includes("abcdef123456"));
   });
 
   it("renders goal type and objective without mutating the raw run", () => {
