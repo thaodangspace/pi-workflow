@@ -48,6 +48,9 @@ export * from "./data-bounds.ts";
 // Re-export run model and transitions
 export * from "./run.ts";
 
+// Re-export bounded history projection primitives
+export * from "./bounded-history.ts";
+
 // Re-export session entry encoding and parsing
 export * from "./session-entries.ts";
 

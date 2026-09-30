@@ -409,12 +409,67 @@ export interface WorkflowRun {
 
   /** Recorded external effect checkpoints keyed by effect key */
   readonly effects?: Readonly<Record<string, WorkflowEffect>>;
-  /** Chronological record of recovery and reconciliation events */
+  /**
+   * Bounded recent recovery-event projection (oldest retained event first).
+   *
+   * At most `MAX_RUN_RECOVERY_EVENTS` events are retained; older events remain
+   * durable in the Pi session log but are dropped from the projection.
+   */
   readonly recoveryEvents?: ReadonlyArray<WorkflowRecoveryEvent>;
-  /** Audit history of lifecycle mutations and actions */
+  /** Total lifetime recovery events appended (retained + dropped) */
+  readonly recoveryEventsTotal?: number;
+  /** Number of lifetime recovery events dropped from the projection */
+  readonly recoveryEventsDropped?: number;
+  /** Bounded recent-history projection of lifecycle mutations and actions */
   readonly history?: ReadonlyArray<WorkflowRunHistoryEntry>;
+  /** Total lifetime history entries appended (retained + dropped) */
+  readonly historyTotal?: number;
+  /** Number of lifetime history entries dropped from the retained projection */
+  readonly historyDropped?: number;
   /** Active ownership lease if claimed */
   readonly lease?: Readonly<WorkflowRunLease>;
+}
+
+/** Deterministic ordering for `registry.getRunHistory` results. */
+export type WorkflowRunHistoryOrder = "oldest" | "newest";
+
+/** Options for the bounded recent-history accessor. */
+export interface WorkflowRunHistoryOptions {
+  /**
+   * Maximum number of entries to return. Clamped to
+   * `[0, MAX_RUN_HISTORY_QUERY_LIMIT]`; defaults to the full retained window.
+   * Values that are `NaN`/non-finite fall back to the full retained window.
+   */
+  limit?: number;
+  /**
+   * Order of returned entries. Defaults to `"oldest"` (chronological, matching
+   * the retained projection). `"newest"` returns most-recent-first.
+   */
+  order?: WorkflowRunHistoryOrder;
+}
+
+/**
+ * Observability view over a run's bounded recent-history projection.
+ * Exposes truncation metadata without scanning the lifetime session log.
+ */
+export interface WorkflowRunHistoryView {
+  readonly runId: string;
+  /** Retained entries in the requested deterministic order. */
+  readonly entries: ReadonlyArray<WorkflowRunHistoryEntry>;
+  /** Deterministic order of `entries`. */
+  readonly order: WorkflowRunHistoryOrder;
+  /** Effective (clamped) limit applied to `entries`. */
+  readonly limit: number;
+  /** Number of entries retained in the run projection. */
+  readonly retained: number;
+  /** Total lifetime history entries appended (retained + dropped). */
+  readonly total: number;
+  /** Number of lifetime entries dropped from the retained projection. */
+  readonly dropped: number;
+  /** True when lifetime history exceeded the retention capacity. */
+  readonly truncated: boolean;
+  /** True when `entries` excludes retained entries because of `limit`. */
+  readonly limited: boolean;
 }
 
 /** Mutation actions for append-only session entries */
@@ -633,6 +688,16 @@ export interface EffectCommitOptions {
   resultSummary?: Record<string, JsonValue> | JsonValue;
   /** Optional commit timestamp */
   committedAt?: number;
+  /**
+   * Whether this commit reconciles a previously ambiguous started effect.
+   * Persisted so replay reproduces the `effect_reconciled` audit event.
+   */
+  recovered?: boolean;
+  /**
+   * Optional deterministic id for the generated `effect_reconciled` recovery
+   * event. Persisted so replay reproduces the same event id.
+   */
+  eventId?: string;
 }
 
 export interface EffectReconcileOptions {
@@ -646,6 +711,11 @@ export interface EffectReconcileOptions {
   reason?: string;
   /** Optional reconciliation timestamp */
   reconciledAt?: number;
+  /**
+   * Optional deterministic id for the generated recovery event. Persisted so
+   * replay reproduces the same event id.
+   */
+  eventId?: string;
 }
 
 export interface WorkflowRecoveryEventOptions {

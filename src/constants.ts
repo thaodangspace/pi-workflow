@@ -106,3 +106,31 @@ export const MAX_EFFECTS_PER_RUN = 1000;
 
 /** Default ownership lease duration for workflow runs (15 minutes) */
 export const DEFAULT_LEASE_DURATION_MS = 15 * 60 * 1000;
+
+/**
+ * Maximum number of recent history entries retained in the in-memory
+ * `WorkflowRun.history` projection (issue #24).
+ *
+ * The append-only Pi session log remains the durable source of truth. This
+ * fixed capacity keeps retained memory O(MAX_RUN_HISTORY_ENTRIES) and makes the
+ * cost of a single append independent of the run's total lifetime event count.
+ */
+export const MAX_RUN_HISTORY_ENTRIES = 200;
+
+/**
+ * Maximum number of recent recovery events retained in the in-memory
+ * `WorkflowRun.recoveryEvents` projection (issue #24).
+ *
+ * `recoveryEvents` is a lifetime audit collection (`effect_reconciled`,
+ * `scheduler_reconnected`, synthesized `effect_ambiguous`, ...), so it is
+ * bounded with the same fixed-capacity projection principles as history rather
+ * than being left to grow without limit.
+ */
+export const MAX_RUN_RECOVERY_EVENTS = 200;
+
+/**
+ * Hard upper bound for `registry.getRunHistory(runId, { limit })`.
+ * A caller can never request more entries than the projection can retain, and
+ * the entire lifetime session log is never scanned or materialized.
+ */
+export const MAX_RUN_HISTORY_QUERY_LIMIT = MAX_RUN_HISTORY_ENTRIES;

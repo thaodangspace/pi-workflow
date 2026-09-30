@@ -540,12 +540,40 @@ Durable lease metadata (`run.lease`) records owner identity and expiration times
 ### 6. Durable History & Visibility
 
 All recovery events (such as `effect_ambiguous`, `effect_reconciled`, `scheduler_reconnected`, `scheduler_recreated`, `scheduler_cleaned`, `scheduler_ambiguous`) are recorded in chronological run history:
-- Accessible programmatically via `registry.getRunHistory(runId)` and `registry.getRunRecoveryEvents(runId)`.
+- Accessible programmatically via `registry.getRunHistory(runId, { limit, order })` (a bounded, deterministic view) and `registry.getRunRecoveryEvents(runId)`.
 - Visible to operators in `/workflow status <run-id>` with explicit warnings when reconciliation is required.
 
+#### Bounded Recent-History Retention
+
+The append-only Pi session JSONL log remains the **durable source of truth** for every workflow mutation. The in-memory `WorkflowRun.history` and `WorkflowRun.recoveryEvents` fields are **bounded recent-history projections**, not a second lifetime event store:
+
+- Each projection retains at most a fixed capacity of the most recent entries (`MAX_RUN_HISTORY_ENTRIES` = 200 for history, `MAX_RUN_RECOVERY_EVENTS` = 200 for recovery events). Memory is therefore `O(capacity)`, independent of run lifetime.
+- Appending an event copies at most `capacity` entries, so per-event cost is `O(capacity)` and never `O(total lifetime events)`.
+- Truncation is observable on every run: `historyTotal` / `historyDropped` (and `recoveryEventsTotal` / `recoveryEventsDropped`) count lifetime entries and dropped-out entries. This distinguishes a short-lived run (few lifetime events) from a long-lived run whose history has been truncated.
+- Auto-generated history event IDs are derived from the **lifetime total**, not the retained length, so they remain unique after truncation.
+- Persisted recovery events (`recovery`, `effect_reconcile`, and the `effect_reconciled` event emitted when an ambiguous effect is committed) embed their event ID in the durable mutation entry, so replay reproduces identical recovery-event IDs rather than generating new random ones. Lease release is persisted with the releasing owner so replay re-clears the lease and appends the same `lease_release` history entry.
+- Replay deterministically rebuilds the same projection: re-running reconstruction over the same branch yields identical retained history and identical `total`/`dropped` counters. Synthesized `effect_ambiguous` events keep their deterministic IDs and stay duplicate-free across repeated reconstruction/`refresh()`, and branch isolation is unchanged (only the active branch is replayed).
+- The projection deliberately does **not** retain raw tool output or secret-bearing payloads; summaries/details remain bounded JSON-safe records.
+
+`registry.getRunHistory(runId, options)` returns a deterministic view of the projection:
+```ts
+const view = registry.getRunHistory(runId, { limit: 20, order: "newest" });
+// view.entries   -> most-recent-first, at most 20 retained entries
+// view.total     -> lifetime history entries (retained + dropped)
+// view.retained  -> entries currently retained in the projection
+// view.dropped   -> lifetime entries dropped from the projection
+// view.truncated -> true when dropped > 0
+// view.limited   -> true when `limit` excluded retained entries
+```
+- `order` is `"oldest"` (default, chronological) or `"newest"`; both are deterministic.
+- `limit` is clamped to `[0, MAX_RUN_HISTORY_QUERY_LIMIT]` (`= MAX_RUN_HISTORY_ENTRIES`).
+- The accessor reads only the in-memory projection and never scans or materializes the lifetime session log, so it is cheap enough for ordinary status rendering.
+
+Full historical forensic replay remains a separate future capability; the durable session log is never deleted or rewritten.
+
 **Synthesized vs persisted recovery events:**
-- **Persisted** events (e.g. `effect_reconciled`, `scheduler_reconnected`) are written through registry mutation methods and appended as session entries; they are replayed on reconstruction.
-- **Synthesized** events are derived during replay when a `started` effect on a non-terminal run is encountered (the run was interrupted before `workflow_effect_commit`). They are marked `details.synthesized === true`, use deterministic ids (`recov-<runId>-<effectKey>`) and the effect's `startedAt` timestamp, and are added to BOTH `recoveryEvents` and `history`. They are intentionally NOT persisted as new session entries, so repeated reconstruction/`refresh()` is idempotent and never duplicates them.
+- **Persisted** events (e.g. `effect_reconciled`, `scheduler_reconnected`) are written through registry mutation methods and appended as session entries with their event ID; they are replayed on reconstruction with the same IDs and ordering.
+- **Synthesized** events are derived during replay when a `started` effect on a non-terminal run is encountered (the run was interrupted before `workflow_effect_commit`). They are marked `details.synthesized === true`, use deterministic ids (`recov-<runId>-<effectKey>`) and the effect's `startedAt` timestamp, and are added to BOTH `recoveryEvents` and `history`. They are intentionally NOT persisted as new session entries, so repeated reconstruction/`refresh()` is idempotent and never duplicates them. If that effect is subsequently committed, the durable `effect_commit` entry records the `recovered` fact; a later replay therefore reproduces the persisted `effect_reconciled` event (and the `[recovered]` history marker) while correctly no longer synthesizing a (now-resolved) ambiguity event.
 
 
 

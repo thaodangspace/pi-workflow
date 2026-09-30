@@ -1278,7 +1278,7 @@ Body`,
       registry.commitEffect(run.id, { key: "create-pr", resultSummary: { pr: 123 } });
       registry.completeRun(run.id, { summary: "Finished PR" });
 
-      const history = registry.getRunHistory(run.id);
+      const history = registry.getRunHistory(run.id).entries;
       assert(history.length >= 5);
       const actions = history.map((h) => h.action);
       assert(actions.includes("create"));
@@ -1308,7 +1308,7 @@ Body`,
       // The synthesized recovery event is exposed in run history (issue #7 acceptance).
       const historyHit = registry2
         .getRunHistory(reloaded1.id)
-        .filter((h) => h.eventId === expectedEventId);
+        .entries.filter((h) => h.eventId === expectedEventId);
       assert.equal(historyHit.length, 1);
       assert.equal(historyHit[0].action, "recovery");
       assert.match(historyHit[0].summary, /effect_ambiguous/);

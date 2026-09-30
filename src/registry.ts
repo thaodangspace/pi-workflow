@@ -4,10 +4,15 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { WORKFLOW_RUN_ENTRY_TYPE } from "./constants.ts";
+import {
+  MAX_RUN_HISTORY_QUERY_LIMIT,
+  MAX_RUN_RECOVERY_EVENTS,
+  WORKFLOW_RUN_ENTRY_TYPE,
+} from "./constants.ts";
+import { appendBounded } from "./bounded-history.ts";
 import { validateRunId } from "./data-bounds.ts";
 import {
-  appendHistoryEntry,
+  appendHistoryProjection,
   applyAcquireLease,
   applyBlockRun,
   applyCancelRun,
@@ -24,6 +29,8 @@ import {
   applyStepTransition,
   applyVerifyRun,
   createWorkflowRun,
+  getHistoryProjection,
+  getRecoveryProjection,
   isTerminalLifecycle,
 } from "./run.ts";
 import {
@@ -56,7 +63,8 @@ import {
   type WorkflowRun,
   WorkflowRunError,
   type WorkflowRunDiagnostic,
-  type WorkflowRunHistoryEntry,
+  type WorkflowRunHistoryOptions,
+  type WorkflowRunHistoryView,
   type WorkflowRunLifecycle,
   WorkflowRunNotFoundError,
   type WorkflowSessionTarget,
@@ -390,7 +398,15 @@ export class WorkflowRunRegistry {
    */
   commitEffect(runId: string, options: EffectCommitOptions): WorkflowRun {
     const current = this.requireRun(runId);
-    const updated = applyEffectCommit(current, options);
+    const wasAmbiguous = current.effects?.[options.key]?.ambiguous === true;
+    const eventId = wasAmbiguous
+      ? options.eventId ?? `recov-${randomUUID().slice(0, 8)}`
+      : undefined;
+    const updated = applyEffectCommit(current, {
+      ...options,
+      recovered: wasAmbiguous,
+      eventId,
+    });
 
     if (updated === current) {
       return updated;
@@ -399,6 +415,7 @@ export class WorkflowRunRegistry {
     const entryData = buildMutationEntryData("effect_commit", runId, updated.workflow, {
       key: options.key,
       resultSummary: options.resultSummary,
+      ...(wasAmbiguous ? { recovered: true, eventId } : {}),
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
@@ -411,13 +428,15 @@ export class WorkflowRunRegistry {
    */
   reconcileEffect(runId: string, options: EffectReconcileOptions): WorkflowRun {
     const current = this.requireRun(runId);
-    const updated = applyEffectReconcile(current, options);
+    const eventId = options.eventId ?? `recov-${randomUUID().slice(0, 8)}`;
+    const updated = applyEffectReconcile(current, { ...options, eventId });
 
     const entryData = buildMutationEntryData("effect_reconcile", runId, updated.workflow, {
       key: options.key,
       resolution: options.resolution,
       reason: options.reason,
       resultSummary: options.resultSummary,
+      eventId,
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
@@ -430,12 +449,14 @@ export class WorkflowRunRegistry {
    */
   recordRecoveryEvent(runId: string, options: WorkflowRecoveryEventOptions): WorkflowRun {
     const current = this.requireRun(runId);
-    const updated = applyRecoveryEvent(current, options);
+    const eventId = options.eventId ?? `recov-${randomUUID().slice(0, 8)}`;
+    const updated = applyRecoveryEvent(current, { ...options, eventId });
 
     const entryData = buildMutationEntryData("recovery", runId, updated.workflow, {
       type: options.type,
       message: options.message,
       details: options.details,
+      eventId,
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
@@ -474,6 +495,7 @@ export class WorkflowRunRegistry {
 
     const entryData = buildMutationEntryData("update", runId, updated.workflow, {
       lease: null,
+      leaseOwnerId: ownerId,
     }, { timestamp: updated.updatedAt });
 
     this.persistEntry(entryData);
@@ -482,14 +504,53 @@ export class WorkflowRunRegistry {
   }
 
   /**
-   * Get chronological history of mutations and lifecycle actions for a run.
+   * Get a bounded, deterministic view of a run's recent history projection.
+   *
+   * The accessor never scans or materializes the lifetime session log: it reads
+   * only the in-memory projection (`O(MAX_RUN_HISTORY_ENTRIES)`).
+   *
+   * - `order` is `"oldest"` (default, chronological) or `"newest"` (most recent
+   *   first). Both orderings are deterministic.
+   * - `limit` is clamped to `[0, MAX_RUN_HISTORY_QUERY_LIMIT]`. The `limit` picks
+   *   the most recent `limit` retained entries (returned in the requested order).
+   * - Truncation metadata (`total`, `retained`, `dropped`, `truncated`) lets
+   *   callers distinguish a short-lived run from a long-lived one whose history
+   *   has been truncated.
    */
-  getRunHistory(runId: string): ReadonlyArray<WorkflowRunHistoryEntry> {
-    return this.requireRun(runId).history ?? [];
+  getRunHistory(runId: string, options: WorkflowRunHistoryOptions = {}): WorkflowRunHistoryView {
+    const run = this.requireRun(runId);
+    const retainedEntries = run.history ?? [];
+    const retained = retainedEntries.length;
+    const total = run.historyTotal ?? retained;
+    const dropped = run.historyDropped ?? Math.max(0, total - retained);
+
+    const order = options.order === "newest" ? "newest" : "oldest";
+    const requested = options.limit;
+    const limit =
+      requested === undefined || !Number.isFinite(requested)
+        ? MAX_RUN_HISTORY_QUERY_LIMIT
+        : Math.min(MAX_RUN_HISTORY_QUERY_LIMIT, Math.max(0, Math.floor(requested)));
+
+    const limited = retained > limit;
+    // `retainedEntries` is oldest-first; the most recent window is the tail.
+    const window = limited ? retainedEntries.slice(retained - limit) : retainedEntries;
+    const entries = order === "newest" ? Object.freeze([...window].reverse()) : window;
+
+    return Object.freeze({
+      runId,
+      entries,
+      order,
+      limit,
+      retained,
+      total,
+      dropped,
+      truncated: dropped > 0,
+      limited,
+    });
   }
 
   /**
-   * Get chronological recovery events for a run.
+   * Get the bounded recent recovery-event projection for a run (oldest first).
    */
   getRunRecoveryEvents(runId: string): ReadonlyArray<WorkflowRecoveryEvent> {
     return this.requireRun(runId).recoveryEvents ?? [];
@@ -662,6 +723,18 @@ export class WorkflowRunRegistry {
           let updated: WorkflowRun;
           switch (action) {
             case "update":
+              if (p.lease === null) {
+                // Backward/supported encoding for ownership lease release: clear
+                // the lease and append the same audit history entry as the live
+                // applyReleaseLease path, using the persisted owner and timestamp
+                // so replay is byte-for-byte faithful.
+                const releaseOwner =
+                  typeof p.leaseOwnerId === "string" && p.leaseOwnerId.length > 0
+                    ? p.leaseOwnerId
+                    : current.lease?.ownerId ?? "";
+                updated = applyReleaseLease(current, releaseOwner, timestamp);
+                break;
+              }
               updated = applyRunUpdate(current, {
                 step: p.step,
                 data: p.data,
@@ -754,6 +827,8 @@ export class WorkflowRunRegistry {
                 key: p.key,
                 resultSummary: p.resultSummary,
                 committedAt: timestamp,
+                recovered: p.recovered === true,
+                eventId: typeof p.eventId === "string" ? p.eventId : undefined,
               });
               break;
             case "effect_reconcile":
@@ -763,6 +838,7 @@ export class WorkflowRunRegistry {
                 reason: p.reason,
                 resultSummary: p.resultSummary,
                 reconciledAt: timestamp,
+                eventId: typeof p.eventId === "string" ? p.eventId : undefined,
               });
               break;
             case "recovery":
@@ -771,6 +847,7 @@ export class WorkflowRunRegistry {
                 message: p.message,
                 details: p.details,
                 timestamp,
+                eventId: typeof p.eventId === "string" ? p.eventId : undefined,
               });
               break;
             case "lease":
@@ -814,55 +891,58 @@ export class WorkflowRunRegistry {
     // Event/ history IDs and timestamps are deterministic so repeated reconstruction is
     // idempotent and never duplicates entries.
     for (const [runId, run] of newRuns.entries()) {
-      if (!isTerminalLifecycle(run.lifecycle)) {
-        if (run.effects) {
-          let hasAmbiguous = false;
-          const updatedEffects = { ...run.effects };
-          const updatedRecovery = run.recoveryEvents ? [...run.recoveryEvents] : [];
-          let updatedHistory = run.history ?? [];
+      if (isTerminalLifecycle(run.lifecycle)) continue;
+      if (!run.effects) continue;
 
-          for (const [key, effect] of Object.entries(run.effects)) {
-            if (effect.status === "started" && !effect.ambiguous) {
-              hasAmbiguous = true;
-              updatedEffects[key] = Object.freeze({
-                ...effect,
-                ambiguous: true,
-              });
-              const eventId = `recov-${runId}-${key}`;
-              const alreadyRecorded =
-                (run.recoveryEvents ?? []).some((e) => e.eventId === eventId) ||
-                updatedHistory.some((h) => h.eventId === eventId);
-              if (!alreadyRecorded) {
-                const recEvent: WorkflowRecoveryEvent = Object.freeze({
-                  eventId,
-                  type: "effect_ambiguous",
-                  timestamp: effect.startedAt,
-                  message: `Effect "${effect.key}" (${effect.kind}) was in started state when session reloaded. State is ambiguous; reconciliation required before new side effects.`,
-                  details: Object.freeze({ key: effect.key, kind: effect.kind, synthesized: true }),
-                });
-                updatedRecovery.push(recEvent);
-                updatedHistory = appendHistoryEntry(
-                  updatedHistory,
-                  "recovery",
-                  `Recovery event [effect_ambiguous]: ${recEvent.message}`,
-                  { key: effect.key, kind: effect.kind, synthesized: true },
-                  effect.startedAt,
-                  eventId
-                );
-              }
-            }
-          }
+      let hasAmbiguous = false;
+      const updatedEffects = { ...run.effects };
+      let recoveryProjection = getRecoveryProjection(run);
+      let historyProjection = getHistoryProjection(run);
 
-          if (hasAmbiguous) {
-            const updatedRun: WorkflowRun = Object.freeze({
-              ...run,
-              effects: Object.freeze(updatedEffects),
-              recoveryEvents: Object.freeze(updatedRecovery),
-              history: Object.freeze(updatedHistory),
-            });
-            newRuns.set(runId, updatedRun);
-          }
-        }
+      for (const [key, effect] of Object.entries(run.effects)) {
+        if (effect.status !== "started" || effect.ambiguous) continue;
+
+        hasAmbiguous = true;
+        updatedEffects[key] = Object.freeze({
+          ...effect,
+          ambiguous: true,
+        });
+        const eventId = `recov-${runId}-${key}`;
+        const alreadyRecorded =
+          recoveryProjection.entries.some((e) => e.eventId === eventId) ||
+          historyProjection.entries.some((h) => h.eventId === eventId);
+        if (alreadyRecorded) continue;
+
+        const recEvent: WorkflowRecoveryEvent = Object.freeze({
+          eventId,
+          type: "effect_ambiguous",
+          timestamp: effect.startedAt,
+          message: `Effect "${effect.key}" (${effect.kind}) was in started state when session reloaded. State is ambiguous; reconciliation required before new side effects.`,
+          details: Object.freeze({ key: effect.key, kind: effect.kind, synthesized: true }),
+        });
+        recoveryProjection = appendBounded(recoveryProjection, recEvent, MAX_RUN_RECOVERY_EVENTS);
+        historyProjection = appendHistoryProjection(
+          historyProjection,
+          "recovery",
+          `Recovery event [effect_ambiguous]: ${recEvent.message}`,
+          { key: effect.key, kind: effect.kind, synthesized: true },
+          effect.startedAt,
+          eventId
+        );
+      }
+
+      if (hasAmbiguous) {
+        const updatedRun: WorkflowRun = Object.freeze({
+          ...run,
+          effects: Object.freeze(updatedEffects),
+          recoveryEvents: recoveryProjection.entries,
+          recoveryEventsTotal: recoveryProjection.total,
+          recoveryEventsDropped: recoveryProjection.dropped,
+          history: historyProjection.entries,
+          historyTotal: historyProjection.total,
+          historyDropped: historyProjection.dropped,
+        });
+        newRuns.set(runId, updatedRun);
       }
     }
 
