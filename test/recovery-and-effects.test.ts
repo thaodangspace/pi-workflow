@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  createGoalDefinition,
   createLoopSchedulerAdapter,
   createWorkflowRunRegistry,
   createWorkflowTools,
@@ -1360,6 +1361,69 @@ Body`,
         reloaded.history!.some((h) => h.eventId === "recov-wfrun-paused-ambig-deploy"),
         true
       );
+    });
+  });
+
+  // =========================================================================
+  // 9. Goal runs use the same generic recovery/reconciliation machinery
+  // =========================================================================
+  describe("Goal recovery via the generic effect checkpoints", () => {
+    it("recovers an ambiguous goal effect through the generic recovery prompt and reconciliation", async () => {
+      const session = new FakeSessionManager();
+      const registry1 = new WorkflowRunRegistry(session);
+      const dispatcher1 = new WorkflowDispatcher(registry1);
+
+      const def = createGoalDefinition("publish the deliverable exactly once");
+      const run1 = registry1.createRun(def, { runId: "wfrun-goal-recovery" });
+      registry1.transitionStep(run1.id, { toStep: "PUBLISHING" });
+
+      // Begin an external effect, then crash before committing it.
+      const ac1 = new AbortController();
+      dispatcher1.beginIteration(run1.id, { signal: ac1.signal, incrementTurns: false });
+      await createWorkflowTools({ dispatcher: dispatcher1, registry: registry1 })
+        .find((t) => t.name === "workflow_effect_begin")!
+        .execute(
+          "goal-effect-begin",
+          { key: "publish", kind: "release.publish", inputSummary: { version: "1.0.0" } },
+          ac1.signal,
+          undefined,
+          {} as any
+        );
+      dispatcher1.endIteration();
+
+      // Reload: the goal is reconstructed with identity intact and effect ambiguous.
+      const registry2 = new WorkflowRunRegistry();
+      const { runs } = registry2.reconstructFromSession(session);
+      const reloaded = runs.find((r) => r.id === run1.id)!;
+      assert.equal(reloaded.type, "goal");
+      assert.equal(reloaded.objective, "publish the deliverable exactly once");
+      assert.equal(hasAmbiguousEffects(reloaded), true);
+      assert.equal(reloaded.recoveryEvents?.[0]?.type, "effect_ambiguous");
+
+      // The generic recovery prompt is used (goal-agnostic, effect-scoped).
+      const dispatcher2 = new WorkflowDispatcher(registry2);
+      const prompt = dispatcher2.buildPrompt(reloaded.id);
+      assert.match(prompt, /# Workflow Recovery & Reconciliation:/);
+      assert.match(prompt, /publish/);
+
+      // Reconcile the assumed-succeeded effect via the generic tool.
+      const ac2 = new AbortController();
+      dispatcher2.beginIteration(reloaded.id, { signal: ac2.signal, incrementTurns: false });
+      await createWorkflowTools({ dispatcher: dispatcher2, registry: registry2 })
+        .find((t) => t.name === "workflow_effect_reconcile")!
+        .execute(
+          "goal-effect-reconcile",
+          { key: "publish", resolution: "committed", reason: "release 1.0.0 confirmed published" },
+          ac2.signal,
+          undefined,
+          {} as any
+        );
+      dispatcher2.endIteration();
+
+      const reconciled = registry2.requireRun(run1.id);
+      assert.equal(hasAmbiguousEffects(reconciled), false);
+      assert.equal(reconciled.effects?.publish.status, "committed");
+      assert.equal(reconciled.type, "goal");
     });
   });
 });

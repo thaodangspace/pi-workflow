@@ -11,6 +11,30 @@ import type {
 
 export type WorkflowMode = (typeof ALLOWED_WORKFLOW_MODES)[number];
 
+/**
+ * Closed durable workflow-kind discriminator.
+ *
+ * - `"workflow"` default for ordinary named/discovered workflows.
+ * - `"goal"` for the command-owned ad-hoc goal facade (see `src/goal.ts`).
+ */
+export type WorkflowKind = "workflow" | "goal";
+
+/** Allowed values for the durable workflow-kind discriminator. */
+export const WORKFLOW_KINDS: readonly WorkflowKind[] = ["workflow", "goal"] as const;
+
+/**
+ * Resolves the durable kind of a definition/snapshot/run-like object.
+ * Absent discriminator means an ordinary workflow (backward compatible).
+ */
+export function workflowKindOf(value: { type?: WorkflowKind } | null | undefined): WorkflowKind {
+  return value?.type === "goal" ? "goal" : "workflow";
+}
+
+/** True when the value is a goal-kind definition/snapshot/run. */
+export function isGoalKind(value: { type?: WorkflowKind } | null | undefined): boolean {
+  return value?.type === "goal";
+}
+
 export interface WorkflowScheduleConfig {
   /** Cadence interval as a duration string (e.g., "30m", "2h") */
   interval?: string;
@@ -110,6 +134,21 @@ export interface WorkflowDefinitionV1 {
   name: string;
   /** Human-readable workflow description */
   description: string;
+  /**
+   * Durable workflow-kind discriminator.
+   *
+   * Absent (or `"workflow"`) for ordinary named workflows discovered from disk.
+   * `"goal"` marks a command-owned ad-hoc goal facade definition built in
+   * memory by `src/goal.ts`. This is a closed union validated on replay; goals
+   * must never be identified by a name prefix alone.
+   */
+  type?: WorkflowKind;
+  /**
+   * User-supplied goal objective. Only present for `type: "goal"` definitions
+   * built by the built-in goal factory. It is not an allowed frontmatter field,
+   * so an on-disk named workflow can never claim to be a goal.
+   */
+  objective?: string;
   /** Workflow scheduling mode */
   mode: WorkflowMode;
   /** Scheduling configuration when applicable */
@@ -154,6 +193,10 @@ export interface WorkflowSnapshotV1 {
   readonly source: DeepReadonly<WorkflowSourceIdentity>;
   readonly name: string;
   readonly description: string;
+  /** Durable workflow-kind discriminator preserved from the definition. */
+  readonly type?: WorkflowKind;
+  /** Goal objective preserved immutably for goal-kind snapshots. */
+  readonly objective?: string;
   readonly mode: WorkflowMode;
   readonly schedule?: DeepReadonly<WorkflowScheduleConfig>;
   readonly concurrency: DeepReadonly<WorkflowConcurrencyPolicy>;
@@ -362,6 +405,10 @@ export interface WorkflowRun {
   readonly id: string;
   /** Workflow definition name */
   readonly workflow: string;
+  /** Durable workflow-kind discriminator derived from the snapshot. */
+  readonly type?: WorkflowKind;
+  /** Goal objective derived from a goal-kind snapshot (undefined otherwise). */
+  readonly objective?: string;
   /** Version number or string of the workflow definition */
   readonly definitionVersion: number | string;
   /** Source identity or path of the definition */

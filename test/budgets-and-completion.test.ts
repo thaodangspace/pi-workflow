@@ -1,11 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import workflowExtension, {
+  createGoalDefinition,
   createLoopSchedulerAdapter,
   createWorkflowDispatcher,
   createWorkflowRunRegistry,
   createWorkflowTools,
   createWorkflowVerifyTool,
+  describeVerification,
   extractWorkflowRunId,
   formatNextWakeup,
   parseWorkflowContent,
@@ -1262,6 +1264,200 @@ Body`,
       assert.equal(finalRun.completion?.summary, "Full feature implementation ready for inspection");
       assert.equal(finalRun.completion?.evidence.length, 2);
       assert.equal(finalRun.verificationFindings?.decision, "accepted");
+    });
+  });
+
+  // =========================================================================
+  // Goal completion policy (issue #9): generic evidence/verifier gate only
+  // =========================================================================
+  describe("Goal Completion Policy (generic gate)", () => {
+    it("requires evidence, never completes from plain text, and records completion unverified by default", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+
+      const def = createGoalDefinition("make the failing suite green");
+      const run = registry.createRun(def, { runId: "wfrun-goal-evidence" });
+
+      const ac = new AbortController();
+      dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
+      const completeTool = createWorkflowTools({ dispatcher, registry }).find(
+        (t) => t.name === "workflow_complete"
+      )!;
+
+      // A summary with no evidence is rejected by the generic gate.
+      await assert.rejects(
+        async () => {
+          await completeTool.execute("goal-c1", { summary: "done" }, ac.signal, undefined, {} as any);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowRunError);
+          assert.match(err.message, /requires at least one evidence item/i);
+          return true;
+        }
+      );
+
+      // Merely saying "done" changed nothing: still active, no claim, no completion.
+      const afterText = registry.requireRun(run.id);
+      assert.equal(afterText.lifecycle, "active");
+      assert.equal(afterText.completionClaim, undefined);
+      assert.equal(afterText.completion, undefined);
+
+      // Real evidence completes the goal through the generic path.
+      const result = await completeTool.execute(
+        "goal-c2",
+        {
+          summary: "Fixed the failing suite and confirmed all tests pass",
+          evidence: [{ type: "test", description: "npm test: 311 passing" }],
+        },
+        ac.signal,
+        undefined,
+        {} as any
+      );
+      assert.equal((result.details as any).status, "completed");
+
+      const completed = registry.requireRun(run.id);
+      assert.equal(completed.type, "goal");
+      assert.equal(completed.lifecycle, "completed");
+      assert.equal(completed.completion?.evidence.length, 1);
+      // No verifier configured: the completion is explicitly unverified.
+      assert.equal(completed.verificationFindings, undefined);
+      assert.equal(describeVerification(completed), "not configured (unverified completion)");
+    });
+
+    it("routes a configured goal completion through the generic verifier accept/reject gate", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+
+      const def = createGoalDefinition("achieve the objective", { verify: true, maxVerificationAttempts: 2 });
+      assert.equal(def.completion?.verify, true);
+      const run = registry.createRun(def, { runId: "wfrun-goal-verify" });
+
+      // Turn 1: submit claim -> verifying
+      const ac1 = new AbortController();
+      dispatcher.beginIteration(run.id, { signal: ac1.signal, incrementTurns: false });
+      const completeTool = createWorkflowTools({ dispatcher, registry }).find(
+        (t) => t.name === "workflow_complete"
+      )!;
+      const claim = await completeTool.execute(
+        "goal-v1",
+        { summary: "objective achieved", evidence: [{ type: "file", description: "result.txt" }] },
+        ac1.signal,
+        undefined,
+        {} as any
+      );
+      assert.equal((claim.details as any).status, "verifying");
+      assert.equal(registry.requireRun(run.id).lifecycle, "verifying");
+      assert.match(dispatcher.buildPrompt(run.id), /Workflow Completion Verification/);
+      dispatcher.endIteration();
+
+      // Turn 2: verifier rejects -> back to active rework (generic rejection path)
+      const ac2 = new AbortController();
+      dispatcher.beginIteration(run.id, { signal: ac2.signal, incrementTurns: false });
+      const verifyTool = createWorkflowVerifyTool(dispatcher, registry);
+      await verifyTool.execute("goal-v2", { decision: "reject", findings: "evidence insufficient" }, ac2.signal, undefined, {} as any);
+      const rejected = registry.requireRun(run.id);
+      assert.equal(rejected.lifecycle, "active");
+      assert.equal(rejected.verificationFindings?.decision, "rejected");
+      dispatcher.endIteration();
+
+      // Turn 3: resubmit and accept -> completed and verified
+      const ac3 = new AbortController();
+      dispatcher.beginIteration(run.id, { signal: ac3.signal, incrementTurns: false });
+      const completeTool3 = createWorkflowTools({ dispatcher, registry }).find(
+        (t) => t.name === "workflow_complete"
+      )!;
+      await completeTool3.execute(
+        "goal-v3",
+        {
+          summary: "objective achieved with proof",
+          evidence: [{ type: "url", description: "http://example.test/proof", url: "http://example.test/proof" }],
+        },
+        ac3.signal,
+        undefined,
+        {} as any
+      );
+      const accepted = await createWorkflowVerifyTool(dispatcher, registry).execute(
+        "goal-v4",
+        { decision: "accept", findings: "proof confirmed" },
+        ac3.signal,
+        undefined,
+        {} as any
+      );
+      assert.equal((accepted.details as any).status, "completed");
+      const finalRun = registry.requireRun(run.id);
+      assert.equal(finalRun.lifecycle, "completed");
+      assert.equal(finalRun.verificationFindings?.decision, "accepted");
+      assert.equal(describeVerification(finalRun), "accepted by verifier (attempt 2)");
+    });
+
+    it("uses the generic budget/blocked gate for goal runs", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+
+      const def = createGoalDefinition("bounded goal", { maxTurns: 1 });
+      const run = registry.createRun(def, { runId: "wfrun-goal-budget" });
+
+      const ac = new AbortController();
+      const binding = dispatcher.beginIteration(run.id, { signal: ac.signal });
+      const cancelled: string[] = [];
+      (binding as any).schedulerPort = {
+        scheduleWakeup() {},
+        cancelWakeup(id: string) {
+          cancelled.push(id);
+        },
+      };
+
+      const continueTool = createWorkflowTools({ dispatcher, registry }).find(
+        (t) => t.name === "workflow_continue"
+      )!;
+      await assert.rejects(
+        async () => {
+          await continueTool.execute("goal-b1", {}, ac.signal, undefined, {} as any);
+        },
+        (err: any) => {
+          assert(err instanceof WorkflowBudgetExhaustedError);
+          assert.equal(err.dimension, "turns");
+          return true;
+        }
+      );
+
+      const blocked = registry.requireRun(run.id);
+      assert.equal(blocked.lifecycle, "blocked");
+      assert.equal(blocked.blocker?.category, "human-required");
+      assert.ok(cancelled.includes(run.id));
+    });
+
+    it("persists a goal completion claim across reload, retaining goal identity", async () => {
+      const session = new FakeSessionManager();
+      const registry = new WorkflowRunRegistry(session);
+      const dispatcher = new WorkflowDispatcher(registry);
+
+      const def = createGoalDefinition("durable goal objective", { verify: true });
+      const run = registry.createRun(def, { runId: "wfrun-goal-reload-claim" });
+
+      const ac = new AbortController();
+      dispatcher.beginIteration(run.id, { signal: ac.signal, incrementTurns: false });
+      await createWorkflowTools({ dispatcher, registry })
+        .find((t) => t.name === "workflow_complete")!
+        .execute(
+          "goal-r1",
+          { summary: "claim survives reload", evidence: [{ type: "test", description: "evidence" }] },
+          ac.signal,
+          undefined,
+          {} as any
+        );
+
+      const reloaded = new WorkflowRunRegistry();
+      reloaded.reconstructFromSession(FakeSessionManager.fromJsonl(session.exportJsonl()));
+      const reloadedRun = reloaded.requireRun(run.id);
+      assert.equal(reloadedRun.type, "goal");
+      assert.equal(reloadedRun.objective, "durable goal objective");
+      assert.equal(reloadedRun.lifecycle, "verifying");
+      assert.equal(reloadedRun.completionClaim?.summary, "claim survives reload");
+      assert.equal(reloadedRun.completionClaim?.evidence.length, 1);
     });
   });
 });

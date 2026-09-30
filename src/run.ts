@@ -316,6 +316,8 @@ export function createWorkflowRun(params: CreateRunParams): WorkflowRun {
     workflow: params.snapshot.name,
     definitionVersion: params.snapshot.schemaVersion,
     definitionSource: params.snapshot.source.path,
+    ...(params.snapshot.type ? { type: params.snapshot.type } : {}),
+    ...(params.snapshot.objective !== undefined ? { objective: params.snapshot.objective } : {}),
     snapshot: frozenSnapshot,
     ...(params.budget ? { budget: Object.freeze({ ...params.budget }) } : {}),
     lifecycle: "active",

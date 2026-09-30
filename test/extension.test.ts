@@ -27,6 +27,7 @@ describe("Workflow Extension Entrypoint", () => {
   it("subscribes to session_start, session_tree, agent_settled, and session_shutdown events on ExtensionAPI and registers tools", async () => {
     const handlers = new Map<string, Function>();
     const registeredTools: any[] = [];
+    const registeredCommands = new Map<string, any>();
     const session = new FakeSessionManager();
 
     const fakePi: any = {
@@ -37,12 +38,15 @@ describe("Workflow Extension Entrypoint", () => {
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
+      registerCommand(name: string, options: any) {
+        registeredCommands.set(name, options);
+      },
       appendEntry(customType: string, data?: unknown) {
         session.appendCustomEntry(customType, data);
       },
     };
 
-    workflowExtension(fakePi);
+    const handle = workflowExtension(fakePi);
 
     assert(handlers.has("session_start"));
     assert(handlers.has("session_tree"));
@@ -62,6 +66,13 @@ describe("Workflow Extension Entrypoint", () => {
       "workflow_transition",
       "workflow_verify",
     ]);
+
+    // Both slash-command families are registered on the same extension.
+    assert.ok(registeredCommands.has("workflow"));
+    assert.ok(registeredCommands.has("goal"));
+    assert.equal(typeof registeredCommands.get("goal").handler, "function");
+    assert.equal(typeof registeredCommands.get("goal").getArgumentCompletions, "function");
+    assert.ok(handle.goalController, "extension handle exposes the goal controller");
 
     // Simulate session_start
     const fakeCtx: any = {
