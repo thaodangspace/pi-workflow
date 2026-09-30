@@ -510,3 +510,128 @@ export class WorkflowPersistenceError extends WorkflowRunError {
     this.entryId = options?.entryId;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Workflow Iteration Context & Dispatcher Types (Issue #3)
+// ---------------------------------------------------------------------------
+
+export class WorkflowIterationError extends WorkflowRunError {
+  constructor(message: string, runId?: string) {
+    super(message, runId);
+    this.name = "WorkflowIterationError";
+  }
+}
+
+export class WorkflowStaleIterationError extends WorkflowIterationError {
+  readonly token?: string;
+  readonly generation?: number;
+  readonly currentGeneration?: number;
+
+  constructor(
+    message: string,
+    options?: { runId?: string; token?: string; generation?: number; currentGeneration?: number }
+  ) {
+    super(message, options?.runId);
+    this.name = "WorkflowStaleIterationError";
+    this.token = options?.token;
+    this.generation = options?.generation;
+    this.currentGeneration = options?.currentGeneration;
+  }
+}
+
+/** Parameters passed to the scheduler port when scheduling a wakeup */
+export interface WorkflowScheduleWakeupParams {
+  runId: string;
+  delayMs: number;
+  reason?: string;
+}
+
+/** Port interface for interacting with an external task scheduler (e.g. pi-loop) */
+export interface WorkflowSchedulerPort {
+  scheduleWakeup(params: WorkflowScheduleWakeupParams): Promise<void> | void;
+  cancelWakeup?(runId: string): Promise<void> | void;
+}
+
+/** Ephemeral binding representing an active iteration turn */
+export interface IterationBinding {
+  readonly token: string;
+  readonly generation: number;
+  readonly runId: string;
+  readonly workflowName: string;
+  readonly createdAt: number;
+  readonly schedulerPort?: WorkflowSchedulerPort;
+  readonly capabilities?: ReadonlySet<string>;
+  readonly signal?: AbortSignal;
+}
+
+/** Options for dispatching an iteration turn */
+export interface DispatchIterationOptions {
+  schedulerPort?: WorkflowSchedulerPort;
+  capabilities?: Iterable<string> | Record<string, boolean>;
+  signal?: AbortSignal;
+  incrementTurns?: boolean;
+}
+
+/** Budget status and remaining limits exposed in iteration context */
+export interface WorkflowIterationBudgetStatus {
+  maxTurns?: number;
+  turnsRemaining?: number;
+  maxDuration?: string;
+  maxDurationMs?: number;
+  durationRemainingMs?: number;
+  maxAttempts?: number;
+  attemptsRemaining?: number;
+  maxCost?: number;
+}
+
+/** Model-facing execution context snapshot */
+export interface WorkflowIterationContext {
+  runId: string;
+  workflow: string;
+  lifecycle: WorkflowRunLifecycle;
+  step: string;
+  turns: number;
+  attempts: number;
+  data: Readonly<Record<string, JsonValue>>;
+  budget: WorkflowIterationBudgetStatus;
+  definition: {
+    name: string;
+    description: string;
+    mode: WorkflowMode;
+    version: number | string;
+    source: string;
+  };
+  requires: readonly string[];
+  capabilities: Record<string, boolean>;
+  wakeups: {
+    default?: string;
+    defaultMs?: number;
+    min?: string;
+    minMs?: number;
+    max?: string;
+    maxMs?: number;
+    named?: Record<string, string>;
+  };
+  completion?: {
+    requireSummary?: boolean;
+    requireEvidence?: boolean;
+    verify?: boolean;
+  };
+}
+
+/** Options for resolving a wakeup delay */
+export interface ResolveWakeupDelayOptions {
+  delay?: string;
+  delayMs?: number;
+  wakeupName?: string;
+  policy?: WorkflowWakeupPolicy;
+}
+
+/** Resolved delay result with metadata */
+export interface ResolvedWakeupDelay {
+  delayMs: number;
+  delayString: string;
+  source: "named" | "explicit" | "default";
+  isClamped: boolean;
+  originalDelayMs: number;
+}

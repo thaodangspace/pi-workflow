@@ -194,6 +194,79 @@ Arbitrary workflow state (`run.data`), evidence, blocker, and completion records
 
 ---
 
+## Iteration Context & Model-Callable Tools
+
+When a workflow run is dispatched, `pi-workflow` binds an exclusive, ephemeral iteration context. The model interacts with the workflow engine using typed, scoped tools without needing to know internal scheduler identifiers or raw run IDs.
+
+### Model-Callable Tools
+
+| Tool | Description | Parameters |
+|---|---|---|
+| `workflow_get_context` | Inspects current run context, step, durable data, remaining budgets, definition metadata, and capability availability. | `{}` (none) |
+| `workflow_transition` | Atomically advances workflow `step`, merges bounded JSON `data`, and appends an audit `reason`. | `{ toStep: string, data?: object, reason?: string }` |
+| `workflow_continue` | Requests the next wakeup iteration for the run using named wakeup policy, explicit bounded delay, or default delay. | `{ delay?: string, delayMs?: number, wakeupName?: string, reason?: string }` |
+| `workflow_block` | Moves run to `blocked` lifecycle with reason, records `requiresHuman` flag, and cancels pending wakeups. | `{ reason: string, requiresHuman?: boolean, data?: object }` |
+| `workflow_complete` | Submits completion summary and evidence. Triggers verification gate (`VERIFYING` step) if policy specifies `verify: true`. | `{ summary: string, evidence?: object[], data?: object }` |
+
+### Safety & Ownership Rules
+
+- **Current-Run Scoping**: Model tools mutate only the currently executing workflow run. The model never passes raw run IDs or internal scheduler task IDs.
+- **Fail-Closed Execution**: Calling tools outside an active iteration immediately fails closed with `WorkflowIterationError`.
+- **Exclusivity**: Only one workflow iteration turn may hold the active mutation context at any time. Dispatching a new run or turn safely replaces the previous binding and increments the monotonic generation counter.
+- **Strict Turn Signal Identity (No Unsafe Fallback)**: Model-facing tools FAIL CLOSED unless BOTH:
+  1. The active iteration was dispatched with a turn-bound `AbortSignal` (`binding.signal`);
+  2. The host environment passes an `AbortSignal` to the tool's `execute()` invocation (`signal`);
+  3. The invocation signal is strictly identical (`===`) to the turn-bound signal.
+  If either signal is absent, or if they differ, the tool call is rejected immediately (`WorkflowIterationError` / `WorkflowStaleIterationError`), ensuring a late or stale tool call from an earlier turn can never be mistaken for or mutate a newer run.
+- **Stale Late Tool Call Protection**: Every iteration turn is assigned a unique token and a monotonic generation counter. Asynchronous tool calls capture the turn token/generation at execution start and re-verify before and after applying state mutations. If an earlier turn settled, aborted, or was replaced before the tool completed, the mutation is rejected with `WorkflowStaleIterationError`.
+- **Lifecycle Guarantees**: Blocked or terminal runs cannot continue scheduling (`workflow_continue` fails closed). Blocking or completing a run cancels any scheduled wakeup via the scheduler port.
+- **Automatic Lifecycle Cleanup**: Active iteration bindings are safely cleared on session reload (`session_start`), session tree switching (`session_tree`), agent settlement (`agent_settled`), and process shutdown (`session_shutdown`).
+- **Trusted Direct Dispatcher & Registry APIs**: Programmatic extensions that need to address a run directly can use trusted registry and dispatcher APIs (`dispatcher.beginIteration`, `dispatcher.withIteration`, `registry.transitionStep`, `registry.blockRun`, `registry.completeRun`) with explicit run IDs. Model-facing tools, however, strictly enforce turn-bound signal identity.
+
+### Dispatcher & Scheduler Port Boundary
+
+A trusted dispatcher API (`WorkflowDispatcher`) provides an explicit interface for executing workflow turns:
+
+```typescript
+import {
+  WorkflowRunRegistry,
+  WorkflowDispatcher,
+  type WorkflowSchedulerPort,
+} from "pi-workflow";
+
+const registry = new WorkflowRunRegistry();
+const dispatcher = new WorkflowDispatcher(registry);
+
+// External scheduler integration port (e.g. pi-loop in Issue #4)
+const schedulerPort: WorkflowSchedulerPort = {
+  async scheduleWakeup({ runId, delayMs, reason }) {
+    console.log(`Schedule wakeup for run ${runId} in ${delayMs}ms: ${reason}`);
+  },
+  async cancelWakeup(runId) {
+    console.log(`Cancel wakeup for run ${runId}`);
+  },
+};
+
+// Dispatch turn with scoped execution
+await dispatcher.withIteration(run.id, { schedulerPort }, async (binding) => {
+  // Generates deterministic prompt for agent turn
+  const prompt = dispatcher.buildPrompt(run.id);
+  // Model tools execute within this iteration scope
+});
+```
+
+> **Boundary Note**: In accordance with the modular design, `pi-workflow` does not use private `pi-loop` imports or homegrown timer implementations (`setTimeout`/`setInterval`). Integration with the live `pi-loop` scheduler service is owned by Issue #4. Because Pi's `ExtensionToolContext` does not natively carry per-invocation workflow identities, `pi-workflow` enforces in-process exclusive token and generation binding to guarantee fail-closed safety for all model-facing tool calls.
+
+### Deterministic Prompt Construction
+
+Each iteration prompt is assembled deterministically:
+1. **Engine Preamble**: Describes current workflow name, run ID, definition schema version, source path, and model tool contract.
+2. **Policy Body**: Markdown body preserved from the workflow definition.
+3. **Current Run State**: Lifecycle, active step, turn counter / limit, attempts counter / limit, and deeply key-sorted JSON state data.
+4. **Required Action Instructions**: Directives requiring the agent to conclude the turn using one of the workflow lifecycle tools (`workflow_transition`, `workflow_continue`, `workflow_block`, or `workflow_complete`).
+
+---
+
 ## Programmatic API
 
 ```typescript
